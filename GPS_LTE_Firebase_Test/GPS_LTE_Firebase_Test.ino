@@ -1,0 +1,1146 @@
+/**
+ * GPS & LTE Signal to Firebase - LTE Only (No WiFi)
+ * For LILYGO T-SIM A7670E (GPS Version)
+ *
+ * Uses LTE exclusively via AT+HTTP commands (modem-level SSL)
+ * This bypasses TinyGsmClientSecure which has issues on this modem.
+ */
+
+#include <Arduino.h>
+
+// TinyGSM - MUST define modem BEFORE include
+#define TINY_GSM_MODEM_A7672X
+#define TINY_GSM_RX_BUFFER 1024
+#include <TinyGsmClient.h>
+
+// ==================== CONFIGURATION ====================
+// LTE Settings — Globe Telecom Philippines
+// Postpaid: "internet.globe.com.ph"  |  Prepaid: "http.globe.com.ph"
+#define GPRS_APN "internet.globe.com.ph"
+#define GPRS_APN_ALT "http.globe.com.ph"
+#define GPRS_USER ""
+#define GPRS_PASS ""
+
+// Firebase REST API
+#define FIREBASE_HOST                                                          \
+  "smart-top-box-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "AIzaSyA7DETBpsdPN6icfWi7PijCbpmLNWEZyTQ"
+#define HARDWARE_ID "TEST_BOX_001"
+
+// Pins for LILYGO T-SIM A7670E (official pinout)
+#define MODEM_TX 26
+#define MODEM_RX 27
+#define MODEM_PWRKEY 4
+#define MODEM_POWER_ON 12
+#define MODEM_RESET_PIN 5
+#define MODEM_BAUD 115200
+
+// Timing (ms)
+#define GPS_INTERVAL_ACQUIRING 500 // Fast polling while seeking fix
+#define GPS_INTERVAL_LOCKED 2000   // Normal polling once fix acquired
+#define FIREBASE_INTERVAL 5000
+#define SIGNAL_INTERVAL 10000
+#define TIME_SYNC_INTERVAL 1800000 // Re-sync time every 30 minutes
+
+// Philippine Standard Time offset (UTC+8)
+#define PHT_OFFSET_HOURS 8
+#define PHT_OFFSET_QUARTERS 32 // 8 hours * 4 quarter-hours
+
+// ==================== GLOBALS ====================
+HardwareSerial modemSerial(1);
+TinyGsm modem(modemSerial);
+
+bool lteConnected = false;
+bool gpsEnabled = false;
+bool modemOK = false;
+unsigned long lastGps = 0, lastFB = 0, lastSig = 0, lastTimeSync = 0;
+
+double gpsLat = 0, gpsLon = 0;
+bool gpsFix = false;
+unsigned long dataBytesOut = 0; // Total bytes sent to Firebase
+
+// Network time tracking (Philippine Standard Time, UTC+8)
+unsigned long epochTime = 0;       // Unix timestamp (seconds since 1970 UTC)
+unsigned long epochSyncMillis = 0; // millis() value when epochTime was last synced
+bool timeSynced = false;
+
+// ==================== AT HELPER ====================
+// Send AT command and return full response
+String sendATAndWait(const char *cmd, unsigned long timeout = 3000) {
+  String resp = "";
+  modem.sendAT(cmd);
+  modem.waitResponse(timeout, resp);
+  return resp;
+}
+
+// ==================== MODEM ====================
+void powerModem() {
+  Serial.println("Powering modem...");
+
+  // Power ON pin
+  pinMode(MODEM_POWER_ON, OUTPUT);
+  digitalWrite(MODEM_POWER_ON, HIGH);
+
+  // Reset sequence
+  pinMode(MODEM_RESET_PIN, OUTPUT);
+  digitalWrite(MODEM_RESET_PIN, LOW);
+  delay(100);
+  digitalWrite(MODEM_RESET_PIN, HIGH);
+  delay(1000);
+  digitalWrite(MODEM_RESET_PIN, LOW);
+
+  // Power key sequence (toggle LOW->HIGH->LOW)
+  pinMode(MODEM_PWRKEY, OUTPUT);
+  digitalWrite(MODEM_PWRKEY, LOW);
+  delay(100);
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(1000);
+  digitalWrite(MODEM_PWRKEY, LOW);
+
+  Serial.println("  Power sequence complete");
+  delay(3000);
+}
+
+bool initModem() {
+  Serial.println("Initializing modem...");
+  delay(3000); // Wait for modem boot
+
+  String name = modem.getModemName();
+  Serial.println("  Modem: " + name);
+
+  String info = modem.getModemInfo();
+  Serial.println("  Info: " + info);
+
+  if (name.length() == 0 && info.length() == 0) {
+    Serial.println("  Modem not responding");
+    return false;
+  }
+  Serial.println("  Modem OK");
+
+  // ── SPEED OPTIMIZATION: Force LTE-only mode ──
+  // AT+CNMP=38 skips GSM/UMTS scanning, locks to Cat-1 LTE
+  // This saves 5-15s vs auto mode (which scans all RATs)
+  Serial.print("  Setting LTE-only (AT+CNMP=38)...");
+  modem.sendAT("+CNMP=38");
+  if (modem.waitResponse(5000L) == 1) {
+    Serial.println(" OK");
+  } else {
+    Serial.println(" skip (using auto)");
+  }
+
+  // ── SPEED OPTIMIZATION: Pre-configure APN during boot ──
+  // Set PDP context NOW so the modem starts LTE attach immediately
+  // while we initialize GPS (parallel registration)
+  Serial.print("  Pre-setting Globe APN...");
+  modem.sendAT("+CGDCONT=1,\"IP\",\"" + String(GPRS_APN) + "\"");
+  modem.waitResponse(3000L);
+  Serial.println(" OK");
+
+  // Trigger auto-registration in background
+  modem.sendAT("+COPS=0");
+  modem.waitResponse(1000L); // Don't wait long, let it register while GPS inits
+
+  return true;
+}
+
+bool initGPS() {
+  Serial.println("Initializing GPS...");
+
+  // Check if GNSS is already powered (avoid unnecessary cold start)
+  String resp;
+  modem.sendAT("+CGNSSPWR?");
+  modem.waitResponse(1000L, resp);
+
+  bool alreadyOn = (resp.indexOf("+CGNSSPWR: 1") >= 0);
+
+  if (!alreadyOn) {
+    // First boot: power on GNSS
+    Serial.print("  Powering GNSS...");
+    modem.sendAT("+CGNSSPWR=1");
+    int result = modem.waitResponse(3000L, resp);
+
+    if (result != 1) {
+      Serial.println(" FAIL: " + resp);
+      return false;
+    }
+    Serial.println(" OK");
+
+    // Wait for READY signal (reduced to 5s — modem is usually fast)
+    unsigned long start = millis();
+    bool ready = false;
+    while (millis() - start < 5000) {
+      while (modem.stream.available()) {
+        String line = modem.stream.readStringUntil('\n');
+        if (line.indexOf("READY") >= 0) {
+          ready = true;
+          break;
+        }
+      }
+      if (ready)
+        break;
+      delay(50);
+    }
+    if (!ready) {
+      Serial.println("  No READY (may still work)");
+    }
+  } else {
+    Serial.println("  GNSS already powered, preserving satellite cache");
+  }
+
+  // ═══════════════════════════════════════════
+  // TTFF OPTIMIZATIONS (Fastest possible fix)
+  // ═══════════════════════════════════════════
+
+  // 1. Multi-constellation: GPS + GLONASS + BeiDou
+  //    Mode 3 = GPS+GLONASS+BDS (confirmed for A7670E)
+  //    More satellites visible = faster triangulation
+  Serial.print("  Multi-GNSS (GPS+GLO+BDS)...");
+  modem.sendAT("+CGNSSMODE=3");
+  modem.waitResponse(1000L);
+  Serial.println(" OK");
+
+  // 2. XTRA ephemeris: download predicted satellite orbits
+  //    Reduces cold start from 30s+ to <15s by knowing where sats are
+  Serial.print("  XTRA ephemeris server...");
+  modem.sendAT("+CGPSURL=\"http://xtra1.gpsonextra.net/xtra.bin\"");
+  modem.waitResponse(2000L);
+  Serial.println(" set");
+
+  Serial.print("  XTRA enable...");
+  modem.sendAT("+CGPSXE=1");
+  if (modem.waitResponse(2000L) == 1) {
+    Serial.println(" OK");
+  } else {
+    Serial.println(" skip");
+  }
+
+  Serial.print("  XTRA auto-download...");
+  modem.sendAT("+CGPSXDAUTO=1");
+  if (modem.waitResponse(2000L) == 1) {
+    Serial.println(" OK");
+  } else {
+    Serial.println(" skip");
+  }
+
+  // 3. Hot start: reuse cached ephemeris/almanac from last session
+  Serial.print("  Hot start (reuse cache)...");
+  modem.sendAT("+CGPSHOT");
+  modem.waitResponse(1000L);
+  Serial.println(" OK");
+
+  // 4. AGPS: download satellite data over cellular (needs data)
+  Serial.print("  AGPS assist...");
+  modem.sendAT("+CAGPS");
+  if (modem.waitResponse(10000L, resp) == 1) {
+    Serial.println(" OK");
+  } else {
+    Serial.println(" skipped (will retry after LTE connects)");
+  }
+
+  // 5. High sensitivity mode for weak signal areas
+  Serial.print("  High sensitivity...");
+  modem.sendAT("+CGNSHOT=1");
+  modem.waitResponse(1000L);
+  Serial.println(" OK");
+
+  // 6. NMEA output at 1Hz for responsive updates
+  modem.sendAT("+CGPSNMEARATE=1");
+  modem.waitResponse(1000L);
+
+  // Verify GPS is running
+  Serial.print("  Verifying GPS status...");
+  modem.sendAT("+CGNSSPWR?");
+  if (modem.waitResponse(1000L, resp) == 1) {
+    Serial.println(" " + resp);
+  }
+
+  // Check antenna / satellite info
+  Serial.print("  Checking antenna...");
+  modem.sendAT("+CGNSSTST=1");
+  modem.waitResponse(1000L);
+  delay(100);
+  modem.sendAT("+CGNSSINF");
+  if (modem.waitResponse(2000L, resp) == 1) {
+    Serial.println(" " + resp);
+    if (resp.indexOf(",,,,") >= 0 || resp.length() < 20) {
+      Serial.println("  WARNING: No satellites detected!");
+      Serial.println("  CHECK: 1) GPS antenna connected to module");
+      Serial.println("         2) Antenna has clear sky view");
+    }
+  }
+
+  Serial.println("  GPS initialized with TTFF optimizations");
+  Serial.println("  Expected: <15s (XTRA) / 3-10s (AGPS) / 5-15s (hot)");
+  return true;
+}
+
+void readGPS() {
+  modem.sendAT("+CGNSSINFO");
+  String resp = "";
+  if (modem.waitResponse(2000L, resp) != 1) {
+    gpsFix = false;
+    Serial.println("GPS: No response from +CGNSSINFO");
+    return;
+  }
+
+  int idx = resp.indexOf("+CGNSSINFO: ");
+  if (idx < 0) {
+    gpsFix = false;
+    Serial.println("GPS: No +CGNSSINFO in response");
+    Serial.println("  Raw: " + resp);
+    return;
+  }
+
+  String data = resp.substring(idx + 12);
+  data.trim();
+
+  // Show raw GPS data every 30 seconds for debugging
+  static unsigned long lastDebug = 0;
+  if (millis() - lastDebug >= 30000) {
+    Serial.println("GPS Raw: " + data);
+    lastDebug = millis();
+  }
+
+  if (data.length() < 10 || data.startsWith(",,,")) {
+    gpsFix = false;
+    return;
+  }
+
+  // Parse CGNSSINFO format:
+  // <fix>,<sats>,,<beidou>,<galileo>,<lat>,<N/S>,<lon>,<E/W>,<date>,<time>,...
+  int commas[15];
+  int commaCount = 0;
+  for (int i = 0; i < (int)data.length() && commaCount < 15; i++) {
+    if (data.charAt(i) == ',') {
+      commas[commaCount++] = i;
+    }
+  }
+
+  if (commaCount < 8) {
+    gpsFix = false;
+    Serial.println("GPS: Not enough fields in response");
+    return;
+  }
+
+  // Extract fields: latitude is field 5, longitude is field 7
+  String latStr = data.substring(commas[4] + 1, commas[5]);
+  String latDir = data.substring(commas[5] + 1, commas[6]);
+  String lonStr = data.substring(commas[6] + 1, commas[7]);
+  String lonDir = data.substring(commas[7] + 1, commas[8]);
+
+  latStr.trim();
+  latDir.trim();
+  lonStr.trim();
+  lonDir.trim();
+
+  if (latStr.length() > 0 && lonStr.length() > 0) {
+    gpsLat = latStr.toDouble();
+    gpsLon = lonStr.toDouble();
+
+    if (latDir == "S")
+      gpsLat = -gpsLat;
+    if (lonDir == "W")
+      gpsLon = -gpsLon;
+
+    gpsFix = true;
+
+    static unsigned long lastFixDebug = 0;
+    if (millis() - lastFixDebug >= 30000) {
+      Serial.printf("GPS Parsed: %.6f, %.6f (Fix acquired!)\n", gpsLat, gpsLon);
+      lastFixDebug = millis();
+    }
+  } else {
+    gpsFix = false;
+  }
+}
+
+// ==================== LTE ====================
+bool connectLTE() {
+  if (!modemOK)
+    return false;
+
+  Serial.println("Connecting LTE (Globe PH)...");
+
+  // ── SIM Diagnostics ──
+  Serial.print("  SIM status...");
+  int simStatus = modem.getSimStatus();
+  if (simStatus != 1) {
+    Serial.printf(" FAIL (status: %d)\n", simStatus);
+    Serial.println("  CHECK: 1) SIM inserted correctly (gold contacts down)");
+    Serial.println("         2) SIM is activated with data");
+    Serial.println("         3) SIM tray fully seated");
+    return false;
+  }
+  Serial.println(" OK");
+
+  // Print IMEI & IMSI for debugging
+  String resp;
+  modem.sendAT("+CGSN"); // IMEI
+  if (modem.waitResponse(1000L, resp) == 1) {
+    Serial.println("  IMEI: " + resp);
+  }
+  modem.sendAT("+CIMI"); // IMSI (starts with 515 02 for Globe)
+  if (modem.waitResponse(1000L, resp) == 1) {
+    Serial.println("  IMSI: " + resp);
+    if (resp.indexOf("51502") < 0) {
+      Serial.println("  WARNING: IMSI does not match Globe PH (515 02)");
+    }
+  }
+
+  // ── Signal Check (wait up to 30s for modem to find tower) ──
+  // NOTE: modem was already told to register (AT+COPS=0) during initModem()
+  //       so it's been searching during GPS init — should be faster now
+  Serial.print("  Waiting for signal...");
+  int csq = 99;
+  unsigned long sigWaitStart = millis();
+  while (millis() - sigWaitStart < 30000) {
+    csq = modem.getSignalQuality();
+    if (csq != 99 && csq != 0)
+      break;
+    Serial.print(".");
+    delay(2000);
+  }
+  Serial.printf(" CSQ: %d", csq);
+  if (csq == 99 || csq == 0) {
+    Serial.println(" — No signal after 30s!");
+    Serial.println("  CHECK: LTE antenna connected, SIM has coverage");
+    return false;
+  }
+  int dbm = -113 + (2 * csq);
+  Serial.printf(" (%d dBm)\n", dbm);
+
+  // ── Check current network info ──
+  Serial.print("  Network info: ");
+  modem.sendAT("+CPSI?");
+  if (modem.waitResponse(2000L, resp) == 1) {
+    Serial.println(resp);
+  }
+
+  // ── Network Registration Check ──
+  // TinyGSM's waitForNetwork() uses AT+CREG (2G) which fails on LTE-only
+  // Instead, check AT+CPSI? directly — it already showed "LTE,Online" above
+  Serial.print("  Checking LTE registration...");
+
+  bool networkOK = false;
+  unsigned long netWaitStart = millis();
+  while (millis() - netWaitStart < 30000) {
+    modem.sendAT("+CPSI?");
+    if (modem.waitResponse(2000L, resp) == 1) {
+      if (resp.indexOf("Online") >= 0) {
+        networkOK = true;
+        break;
+      }
+    }
+    // Also check AT+CEREG? (LTE-specific registration)
+    modem.sendAT("+CEREG?");
+    if (modem.waitResponse(1000L, resp) == 1) {
+      // +CEREG: 0,1 (home) or +CEREG: 0,5 (roaming) = registered
+      if (resp.indexOf(",1") >= 0 || resp.indexOf(",5") >= 0) {
+        networkOK = true;
+        break;
+      }
+    }
+    Serial.print(".");
+    delay(2000);
+  }
+
+  if (!networkOK) {
+    Serial.println(" FAILED");
+    modem.sendAT("+CEREG?");
+    if (modem.waitResponse(1000L, resp) == 1) {
+      Serial.println("  CEREG: " + resp);
+    }
+    modem.sendAT("+CREG?");
+    if (modem.waitResponse(1000L, resp) == 1) {
+      Serial.println("  CREG: " + resp);
+    }
+    return false;
+  }
+  Serial.println(" registered!");
+
+  Serial.println("  Operator: " + modem.getOperator());
+
+  // ── Activate PDP Context (APN already set in initModem) ──
+  Serial.print("  Activating data (PDP)...");
+  modem.sendAT("+CGACT=1,1");
+  modem.waitResponse(5000L);
+
+  // Verify IP assignment
+  modem.sendAT("+CGPADDR=1");
+  if (modem.waitResponse(3000L, resp) == 1) {
+    Serial.println(" " + resp);
+  }
+
+  // If CGACT didn't assign an IP, try TinyGSM's gprsConnect as fallback
+  bool dataOK = true;
+  String ipStr = modem.localIP().toString();
+  if (ipStr == "0.0.0.0" || ipStr.length() < 7) {
+    dataOK = false;
+    Serial.print("  Fallback: GPRS connect (" + String(GPRS_APN) + ")...");
+    unsigned long gprsStart = millis();
+
+    while (millis() - gprsStart < 20000 && !dataOK) {
+      if (modem.gprsConnect(GPRS_APN, GPRS_USER, GPRS_PASS)) {
+        dataOK = true;
+        break;
+      }
+      delay(1000);
+    }
+
+    // Try alternate Globe APN (prepaid vs postpaid)
+    if (!dataOK) {
+      Serial.println(" failed, trying alt APN...");
+      Serial.print("  Connecting GPRS (" + String(GPRS_APN_ALT) + ")...");
+      modem.sendAT("+CGDCONT=1,\"IP\",\"" + String(GPRS_APN_ALT) + "\"");
+      modem.waitResponse(3000L);
+
+      gprsStart = millis();
+      while (millis() - gprsStart < 20000 && !dataOK) {
+        if (modem.gprsConnect(GPRS_APN_ALT, GPRS_USER, GPRS_PASS)) {
+          dataOK = true;
+          break;
+        }
+        delay(1000);
+      }
+    }
+  }
+
+  if (!dataOK) {
+    Serial.println(" FAILED");
+    Serial.println("  CHECK: 1) SIM has active data (load/promo)");
+    Serial.println("         2) Try dialing *143# on a phone with this SIM");
+    Serial.println("         3) APN may need manual config via Globe app");
+    return false;
+  }
+
+  Serial.println(" OK!");
+
+  // Configure DNS servers (Google DNS)
+  Serial.print("  Setting DNS...");
+  modem.sendAT("+CDNSCFG=\"8.8.8.8\",\"8.8.4.4\"");
+  if (modem.waitResponse(5000L) == 1) {
+    Serial.println(" OK");
+  } else {
+    Serial.println(" skip");
+  }
+
+  delay(2000); // Wait for network to stabilize
+
+  Serial.println("  IP: " + modem.localIP().toString());
+  Serial.println("  Operator: " + modem.getOperator());
+
+  // ── Connectivity Test via AT+HTTPINIT (modem-level HTTP) ──
+  Serial.print("  Testing internet (AT+HTTP)...");
+  sendATAndWait("+HTTPTERM", 1000); // Terminate any previous session
+  delay(200);
+
+  String httpResp;
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(5000L, httpResp) != 1) {
+    Serial.println(" HTTPINIT FAIL: " + httpResp);
+    // Still mark as connected — GPRS is up, HTTP may work on next try
+  } else {
+    modem.sendAT("+HTTPPARA=\"CID\",1");
+    modem.waitResponse(3000L);
+    modem.sendAT("+HTTPPARA=\"URL\",\"http://www.google.com\"");
+    modem.waitResponse(3000L);
+
+    modem.sendAT("+HTTPACTION=0"); // GET
+    // Wait for +HTTPACTION URC (up to 15s)
+    unsigned long httpStart = millis();
+    bool httpOK = false;
+    while (millis() - httpStart < 15000) {
+      if (modem.stream.available()) {
+        String line = modem.stream.readStringUntil('\n');
+        line.trim();
+        if (line.indexOf("+HTTPACTION:") >= 0) {
+          Serial.println(" " + line);
+          // +HTTPACTION: 0,200,<len> means success
+          if (line.indexOf(",200,") > 0 || line.indexOf(",301,") > 0 ||
+              line.indexOf(",302,") > 0) {
+            httpOK = true;
+          }
+          break;
+        }
+      }
+      delay(50);
+    }
+
+    if (httpOK) {
+      Serial.println("  Internet OK!");
+    } else {
+      Serial.println("  HTTP test failed (may still work for Firebase)");
+    }
+
+    sendATAndWait("+HTTPTERM", 1000);
+  }
+
+  lteConnected = true;
+  return true;
+}
+
+int getSignal() {
+  if (!modemOK)
+    return -999;
+  int csq = modem.getSignalQuality();
+  return (csq == 99 || csq == 0) ? -999 : -113 + (2 * csq);
+}
+
+// ==================== NETWORK TIME (PHT UTC+8) ====================
+// Days-in-month lookup (non-leap and leap year)
+static const int daysInMonth[] = {31, 28, 31, 30, 31, 30,
+                                  31, 31, 30, 31, 30, 31};
+
+bool isLeapYear(int y) {
+  return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+}
+
+// Convert date/time components to Unix epoch (seconds since 1970-01-01 00:00:00 UTC)
+// Input is already in PHT (UTC+8), so we subtract 8 hours to get UTC epoch
+unsigned long dateTimeToEpoch(int year, int month, int day, int hour, int min,
+                              int sec) {
+  unsigned long epoch = 0;
+
+  // Sum days for complete years since 1970
+  for (int y = 1970; y < year; y++) {
+    epoch += isLeapYear(y) ? 366 : 365;
+  }
+
+  // Sum days for complete months in current year
+  for (int m = 1; m < month; m++) {
+    epoch += daysInMonth[m - 1];
+    if (m == 2 && isLeapYear(year))
+      epoch += 1;
+  }
+
+  // Add remaining days, hours, minutes, seconds
+  epoch += (day - 1);
+  epoch = epoch * 86400UL; // Convert days to seconds
+  epoch += (unsigned long)hour * 3600UL;
+  epoch += (unsigned long)min * 60UL;
+  epoch += (unsigned long)sec;
+
+  // The time from AT+CCLK? is local (PHT = UTC+8), convert to UTC epoch
+  epoch -= (unsigned long)PHT_OFFSET_HOURS * 3600UL;
+
+  return epoch;
+}
+
+// Parse AT+CCLK? response and extract Unix epoch
+// Response format: +CCLK: "yy/MM/dd,hh:mm:ss+zz" (zz = timezone in quarters)
+bool parseCCLK(const String &resp, unsigned long &outEpoch) {
+  int idx = resp.indexOf("+CCLK: \"");
+  if (idx < 0)
+    return false;
+
+  String timeStr = resp.substring(idx + 8); // Skip '+CCLK: "'
+  // Expected: "yy/MM/dd,hh:mm:ss+zz" or "yy/MM/dd,hh:mm:ss-zz"
+
+  if (timeStr.length() < 17)
+    return false;
+
+  int year = 2000 + timeStr.substring(0, 2).toInt();
+  int month = timeStr.substring(3, 5).toInt();
+  int day = timeStr.substring(6, 8).toInt();
+  int hour = timeStr.substring(9, 11).toInt();
+  int minute = timeStr.substring(12, 14).toInt();
+  int sec = timeStr.substring(15, 17).toInt();
+
+  // Sanity check: year should be >= 2024 (not 1970 or 1980)
+  if (year < 2024 || month < 1 || month > 12 || day < 1 || day > 31) {
+    Serial.printf("  CCLK parse: invalid date %d/%d/%d\n", year, month, day);
+    return false;
+  }
+
+  outEpoch = dateTimeToEpoch(year, month, day, hour, minute, sec);
+
+  Serial.printf("  Parsed time: %04d-%02d-%02d %02d:%02d:%02d PHT (epoch: %lu)\n",
+                year, month, day, hour, minute, sec, outEpoch);
+  return true;
+}
+
+// Sync modem RTC from cellular network / NTP, then read it
+bool syncNetworkTime() {
+  Serial.println("Syncing network time (PHT, UTC+8)...");
+  String resp;
+
+  // Step A: Enable automatic time zone update from network
+  Serial.print("  Auto timezone update (AT+CTZU=1)...");
+  modem.sendAT("+CTZU=1");
+  if (modem.waitResponse(3000L) == 1) {
+    Serial.println(" OK");
+  } else {
+    Serial.println(" skip");
+  }
+
+  // Step B: Configure and trigger NTP sync for reliability
+  Serial.print("  NTP config (pool.ntp.org, UTC+8)...");
+  modem.sendAT("+CNTP=\"pool.ntp.org\"," + String(PHT_OFFSET_QUARTERS));
+  if (modem.waitResponse(3000L) == 1) {
+    Serial.println(" OK");
+  } else {
+    Serial.println(" skip");
+  }
+
+  Serial.print("  NTP sync...");
+  modem.sendAT("+CNTP");
+  // Wait for +CNTP: 0 (success) URC — can take up to 30s
+  unsigned long ntpStart = millis();
+  bool ntpOK = false;
+  while (millis() - ntpStart < 30000) {
+    if (modem.stream.available()) {
+      String line = modem.stream.readStringUntil('\n');
+      line.trim();
+      if (line.indexOf("+CNTP: 0") >= 0) {
+        ntpOK = true;
+        break;
+      }
+      if (line.indexOf("+CNTP:") >= 0) {
+        Serial.print(" err:" + line);
+        break;
+      }
+    }
+    delay(100);
+  }
+  Serial.println(ntpOK ? " OK" : " timeout (trying CCLK anyway)");
+
+  // Step C: Read RTC via AT+CCLK? (retry up to 3 times)
+  for (int attempt = 0; attempt < 3; attempt++) {
+    Serial.printf("  Reading RTC (attempt %d)...", attempt + 1);
+    resp = "";
+    modem.sendAT("+CCLK?");
+    modem.waitResponse(3000L, resp);
+    Serial.println(" " + resp);
+
+    unsigned long parsed = 0;
+    if (parseCCLK(resp, parsed)) {
+      epochTime = parsed;
+      epochSyncMillis = millis();
+      timeSynced = true;
+      Serial.println("  Time synced successfully!");
+      return true;
+    }
+
+    // Modem RTC not yet updated, wait and retry
+    Serial.println("  RTC not ready, retrying in 2s...");
+    delay(2000);
+  }
+
+  Serial.println("  WARNING: Time sync failed — timestamps will be 0");
+  return false;
+}
+
+// Get current Unix epoch by adding elapsed time since last sync
+unsigned long getCurrentEpoch() {
+  if (!timeSynced)
+    return 0;
+  return epochTime + ((millis() - epochSyncMillis) / 1000);
+}
+
+// Format epoch as ISO 8601 string in PHT: "YYYY-MM-DDTHH:MM:SS+08:00"
+String formatTimestamp(unsigned long epoch) {
+  if (epoch == 0)
+    return "\"no_time\"";
+
+  // Convert UTC epoch to PHT by adding 8 hours
+  unsigned long local = epoch + (unsigned long)PHT_OFFSET_HOURS * 3600UL;
+
+  unsigned long s = local;
+  int sec = s % 60;
+  s /= 60;
+  int min = s % 60;
+  s /= 60;
+  int hour = s % 24;
+  unsigned long days = s / 24;
+
+  // Convert days since 1970-01-01 to year/month/day
+  int year = 1970;
+  while (true) {
+    unsigned long diy = isLeapYear(year) ? 366 : 365;
+    if (days < diy)
+      break;
+    days -= diy;
+    year++;
+  }
+
+  int month = 1;
+  while (month <= 12) {
+    int dim = daysInMonth[month - 1];
+    if (month == 2 && isLeapYear(year))
+      dim++;
+    if (days < (unsigned long)dim)
+      break;
+    days -= dim;
+    month++;
+  }
+  int day = days + 1;
+
+  char buf[30];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d+08:00", year,
+           month, day, hour, min, sec);
+  return String(buf);
+}
+
+// ==================== FIREBASE (AT+HTTP) ====================
+// Uses A7670E's built-in HTTP client which handles SSL at modem level
+bool httpPutToFirebase(const char *path, const String &jsonData) {
+  String resp;
+
+  // Terminate any existing HTTP session
+  sendATAndWait("+HTTPTERM", 1000);
+  delay(200);
+
+  // Initialize HTTP
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(5000L, resp) != 1) {
+    Serial.print("HTTPINIT FAIL ");
+    return false;
+  }
+
+  // Set PDP context
+  modem.sendAT("+HTTPPARA=\"CID\",1");
+  modem.waitResponse(3000L);
+
+  // Build Firebase URL: https://HOST/PATH.json
+  String url = "https://" + String(FIREBASE_HOST) + path;
+  String urlCmd = "+HTTPPARA=\"URL\",\"" + url + "\"";
+  modem.sendAT(urlCmd.c_str());
+  modem.waitResponse(3000L);
+
+  // Set content type for JSON
+  modem.sendAT("+HTTPPARA=\"CONTENT\",\"application/json\"");
+  modem.waitResponse(3000L);
+
+  // Enable SSL (HTTPS)
+  modem.sendAT("+HTTPSSL=1");
+  modem.waitResponse(3000L);
+
+  // Prepare data upload: AT+HTTPDATA=<size>,<timeout_ms>
+  String dataCmd = "+HTTPDATA=" + String(jsonData.length()) + ",10000";
+  modem.sendAT(dataCmd.c_str());
+
+  // Wait for DOWNLOAD prompt
+  unsigned long waitStart = millis();
+  bool gotDownload = false;
+  while (millis() - waitStart < 5000) {
+    if (modem.stream.available()) {
+      String line = modem.stream.readStringUntil('\n');
+      line.trim();
+      if (line.indexOf("DOWNLOAD") >= 0) {
+        gotDownload = true;
+        break;
+      }
+    }
+    delay(10);
+  }
+
+  if (!gotDownload) {
+    Serial.print("NO_DOWNLOAD_PROMPT ");
+    sendATAndWait("+HTTPTERM", 1000);
+    return false;
+  }
+
+  // Send the JSON data
+  modem.stream.print(jsonData);
+  delay(500);
+
+  // Wait for OK after data upload
+  modem.waitResponse(5000L);
+
+  // Execute PUT request: AT+HTTPACTION=3 (PUT method)
+  // Note: A7670E may use: 0=GET, 1=POST, 2=HEAD, 3=DELETE, 4=PUT
+  // Some firmware versions: 0=GET, 1=POST, 3=PUT
+  // Try PUT first (action=4 on some, action=1/POST as fallback)
+  modem.sendAT("+HTTPACTION=4"); // PUT
+
+  // Wait for +HTTPACTION URC response
+  waitStart = millis();
+  bool actionOK = false;
+  int httpStatus = 0;
+  while (millis() - waitStart < 30000) {
+    if (modem.stream.available()) {
+      String line = modem.stream.readStringUntil('\n');
+      line.trim();
+      if (line.indexOf("+HTTPACTION:") >= 0) {
+        // Parse: +HTTPACTION: <method>,<status>,<data_len>
+        int firstComma = line.indexOf(',');
+        int secondComma = line.indexOf(',', firstComma + 1);
+        if (firstComma > 0 && secondComma > 0) {
+          httpStatus = line.substring(firstComma + 1, secondComma).toInt();
+        }
+        actionOK = true;
+        break;
+      }
+      // Check if ERROR (method not supported)
+      if (line.indexOf("ERROR") >= 0) {
+        break;
+      }
+    }
+    delay(50);
+  }
+
+  // If PUT (action=4) failed, try with PATCH via POST workaround
+  if (!actionOK || httpStatus == 0) {
+    // Some A7670E firmware doesn't support action=4 (PUT)
+    // Fallback: use PATCH with URL parameter
+    Serial.print("(PUT unsupported, using PATCH)... ");
+    sendATAndWait("+HTTPTERM", 1000);
+    delay(200);
+
+    // Re-init with PATCH URL (Firebase supports PATCH via REST)
+    modem.sendAT("+HTTPINIT");
+    modem.waitResponse(5000L);
+    modem.sendAT("+HTTPPARA=\"CID\",1");
+    modem.waitResponse(3000L);
+
+    // Use X-HTTP-Method-Override header approach or just POST to Firebase
+    // Firebase REST API accepts PATCH on the URL to update data
+    String patchUrl = "https://" + String(FIREBASE_HOST) + path;
+    String patchUrlCmd = "+HTTPPARA=\"URL\",\"" + patchUrl + "\"";
+    modem.sendAT(patchUrlCmd.c_str());
+    modem.waitResponse(3000L);
+
+    modem.sendAT("+HTTPPARA=\"CONTENT\",\"application/json\"");
+    modem.waitResponse(3000L);
+    modem.sendAT("+HTTPSSL=1");
+    modem.waitResponse(3000L);
+
+    // Upload data again
+    dataCmd = "+HTTPDATA=" + String(jsonData.length()) + ",10000";
+    modem.sendAT(dataCmd.c_str());
+
+    waitStart = millis();
+    gotDownload = false;
+    while (millis() - waitStart < 5000) {
+      if (modem.stream.available()) {
+        String line = modem.stream.readStringUntil('\n');
+        line.trim();
+        if (line.indexOf("DOWNLOAD") >= 0) {
+          gotDownload = true;
+          break;
+        }
+      }
+      delay(10);
+    }
+
+    if (gotDownload) {
+      modem.stream.print(jsonData);
+      delay(500);
+      modem.waitResponse(5000L);
+
+      // Use POST (action=1) — Firebase will overwrite the node
+      modem.sendAT("+HTTPACTION=1");
+
+      waitStart = millis();
+      actionOK = false;
+      while (millis() - waitStart < 30000) {
+        if (modem.stream.available()) {
+          String line = modem.stream.readStringUntil('\n');
+          line.trim();
+          if (line.indexOf("+HTTPACTION:") >= 0) {
+            int firstComma = line.indexOf(',');
+            int secondComma = line.indexOf(',', firstComma + 1);
+            if (firstComma > 0 && secondComma > 0) {
+              httpStatus = line.substring(firstComma + 1, secondComma).toInt();
+            }
+            actionOK = true;
+            break;
+          }
+        }
+        delay(50);
+      }
+    }
+  }
+
+  // Clean up
+  sendATAndWait("+HTTPTERM", 1000);
+
+  if (actionOK && httpStatus == 200) {
+    dataBytesOut += jsonData.length(); // Track data consumed
+    return true;
+  }
+
+  Serial.printf("HTTP_%d ", httpStatus);
+  return false;
+}
+
+void sendToFirebase() {
+  if (!lteConnected) {
+    Serial.println("Firebase: LTE not connected");
+    return;
+  }
+
+  Serial.print("Firebase... ");
+
+  // Derive box status from current state
+  const char *boxStatus = "IDLE";
+  if (gpsFix) {
+    boxStatus = "ACTIVE";
+  } else if (lteConnected) {
+    boxStatus = "STANDBY";
+  }
+
+  // Get current timestamp
+  unsigned long now_epoch = getCurrentEpoch();
+
+  // Build JSON for hardware status
+  String hardwareJson = "{";
+  hardwareJson += "\"status\":\"" + String(boxStatus) + "\",";
+  hardwareJson += "\"connection\":\"LTE\",";
+  hardwareJson += "\"rssi\":" + String(getSignal()) + ",";
+  hardwareJson += "\"csq\":" + String(modem.getSignalQuality()) + ",";
+  hardwareJson += "\"op\":\"" + modem.getOperator() + "\",";
+  hardwareJson += "\"gps_fix\":" + String(gpsFix ? "true" : "false") + ",";
+  hardwareJson += "\"data_bytes\":" + String(dataBytesOut) + ",";
+  hardwareJson += "\"last_updated\":" + String(now_epoch) + ",";
+  hardwareJson += "\"last_updated_str\":\"" + formatTimestamp(now_epoch) + "\",";
+  hardwareJson += "\"time_synced\":" + String(timeSynced ? "true" : "false");
+  hardwareJson += "}";
+
+  // Send hardware status
+  String hwPath = "/hardware/" + String(HARDWARE_ID) + ".json";
+  if (httpPutToFirebase(hwPath.c_str(), hardwareJson)) {
+    Serial.print("HW:OK ");
+  } else {
+    Serial.print("HW:FAIL ");
+  }
+
+  // Send location if GPS has fix
+  if (gpsFix) {
+    String locationJson = "{";
+    locationJson += "\"latitude\":" + String(gpsLat, 6) + ",";
+    locationJson += "\"longitude\":" + String(gpsLon, 6) + ",";
+    locationJson += "\"timestamp\":" + String(now_epoch) + ",";
+    locationJson += "\"timestamp_str\":\"" + formatTimestamp(now_epoch) + "\",";
+    locationJson += "\"source\":\"box\"";
+    locationJson += "}";
+
+    String locPath = "/locations/" + String(HARDWARE_ID) + ".json";
+    if (httpPutToFirebase(locPath.c_str(), locationJson)) {
+      Serial.println("LOC:OK!");
+    } else {
+      Serial.println("LOC:FAIL");
+    }
+  } else {
+    Serial.println("(no GPS)");
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n=== GPS/LTE Firebase Test (LTE Only - AT+HTTP) ===\n");
+
+  // Initialize modem with proper power sequence
+  modemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  powerModem();
+
+  modemOK = initModem();
+
+  if (!modemOK) {
+    Serial.println("\n*** MODEM FAILED - Cannot proceed without LTE ***");
+    Serial.println("  CHECK: 1) Modem hardware connected properly");
+    Serial.println("         2) Power supply sufficient (>2A)");
+    Serial.println("         3) SIM card inserted");
+    while (1)
+      delay(1000);
+  }
+
+  gpsEnabled = initGPS();
+  Serial.println(gpsEnabled ? "GPS: Ready" : "GPS: Failed (continuing)");
+
+  Serial.println("\nConnecting via LTE...");
+  if (!connectLTE()) {
+    Serial.println("\n*** LTE CONNECTION FAILED ***");
+    Serial.println("  CHECK: 1) SIM has active data plan");
+    Serial.println("         2) LTE antenna connected");
+    Serial.println("         3) Signal coverage in area");
+    while (1)
+      delay(1000);
+  }
+
+  // ── POST-LTE: Retry AGPS + XTRA now that data is available ──
+  // These failed during GPS init because LTE wasn't connected yet
+  if (gpsEnabled) {
+    Serial.println("\nRetrying GPS assistance with LTE data...");
+
+    String resp;
+    Serial.print("  AGPS download...");
+    modem.sendAT("+CAGPS");
+    if (modem.waitResponse(15000L, resp) == 1) {
+      Serial.println(" OK (satellite data injected!)");
+    } else {
+      Serial.println(" skip");
+    }
+
+    Serial.print("  XTRA ephemeris download...");
+    modem.sendAT("+CGPSXD=0"); // Trigger immediate XTRA download
+    if (modem.waitResponse(10000L, resp) == 1) {
+      Serial.println(" OK");
+    } else {
+      Serial.println(" skip (auto-download enabled)");
+    }
+  }
+
+  // ── Sync network time (Philippine Standard Time, UTC+8) ──
+  Serial.println("\nSyncing clock to Philippine Standard Time...");
+  if (syncNetworkTime()) {
+    Serial.println("Clock: " + formatTimestamp(getCurrentEpoch()));
+  } else {
+    Serial.println("WARNING: Clock not synced — timestamps may be incorrect");
+  }
+
+  Serial.println("\n=== Ready (LTE Only - AT+HTTP) ===\n");
+}
+
+// ==================== LOOP ====================
+void loop() {
+  unsigned long now = millis();
+
+  // Check LTE connection periodically
+  if (now - lastSig >= SIGNAL_INTERVAL) {
+    if (lteConnected && modemOK) {
+      if (!modem.isGprsConnected()) {
+        Serial.println("LTE: Connection lost, reconnecting...");
+        lteConnected = false;
+        connectLTE();
+      }
+    }
+    lastSig = now;
+  }
+
+  // Read GPS (poll faster while acquiring fix, slower once locked)
+  unsigned long gpsInterval =
+      gpsFix ? GPS_INTERVAL_LOCKED : GPS_INTERVAL_ACQUIRING;
+  if (modemOK && gpsEnabled && now - lastGps >= gpsInterval) {
+    readGPS();
+    lastGps = now;
+
+    // Show GPS status periodically
+    static unsigned long lastGpsStatus = 0;
+    if (now - lastGpsStatus >= 10000) { // Every 10 seconds
+      if (gpsFix) {
+        Serial.printf("GPS: %.6f, %.6f\n", gpsLat, gpsLon);
+      } else {
+        Serial.println("GPS: No fix yet (needs outdoor + clear sky)");
+      }
+      lastGpsStatus = now;
+    }
+  }
+
+  // Re-sync network time periodically to prevent clock drift
+  if (lteConnected && now - lastTimeSync >= TIME_SYNC_INTERVAL) {
+    Serial.println("Periodic time re-sync...");
+    syncNetworkTime();
+    lastTimeSync = now;
+  }
+
+  // Send to Firebase
+  if (lteConnected && now - lastFB >= FIREBASE_INTERVAL) {
+    sendToFirebase();
+    lastFB = now;
+  }
+
+  delay(100);
+}
