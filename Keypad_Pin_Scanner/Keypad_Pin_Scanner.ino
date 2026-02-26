@@ -1,81 +1,137 @@
-/**
- * KEYPAD RAW PIN SCANNER
- *
- * Purpose: Determine the REAL row/col-to-GPIO mapping of your 4x3 keypad.
- *
- * How it works:
- *   - All 7 keypad GPIOs are tested.
- *   - Each pin is driven LOW one at a time while the others are INPUT_PULLUP.
- *   - When you press a key, two pins become connected.
- *   - The Serial Monitor prints exactly which GPIOs are bridged.
- *
- * Instructions:
- *   1. Upload this sketch.
- *   2. Open Serial Monitor at 115200 baud.
- *   3. Press each key ONE AT A TIME and note the output.
- *   4. Share the output so we can fix the mapping.
- *
- * Pinout under test (all 7 keypad GPIOs from Smart_Top_Box_Main):
- *   Current "row" pins: 13, 14, 15, 32
- *   Current "col" pins: 18, 19, 23
- */
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+#include <HardwareSerial.h>
 
-#include <Arduino.h>
+// --- LOCK SETUP ---
+#define LOCK_PIN 32 // Papunta sa PWM ng MOSFET
 
-// All 7 GPIOs connected to the keypad connector
-static const byte ALL_PINS[] = {13, 14, 15, 5, 18, 19, 23};
-static const byte PIN_COUNT = 7;
+// --- LCD SETUP ---
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+// --- KEYPAD SETUP ---
+const byte ROWS = 4; 
+const byte COLS = 3; 
+
+char keys[ROWS][COLS] = {
+  {'1','2','3'},
+  {'4','5','6'},
+  {'7','8','9'},
+  {'*','0','#'}
+};
+
+// Yung working custom pins mo
+byte rowPins[ROWS] = {13, 23, 19, 26}; 
+byte colPins[COLS] = {14, 25, 18};    
+
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// --- SYSTEM LOGIC ---
+String inputCode = "";
+const String correctCode = "1234"; 
+bool faceDetected = false; 
+
+// Serial2 para makausap ang ESP32-CAM
+#define CAM_SERIAL Serial2 
 
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println();
-  Serial.println("=============================================");
-  Serial.println(" KEYPAD RAW PIN SCANNER");
-  Serial.println(" Press each key one at a time.");
-  Serial.println(" Note which GPIOs are printed for each key.");
-  Serial.println("=============================================");
-  Serial.println();
+  Serial.begin(115200); 
+  // LILYGO RX = GPIO 16, TX = GPIO 17
+  CAM_SERIAL.begin(115200, SERIAL_8N1, 16, 17); 
+  
+  pinMode(LOCK_PIN, OUTPUT);
+  digitalWrite(LOCK_PIN, LOW); // Lock the door
+  
+  keypad.setDebounceTime(50); 
+  
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Parcel-Safe v1");
+  delay(2000); 
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Look at Camera"); 
 }
 
 void loop() {
-  // For each pin: drive it LOW, set all others to INPUT_PULLUP,
-  // then check which other pins read LOW (meaning they're connected
-  // to the driven pin through the pressed button).
-
-  for (byte d = 0; d < PIN_COUNT; d++) {
-    // Drive pin d LOW
-    pinMode(ALL_PINS[d], OUTPUT);
-    digitalWrite(ALL_PINS[d], LOW);
-
-    // Set every other pin to INPUT_PULLUP
-    for (byte r = 0; r < PIN_COUNT; r++) {
-      if (r == d)
-        continue;
-      pinMode(ALL_PINS[r], INPUT_PULLUP);
+  // 1. MAKINIG SA ESP32-CAM
+  if (CAM_SERIAL.available()) {
+    String msg = CAM_SERIAL.readStringUntil('\n');
+    msg.trim(); 
+    Serial.println("From CAM: " + msg);
+    
+    if (msg == "FACE_YES" && !faceDetected) {
+      faceDetected = true;
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Enter PIN:");
+      inputCode = "";
+    } 
+    else if (msg == "FACE_NO" && faceDetected) {
+      faceDetected = false;
+      inputCode = "";
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Look at Camera");
     }
+    else if (msg == "PHOTO_DONE") {
+      unlockDoor();
+    }
+  }
 
-    delayMicroseconds(50); // let pullups settle
+  // 2. BASAHIN ANG KEYPAD (Gagana lang kapag True ang faceDetected)
+  if (faceDetected) {
+    char key = keypad.getKey();
 
-    // Read the other pins
-    for (byte r = 0; r < PIN_COUNT; r++) {
-      if (r == d)
-        continue;
-      if (digitalRead(ALL_PINS[r]) == LOW) {
-        // Found a connection!
-        Serial.printf(">> KEY DETECTED:  GPIO %2d  <-->  GPIO %2d\n",
-                      ALL_PINS[d], ALL_PINS[r]);
-
-        // Wait for key release to avoid spam
-        while (digitalRead(ALL_PINS[r]) == LOW) {
-          delay(10);
+    if (key) {
+      if (key == '*') {
+        inputCode = "";
+        lcd.setCursor(0, 1);
+        lcd.print("                ");
+      } 
+      else if (key == '#') {
+        if (inputCode == correctCode) {
+          lcd.setCursor(0, 1);
+          lcd.print("Verifying...    ");
+          
+          // UTUSAN ANG ESP32-CAM NA KUMUHA NG PICTURE
+          CAM_SERIAL.println("TAKE_PHOTO"); 
+          
+        } else {
+          lcd.setCursor(0, 1);
+          lcd.print("Wrong PIN!      ");
+          delay(2000);
+          inputCode = "";
+          lcd.setCursor(0, 1);
+          lcd.print("                ");
         }
-        Serial.println("   (released)");
-        delay(200); // debounce
+      } 
+      else {
+        if (inputCode.length() < 4) {
+          inputCode += key;
+          lcd.setCursor(0, 1);
+          lcd.print(inputCode);
+        }
       }
     }
-
-    // Reset the driven pin back to input so it doesn't interfere
-    pinMode(ALL_PINS[d], INPUT_PULLUP);
   }
+}
+
+void unlockDoor() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Box Unlocked!");
+  
+  digitalWrite(LOCK_PIN, HIGH); // Pitik sa solenoid
+  delay(3000);                  // Bukas ng 3 segundo
+  digitalWrite(LOCK_PIN, LOW);  // Patay kuryente
+  
+  inputCode = ""; 
+  faceDetected = false; 
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Look at Camera");
 }
