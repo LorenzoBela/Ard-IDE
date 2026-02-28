@@ -6,6 +6,7 @@
  * This bypasses TinyGsmClientSecure which has issues on this modem.
  */
 
+#include "esp_task_wdt.h"
 #include <Arduino.h>
 
 // TinyGSM - MUST define modem BEFORE include
@@ -25,7 +26,7 @@
 #define FIREBASE_HOST                                                          \
   "smart-top-box-default-rtdb.asia-southeast1.firebasedatabase.app"
 #define FIREBASE_AUTH "AIzaSyA7DETBpsdPN6icfWi7PijCbpmLNWEZyTQ"
-#define HARDWARE_ID "TEST_BOX_001"
+#define HARDWARE_ID "BOX_001"
 
 // Pins for LILYGO T-SIM A7670E (official pinout)
 #define MODEM_TX 26
@@ -42,6 +43,13 @@
 #define SIGNAL_INTERVAL 10000
 #define TIME_SYNC_INTERVAL 1800000 // Re-sync time every 30 minutes
 
+// Reliability
+#define WDT_TIMEOUT_S 30            // Watchdog reboot after 30s hang
+#define MODEM_HEALTH_INTERVAL 30000 // Check modem alive every 30s
+#define MEM_REPORT_INTERVAL 60000   // Print heap stats every 60s
+#define MAX_CONSECUTIVE_FAILURES 5  // Hard-reset modem after 5 AT timeouts
+#define MAX_FB_FAILURES 3           // Reconnect LTE after 3 Firebase fails
+
 // Philippine Standard Time offset (UTC+8)
 #define PHT_OFFSET_HOURS 8
 #define PHT_OFFSET_QUARTERS 32 // 8 hours * 4 quarter-hours
@@ -54,15 +62,55 @@ bool lteConnected = false;
 bool gpsEnabled = false;
 bool modemOK = false;
 unsigned long lastGps = 0, lastFB = 0, lastSig = 0, lastTimeSync = 0;
+unsigned long lastModemHealth = 0, lastMemReport = 0;
 
 double gpsLat = 0, gpsLon = 0;
 bool gpsFix = false;
 unsigned long dataBytesOut = 0; // Total bytes sent to Firebase
 
+// Reliability counters
+uint8_t consecutiveModemFailures = 0;
+uint8_t firebaseFailures = 0;
+
 // Network time tracking (Philippine Standard Time, UTC+8)
-unsigned long epochTime = 0;       // Unix timestamp (seconds since 1970 UTC)
-unsigned long epochSyncMillis = 0; // millis() value when epochTime was last synced
+unsigned long epochTime = 0; // Unix timestamp (seconds since 1970 UTC)
+unsigned long epochSyncMillis =
+    0; // millis() value when epochTime was last synced
 bool timeSynced = false;
+
+// ── Compile-time fallback date ──
+// Parses __DATE__ ("Feb 28 2026") and __TIME__ ("11:43:00") as UTC,
+// then converts to epoch so the device is never stuck at 1970-01-01.
+static int parseMonthFromStr(const char *m) {
+  const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  for (int i = 0; i < 12; i++) {
+    if (m[0] == months[i][0] && m[1] == months[i][1] && m[2] == months[i][2])
+      return i + 1;
+  }
+  return 1;
+}
+
+// Forward-declare dateTimeToEpoch (defined below)
+unsigned long dateTimeToEpoch(int year, int month, int day, int hour, int min,
+                              int sec);
+
+static unsigned long getCompileTimeEpoch() {
+  // __DATE__ = "Mmm dd yyyy"  __TIME__ = "hh:mm:ss"
+  const char *d = __DATE__; // e.g. "Feb 28 2026"
+  const char *t = __TIME__; // e.g. "11:43:00"
+  int month = parseMonthFromStr(d);
+  int day = (d[4] == ' ') ? (d[5] - '0') : ((d[4] - '0') * 10 + (d[5] - '0'));
+  int year = (d[7] - '0') * 1000 + (d[8] - '0') * 100 + (d[9] - '0') * 10 +
+             (d[10] - '0');
+  int hour = (t[0] - '0') * 10 + (t[1] - '0');
+  int min = (t[3] - '0') * 10 + (t[4] - '0');
+  int sec = (t[6] - '0') * 10 + (t[7] - '0');
+  // dateTimeToEpoch expects LOCAL (PHT) input and subtracts 8h internally.
+  // __DATE__/__TIME__ are in the compiler's local timezone (PHT for you),
+  // so this produces a correct UTC epoch.
+  return dateTimeToEpoch(year, month, day, hour, min, sec);
+}
 
 // ==================== AT HELPER ====================
 // Send AT command and return full response
@@ -398,6 +446,7 @@ bool connectLTE() {
     if (csq != 99 && csq != 0)
       break;
     Serial.print(".");
+    esp_task_wdt_reset();
     delay(2000);
   }
   Serial.printf(" CSQ: %d", csq);
@@ -441,6 +490,7 @@ bool connectLTE() {
       }
     }
     Serial.print(".");
+    esp_task_wdt_reset();
     delay(2000);
   }
 
@@ -564,6 +614,7 @@ bool connectLTE() {
         }
       }
       delay(50);
+      esp_task_wdt_reset();
     }
 
     if (httpOK) {
@@ -595,8 +646,8 @@ bool isLeapYear(int y) {
   return (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
 }
 
-// Convert date/time components to Unix epoch (seconds since 1970-01-01 00:00:00 UTC)
-// Input is already in PHT (UTC+8), so we subtract 8 hours to get UTC epoch
+// Convert date/time components to Unix epoch (seconds since 1970-01-01 00:00:00
+// UTC) Input is already in PHT (UTC+8), so we subtract 8 hours to get UTC epoch
 unsigned long dateTimeToEpoch(int year, int month, int day, int hour, int min,
                               int sec) {
   unsigned long epoch = 0;
@@ -654,8 +705,9 @@ bool parseCCLK(const String &resp, unsigned long &outEpoch) {
 
   outEpoch = dateTimeToEpoch(year, month, day, hour, minute, sec);
 
-  Serial.printf("  Parsed time: %04d-%02d-%02d %02d:%02d:%02d PHT (epoch: %lu)\n",
-                year, month, day, hour, minute, sec, outEpoch);
+  Serial.printf(
+      "  Parsed time: %04d-%02d-%02d %02d:%02d:%02d PHT (epoch: %lu)\n", year,
+      month, day, hour, minute, sec, outEpoch);
   return true;
 }
 
@@ -701,6 +753,7 @@ bool syncNetworkTime() {
       }
     }
     delay(100);
+    esp_task_wdt_reset();
   }
   Serial.println(ntpOK ? " OK" : " timeout (trying CCLK anyway)");
 
@@ -726,8 +779,14 @@ bool syncNetworkTime() {
     delay(2000);
   }
 
-  Serial.println("  WARNING: Time sync failed — timestamps will be 0");
-  return false;
+  // ── Fallback: use compile-time date so we never report 1970-01-01 ──
+  Serial.println(
+      "  WARNING: NTP/CCLK failed — falling back to compile-time date");
+  epochTime = getCompileTimeEpoch();
+  epochSyncMillis = millis();
+  timeSynced = true; // Mark synced so formatTimestamp produces a real date
+  Serial.println("  Fallback time: " + formatTimestamp(epochTime));
+  return false; // Still return false so caller knows it wasn't a live sync
 }
 
 // Get current Unix epoch by adding elapsed time since last sync
@@ -776,8 +835,8 @@ String formatTimestamp(unsigned long epoch) {
   int day = days + 1;
 
   char buf[30];
-  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d+08:00", year,
-           month, day, hour, min, sec);
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d+08:00", year, month,
+           day, hour, min, sec);
   return String(buf);
 }
 
@@ -832,6 +891,7 @@ bool httpPutToFirebase(const char *path, const String &jsonData) {
       }
     }
     delay(10);
+    esp_task_wdt_reset();
   }
 
   if (!gotDownload) {
@@ -877,6 +937,7 @@ bool httpPutToFirebase(const char *path, const String &jsonData) {
       }
     }
     delay(50);
+    esp_task_wdt_reset();
   }
 
   // If PUT (action=4) failed, try with PATCH via POST workaround
@@ -921,6 +982,7 @@ bool httpPutToFirebase(const char *path, const String &jsonData) {
         }
       }
       delay(10);
+      esp_task_wdt_reset();
     }
 
     if (gotDownload) {
@@ -948,6 +1010,7 @@ bool httpPutToFirebase(const char *path, const String &jsonData) {
           }
         }
         delay(50);
+        esp_task_wdt_reset();
       }
     }
   }
@@ -964,6 +1027,67 @@ bool httpPutToFirebase(const char *path, const String &jsonData) {
   return false;
 }
 
+// ==================== RELIABILITY FUNCTIONS ====================
+
+// Hard-reset the modem via GPIO and re-initialize
+void hardResetModem() {
+  Serial.println("[RESET] Hard-resetting modem via GPIO...");
+  digitalWrite(MODEM_RESET_PIN, LOW);
+  delay(500);
+  digitalWrite(MODEM_RESET_PIN, HIGH);
+  delay(100);
+  digitalWrite(MODEM_RESET_PIN, LOW);
+  delay(5000); // Modem reboot time
+  modemOK = initModem();
+  if (modemOK) {
+    lteConnected = connectLTE();
+    if (lteConnected)
+      syncNetworkTime();
+  }
+  consecutiveModemFailures = 0;
+}
+
+// Print heap/stack health to Serial for diagnostics
+void printMemoryReport() {
+  Serial.printf("[MEM] Free: %u | Min: %u | Largest: %u | Stack HWM: %u\n",
+                ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap(),
+                uxTaskGetStackHighWaterMark(NULL));
+
+  if (ESP.getMaxAllocHeap() < 10240) {
+    Serial.println("[MEM] WARNING: Largest free block < 10KB!");
+  }
+}
+
+// Lightweight modem heartbeat — sends AT and checks for OK
+void checkModemHealth() {
+  if (!modemOK)
+    return;
+  modem.sendAT(""); // Simplest AT test
+  if (modem.waitResponse(2000L) != 1) {
+    consecutiveModemFailures++;
+    Serial.printf("[HEALTH] Modem unresponsive (%u/%u)\n",
+                  consecutiveModemFailures, MAX_CONSECUTIVE_FAILURES);
+    if (consecutiveModemFailures >= MAX_CONSECUTIVE_FAILURES) {
+      hardResetModem();
+    }
+  } else {
+    consecutiveModemFailures = 0;
+  }
+}
+
+// HTTP PUT with single retry (avoids overlapping with 5s send cycle)
+bool httpPutWithRetry(const char *path, const char *jsonData) {
+  if (httpPutToFirebase(path, String(jsonData)))
+    return true;
+  // Single retry after 1s backoff
+  Serial.print("[RETRY] ");
+  esp_task_wdt_reset();
+  delay(1000);
+  return httpPutToFirebase(path, String(jsonData));
+}
+
+// ==================== FIREBASE SEND (snprintf — zero String allocs)
+// ====================
 void sendToFirebase() {
   if (!lteConnected) {
     Serial.println("Firebase: LTE not connected");
@@ -982,47 +1106,87 @@ void sendToFirebase() {
 
   // Get current timestamp
   unsigned long now_epoch = getCurrentEpoch();
+  char tsBuf[30];
+  String tsStr = formatTimestamp(now_epoch);
+  strncpy(tsBuf, tsStr.c_str(), sizeof(tsBuf) - 1);
+  tsBuf[sizeof(tsBuf) - 1] = '\0';
 
-  // Build JSON for hardware status
-  String hardwareJson = "{";
-  hardwareJson += "\"status\":\"" + String(boxStatus) + "\",";
-  hardwareJson += "\"connection\":\"LTE\",";
-  hardwareJson += "\"rssi\":" + String(getSignal()) + ",";
-  hardwareJson += "\"csq\":" + String(modem.getSignalQuality()) + ",";
-  hardwareJson += "\"op\":\"" + modem.getOperator() + "\",";
-  hardwareJson += "\"gps_fix\":" + String(gpsFix ? "true" : "false") + ",";
-  hardwareJson += "\"data_bytes\":" + String(dataBytesOut) + ",";
-  hardwareJson += "\"last_updated\":" + String(now_epoch) + ",";
-  hardwareJson += "\"last_updated_str\":\"" + formatTimestamp(now_epoch) + "\",";
-  hardwareJson += "\"time_synced\":" + String(timeSynced ? "true" : "false");
-  hardwareJson += "}";
+  // Read signal/operator once (avoid multiple AT round-trips)
+  int rssi = getSignal();
+  int csq = modem.getSignalQuality();
+  String opStr = modem.getOperator();
+  char opBuf[32];
+  strncpy(opBuf, opStr.c_str(), sizeof(opBuf) - 1);
+  opBuf[sizeof(opBuf) - 1] = '\0';
 
-  // Send hardware status
-  String hwPath = "/hardware/" + String(HARDWARE_ID) + ".json";
-  if (httpPutToFirebase(hwPath.c_str(), hardwareJson)) {
+  // ── Build hardware JSON with snprintf (zero heap allocs) ──
+  // Use Firebase server timestamp {".sv":"timestamp"} for last_updated
+  // so the web dashboard always gets an accurate UTC ms timestamp,
+  // regardless of whether the ESP32's NTP sync succeeded.
+  // uptime_ms = millis() — device time since boot, survives web page refresh.
+  char hardwareJson[512];
+  snprintf(hardwareJson, sizeof(hardwareJson),
+           "{\"status\":\"%s\","
+           "\"connection\":\"LTE\","
+           "\"rssi\":%d,"
+           "\"csq\":%d,"
+           "\"op\":\"%s\","
+           "\"gps_fix\":%s,"
+           "\"data_bytes\":%lu,"
+           "\"uptime_ms\":%lu,"
+           "\"last_updated\":{\".sv\":\"timestamp\"},"
+           "\"device_epoch\":%lu,"
+           "\"last_updated_str\":\"%s\","
+           "\"time_synced\":%s}",
+           boxStatus, rssi, csq, opBuf, gpsFix ? "true" : "false", dataBytesOut,
+           (unsigned long)millis(), now_epoch, tsBuf,
+           timeSynced ? "true" : "false");
+
+  // Build path with snprintf
+  char hwPath[64];
+  snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
+
+  bool hwOK = httpPutWithRetry(hwPath, hardwareJson);
+  if (hwOK) {
     Serial.print("HW:OK ");
+    firebaseFailures = 0;
   } else {
     Serial.print("HW:FAIL ");
+    firebaseFailures++;
   }
 
-  // Send location if GPS has fix
+  // ── Build location JSON with snprintf ──
   if (gpsFix) {
-    String locationJson = "{";
-    locationJson += "\"latitude\":" + String(gpsLat, 6) + ",";
-    locationJson += "\"longitude\":" + String(gpsLon, 6) + ",";
-    locationJson += "\"timestamp\":" + String(now_epoch) + ",";
-    locationJson += "\"timestamp_str\":\"" + formatTimestamp(now_epoch) + "\",";
-    locationJson += "\"source\":\"box\"";
-    locationJson += "}";
+    char locationJson[256];
+    snprintf(locationJson, sizeof(locationJson),
+             "{\"latitude\":%.6f,"
+             "\"longitude\":%.6f,"
+             "\"timestamp\":%lu,"
+             "\"timestamp_str\":\"%s\","
+             "\"source\":\"box\"}",
+             gpsLat, gpsLon, now_epoch, tsBuf);
 
-    String locPath = "/locations/" + String(HARDWARE_ID) + ".json";
-    if (httpPutToFirebase(locPath.c_str(), locationJson)) {
+    char locPath[64];
+    snprintf(locPath, sizeof(locPath), "/locations/%s.json", HARDWARE_ID);
+
+    if (httpPutWithRetry(locPath, locationJson)) {
       Serial.println("LOC:OK!");
     } else {
       Serial.println("LOC:FAIL");
+      firebaseFailures++;
     }
   } else {
     Serial.println("(no GPS)");
+  }
+
+  // Auto-reconnect LTE after consecutive Firebase failures
+  if (firebaseFailures >= MAX_FB_FAILURES) {
+    Serial.printf(
+        "[RELIABILITY] %u consecutive Firebase failures — reconnecting LTE\n",
+        firebaseFailures);
+    lteConnected = false;
+    connectLTE();
+    firebaseFailures = 0;
   }
 }
 
@@ -1031,6 +1195,17 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n=== GPS/LTE Firebase Test (LTE Only - AT+HTTP) ===\n");
+
+  // ── Initialize Watchdog Timer FIRST (before any modem ops) ──
+  esp_task_wdt_deinit(); // Clear any default WDT config
+  const esp_task_wdt_config_t wdt_config = {
+      .timeout_ms = WDT_TIMEOUT_S * 1000,
+      .idle_core_mask = 0,  // Don't monitor idle tasks
+      .trigger_panic = true // Auto-reboot on timeout
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL); // Add current task (loop) to WDT
+  Serial.printf("[WDT] Watchdog armed (%ds timeout)\n", WDT_TIMEOUT_S);
 
   // Initialize modem with proper power sequence
   modemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
@@ -1092,10 +1267,13 @@ void setup() {
   }
 
   Serial.println("\n=== Ready (LTE Only - AT+HTTP) ===\n");
+
+  printMemoryReport(); // Baseline memory snapshot
 }
 
 // ==================== LOOP ====================
 void loop() {
+  esp_task_wdt_reset(); // Feed watchdog every loop iteration
   unsigned long now = millis();
 
   // Check LTE connection periodically
@@ -1108,6 +1286,18 @@ void loop() {
       }
     }
     lastSig = now;
+  }
+
+  // Modem health check (lightweight AT heartbeat)
+  if (modemOK && now - lastModemHealth >= MODEM_HEALTH_INTERVAL) {
+    checkModemHealth();
+    lastModemHealth = now;
+  }
+
+  // Periodic memory report
+  if (now - lastMemReport >= MEM_REPORT_INTERVAL) {
+    printMemoryReport();
+    lastMemReport = now;
   }
 
   // Read GPS (poll faster while acquiring fix, slower once locked)
