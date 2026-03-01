@@ -1,108 +1,128 @@
-#include <WiFi.h>
+/**
+ * ESP32-CAM OV3660 → Supabase R3 (Person-Detection Triggered)
+ * DOWNGRADED TO ESP32 CORE 2.0.X & ESP-FACE
+ *
+ * Behaviour:
+ * - Continuously grabs QVGA frames and runs ESP-Face detection.
+ * - Person detected  → captures a hi-res JPEG and uploads to Supabase.
+ * - No person        → does nothing.
+ *
+ * Requirements:
+ * - ESP32 Arduino Core 2.0.17
+ * - PSRAM enabled (Tools → PSRAM → Enabled)
+ * - AI-Thinker ESP32-CAM board
+ * - Partition Scheme: Huge APP (3MB No OTA / 1MB SPIFFS)
+ *
+ * Serial commands:
+ * c = force manual capture & upload (bypass detection)
+ * h = show help
+ */
+
 #include <HTTPClient.h>
+#include <WiFi.h>
+#include <esp_arduino_version.h>
 #include <esp_camera.h>
-#include <time.h>
 #include <esp_log.h>
+#include <img_converters.h>
+#include <time.h>
+
+#if !defined(ESP_ARDUINO_VERSION_MAJOR) || ESP_ARDUINO_VERSION_MAJOR != 2
+#error                                                                         \
+    "This sketch strictly requires ESP32 Core 2.0.x (e.g. 2.0.17). Please downgrade in Boards Manager."
+#endif
+
+// Advanced Local Face Detection (built-in to ESP32 Core 2.x camera driver)
+#include "human_face_detect_mnp01.hpp"
+#include "human_face_detect_msr01.hpp"
 
 // ===================== USER CONFIG =====================
-#define WIFI_SSID "RAJ_VIRUS2"
-#define WIFI_PASSWORD "I@mjero4ever"
+#define WIFI_SSID "GlobeAtHome_e9a28_2.4"
+#define WIFI_PASSWORD "furymabaho912!"
 
 #define SUPABASE_URL "https://lvpneakciqegwyymtqno.supabase.co"
 #define SUPABASE_BUCKET "r3"
-#define SUPABASE_API_KEY "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx2cG5lYWtjaXFlZ3d5eW10cW5vIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njc5MDYzNzgsImV4cCI6MjA4MzQ4MjM3OH0.liZ3l1u18H7WwIc72P9JgBTp9b7zUlLfPUhCAndW9uU"
+#define SUPABASE_API_KEY                                                       \
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."                                      \
+  "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx2cG5lYWtjaXFlZ3d5eW10cW5vIiwicm9sZSI6Im" \
+  "Fub24iLCJpYXQiOjE3Njc5MDYzNzgsImV4cCI6MjA4MzQ4MjM3OH0."                     \
+  "liZ3l1u18H7WwIc72P9JgBTp9b7zUlLfPUhCAndW9uU"
 #define SUPABASE_SERVICE_ROLE_KEY ""
 
 #define DEVICE_ID "OV3660_CAM_001"
 #define FILE_PREFIX "capture"
-#define CAPTURE_INTERVAL_MS 10000
 #define MAX_UPLOAD_RETRIES 3
-#define FAST_CAPTURE_MODE true
-#define FAST_DETAIL_PS_FRAME_SIZE FRAMESIZE_CIF
-#define FAST_DETAIL_NO_PSRAM_FRAME_SIZE FRAMESIZE_QVGA
-#define FAST_DETAIL_PS_JPEG_QUALITY 10
-#define FAST_DETAIL_NO_PSRAM_JPEG_QUALITY 10
-#define CAMERA_XCLK_HZ 10000000
-#define CAPTURE_FLUSH_FRAMES 1
-#define CAPTURE_FLUSH_DELAY_MS 25
 
-// ===================== CAMERA MODEL: AI THINKER =====================
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
+// ===================== DETECTION CONFIG =====================
+#define DETECTION_COOLDOWN_MS 5000     // Min time between uploads
+#define UPLOAD_FRAME_SIZE FRAMESIZE_HD // 1280×720
+#define UPLOAD_JPEG_QUALITY 8
 
-unsigned long lastCaptureAt = 0;
-bool autoCaptureEnabled = false;
-bool captureFallbackActive = false;
+// ===================== CAMERA PINS: AI THINKER =====================
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM 0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM 35
+#define Y8_GPIO_NUM 34
+#define Y7_GPIO_NUM 39
+#define Y6_GPIO_NUM 36
+#define Y5_GPIO_NUM 21
+#define Y4_GPIO_NUM 19
+#define Y3_GPIO_NUM 18
+#define Y2_GPIO_NUM 5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM 23
+#define PCLK_GPIO_NUM 22
 
-void applyRecoverySensorProfile() {
-  sensor_t* sensor = esp_camera_sensor_get();
-  if (!sensor) {
-    return;
-  }
+// ===================== STATE =====================
+static unsigned long lastUploadAt = 0;
+static unsigned long scanCount = 0;
+static unsigned long personCount = 0;
+static bool cameraInDetectMode = true;
 
-  sensor->reset(sensor);
-  delay(120);
-  sensor->set_framesize(sensor, FRAMESIZE_QVGA);
-  sensor->set_quality(sensor, 12);
-  sensor->set_brightness(sensor, -1);
-  sensor->set_contrast(sensor, 1);
-  sensor->set_sharpness(sensor, 1);
-  captureFallbackActive = true;
-  Serial.println("Applied recovery profile: QVGA / quality 12.");
-}
+// Initialize ESP-Face models
+HumanFaceDetectMSR01 *s1;
+
+// ===================== HELPERS =====================
 
 void printCommands() {
-  Serial.println("Commands:");
-  Serial.println("  c = capture and upload one photo");
-  Serial.println("  a = toggle auto capture ON/OFF");
-  Serial.println("  h or ? = show commands");
+  Serial.println(F("Commands:"));
+  Serial.println(F("  c = force capture & upload (bypass detection)"));
+  Serial.println(F("  h or ? = show commands"));
 }
 
 bool hasUnsetConfig() {
-  return String(WIFI_SSID).length() == 0 ||
-         String(WIFI_PASSWORD).length() == 0 ||
-         String(SUPABASE_URL).length() == 0 ||
-         String(SUPABASE_API_KEY).length() == 0;
+  return strlen(WIFI_SSID) == 0 || strlen(WIFI_PASSWORD) == 0 ||
+         strlen(SUPABASE_URL) == 0 || strlen(SUPABASE_API_KEY) == 0;
 }
 
-String getSupabaseBearerToken() {
-  if (String(SUPABASE_SERVICE_ROLE_KEY).length() > 0) {
-    return String(SUPABASE_SERVICE_ROLE_KEY);
+const char *getSupabaseBearerToken() {
+  if (strlen(SUPABASE_SERVICE_ROLE_KEY) > 0) {
+    return SUPABASE_SERVICE_ROLE_KEY;
   }
-  return String(SUPABASE_API_KEY);
+  return SUPABASE_API_KEY;
 }
+
+// ===================== WIFI =====================
 
 void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  Serial.print("Connecting to WiFi");
+  Serial.print(F("Connecting to WiFi"));
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 30000) {
     delay(400);
-    Serial.print(".");
+    Serial.print('.');
   }
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi connected. IP: ");
+    Serial.print(F("WiFi connected. IP: "));
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("WiFi connection failed.");
+    Serial.println(F("WiFi connection failed."));
   }
 }
 
@@ -110,32 +130,13 @@ void initTime() {
   configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
   struct tm timeinfo;
   if (getLocalTime(&timeinfo, 5000)) {
-    Serial.println("NTP time synced.");
+    Serial.println(F("NTP time synced."));
   } else {
-    Serial.println("NTP sync failed (using millis fallback for filenames).");
+    Serial.println(F("NTP sync failed (millis fallback)."));
   }
 }
 
-camera_fb_t* getFrameWithRetry(int retries, int delayMs) {
-  for (int attempt = 0; attempt < retries; attempt++) {
-    camera_fb_t* frame = esp_camera_fb_get();
-    if (frame) {
-      return frame;
-    }
-    delay(delayMs);
-  }
-  return nullptr;
-}
-
-void flushCameraFrames(int count) {
-  for (int i = 0; i < count; i++) {
-    camera_fb_t* oldFrame = esp_camera_fb_get();
-    if (oldFrame) {
-      esp_camera_fb_return(oldFrame);
-    }
-    delay(CAPTURE_FLUSH_DELAY_MS);
-  }
-}
+// ===================== CAMERA =====================
 
 bool initCamera() {
   camera_config_t config;
@@ -157,179 +158,302 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = CAMERA_XCLK_HZ;
-  config.pixel_format = PIXFORMAT_JPEG;
+  config.xclk_freq_hz = 20000000;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.ledc_channel = LEDC_CHANNEL_0;
 
-  if (FAST_CAPTURE_MODE) {
-    if (psramFound()) {
-      config.frame_size = FAST_DETAIL_PS_FRAME_SIZE;          // high detail + still responsive
-      config.jpeg_quality = FAST_DETAIL_PS_JPEG_QUALITY;      // lower is better quality
-      config.fb_count = 2;
-    } else {
-      config.frame_size = FAST_DETAIL_NO_PSRAM_FRAME_SIZE;    // safer for boards without PSRAM
-      config.jpeg_quality = FAST_DETAIL_NO_PSRAM_JPEG_QUALITY;
-      config.fb_count = 1;
-    }
-    config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-  } else if (psramFound()) {
-    config.frame_size = FRAMESIZE_SVGA;    // 800x600 test quality
-    config.jpeg_quality = 10;              // lower is better quality
-    config.fb_count = 2;
-  } else {
-    config.frame_size = FRAMESIZE_VGA;     // 640x480 safe fallback
-    config.jpeg_quality = 12;
-    config.fb_count = 1;
-  }
+  // For ESP-Face, PIXFORMAT_RGB565 directly feeds the algorithm without DMA
+  // timeouts on 2.0.x
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.jpeg_quality = 12;
+  config.fb_count = 2; // 2 buffers + GRAB_LATEST silently drops stale frames,
+                       // preventing EV-VSYNC-OVF log spam
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.print("Camera init failed: 0x");
-    Serial.println(err, HEX);
+    Serial.printf("Camera init failed: 0x%x\n", err);
     return false;
   }
 
-  sensor_t* sensor = esp_camera_sensor_get();
-  if (!sensor) {
-    Serial.println("Failed to access camera sensor.");
-    return false;
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor) {
+    if (sensor->id.PID == OV3660_PID) {
+      Serial.println(F("OV3660 detected."));
+    }
+    // Optimise for clarity and detection
+    sensor->set_vflip(sensor, 1);
+    sensor->set_hmirror(sensor, 1);
+    sensor->set_brightness(sensor, 0);
+    sensor->set_contrast(sensor, 0);
+    sensor->set_saturation(sensor, 0);
+    sensor->set_sharpness(sensor, 1);
+    sensor->set_exposure_ctrl(sensor, 1);
   }
 
-  if (sensor->id.PID == OV3660_PID) {
-    Serial.println("OV3660 detected.");
-  } else {
-    Serial.print("Camera detected but PID is not OV3660: 0x");
-    Serial.println(sensor->id.PID, HEX);
-  }
-
-  sensor->set_brightness(sensor, -2);
-  sensor->set_contrast(sensor, 1);
-  sensor->set_saturation(sensor, 0);
-  sensor->set_sharpness(sensor, 1);
-  sensor->set_exposure_ctrl(sensor, 1);
-  sensor->set_aec2(sensor, 1);
-  sensor->set_ae_level(sensor, 0);
-  sensor->set_aec_value(sensor, 300);
-  sensor->set_gain_ctrl(sensor, 1);
-  sensor->set_bpc(sensor, 1);
-
-  if (FAST_CAPTURE_MODE) {
-    Serial.println("Capture profile: FAST + HIGH DETAIL");
-  }
+  cameraInDetectMode = true;
+  Serial.println(F("Camera initialised (QVGA RGB565 for ESP-Face)."));
   return true;
 }
 
+void switchToUploadMode() {
+  if (!cameraInDetectMode)
+    return;
+
+  esp_camera_deinit();
+  delay(100);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.ledc_channel = LEDC_CHANNEL_0;
+
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = UPLOAD_FRAME_SIZE;
+  config.jpeg_quality = UPLOAD_JPEG_QUALITY;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.fb_count = 2; // Need 2 for JPEG DMA
+
+  esp_camera_init(&config);
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor) {
+    sensor->set_vflip(sensor, 1);
+    sensor->set_hmirror(sensor, 1);
+  }
+
+  cameraInDetectMode = false;
+}
+
+void switchToDetectMode() {
+  if (cameraInDetectMode)
+    return;
+
+  esp_camera_deinit();
+  delay(100);
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = Y2_GPIO_NUM;
+  config.pin_d1 = Y3_GPIO_NUM;
+  config.pin_d2 = Y4_GPIO_NUM;
+  config.pin_d3 = Y5_GPIO_NUM;
+  config.pin_d4 = Y6_GPIO_NUM;
+  config.pin_d5 = Y7_GPIO_NUM;
+  config.pin_d6 = Y8_GPIO_NUM;
+  config.pin_d7 = Y9_GPIO_NUM;
+  config.pin_xclk = XCLK_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
+  config.pin_vsync = VSYNC_GPIO_NUM;
+  config.pin_href = HREF_GPIO_NUM;
+  config.pin_sccb_sda = SIOD_GPIO_NUM;
+  config.pin_sccb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn = PWDN_GPIO_NUM;
+  config.pin_reset = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.ledc_channel = LEDC_CHANNEL_0;
+
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size = FRAMESIZE_QVGA;
+  config.jpeg_quality = 12;
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.fb_count = 2;
+
+  esp_camera_init(&config);
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor) {
+    sensor->set_vflip(sensor, 1);
+    sensor->set_hmirror(sensor, 1);
+  }
+
+  cameraInDetectMode = true;
+}
+
+// ===================== DETECTION =====================
+
+/**
+ * Returns true if a face is detected
+ */
+bool runFaceDetection() {
+  camera_fb_t *fb = nullptr;
+  for (int i = 0; i < 3; i++) {
+    fb = esp_camera_fb_get();
+    if (fb)
+      break;
+    delay(50);
+  }
+
+  if (!fb) {
+    Serial.println(F("Detection: frame grab failed. Resetting..."));
+    esp_camera_deinit();
+    delay(100);
+    initCamera();
+    return false;
+  }
+
+  // Convert RGB565 to RGB888 for ESP-Face (MSR01 expects 24-bit RGB)
+  size_t rgbBytes = (size_t)fb->width * (size_t)fb->height * 3;
+  uint8_t *rgbBuffer = (uint8_t *)ps_malloc(rgbBytes);
+  if (!rgbBuffer) {
+    Serial.println(F("Face detect skipped: RGB buffer alloc failed."));
+    esp_camera_fb_return(fb);
+    return false;
+  }
+
+  bool converted = fmt2rgb888(fb->buf, fb->len, fb->format, rgbBuffer);
+  esp_camera_fb_return(fb); // Free fb early
+
+  if (!converted) {
+    free(rgbBuffer);
+    return false;
+  }
+
+  // Run MSR01 Face Detection
+  std::list<dl::detect::result_t> &results =
+      s1->infer(rgbBuffer, {(int)fb->height, (int)fb->width, 3});
+
+  bool detected = false;
+  if (results.size() > 0) {
+    detected = true;
+  }
+
+  free(rgbBuffer);
+  return detected;
+}
+
+// ===================== UPLOAD =====================
+
 String makeObjectPath() {
   char filename[96];
-
-  snprintf(filename, sizeof(filename), FILE_PREFIX "_%lu.jpg", millis());
-
+  snprintf(filename, sizeof(filename), "%s_%lu.jpg", FILE_PREFIX, millis());
   return String("esp32cam/") + DEVICE_ID + "/" + filename;
 }
 
-bool uploadToSupabase(const uint8_t* data, size_t len, const String& objectPath) {
+bool uploadToSupabase(const uint8_t *data, size_t len,
+                      const String &objectPath) {
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("Upload skipped: WiFi not connected.");
+      Serial.println(F("Upload skipped: WiFi disconnected."));
       return false;
     }
   }
 
   HTTPClient http;
-  String endpoint = String(SUPABASE_URL) + "/storage/v1/object/" + SUPABASE_BUCKET + "/" + objectPath;
+  String endpoint = String(SUPABASE_URL) + "/storage/v1/object/" +
+                    SUPABASE_BUCKET + "/" + objectPath;
 
   http.setTimeout(25000);
   http.begin(endpoint);
-  http.addHeader("Authorization", "Bearer " + getSupabaseBearerToken());
+  http.addHeader("Authorization", "Bearer " + String(getSupabaseBearerToken()));
   http.addHeader("apikey", String(SUPABASE_API_KEY));
   http.addHeader("Content-Type", "image/jpeg");
   http.addHeader("x-upsert", "true");
 
-  int code = http.POST((uint8_t*)data, len);
+  Serial.println(F("Uploading to Supabase..."));
+  int code = http.POST((uint8_t *)data, len);
   String response = http.getString();
   http.end();
 
   if (code == 200 || code == 201) {
-    Serial.print("Upload success: ");
+    Serial.print(F("Upload success: HTTP 200 - "));
     Serial.println(objectPath);
     return true;
   }
 
-  Serial.print("Upload failed. HTTP ");
-  Serial.println(code);
+  Serial.printf("Upload failed. HTTP %d\n", code);
   if (response.length() > 0) {
     Serial.println(response);
   }
   return false;
 }
 
-void captureAndUpload() {
-  unsigned long captureStart = millis();
-  flushCameraFrames(CAPTURE_FLUSH_FRAMES);
+void captureHighResAndUpload() {
+  unsigned long t0 = millis();
 
-  camera_fb_t* frame = getFrameWithRetry(2, 80);
-  if (!frame) {
-    Serial.println("No frame on first attempt.");
+  // Switch to JPEG
+  switchToUploadMode();
 
-    if (!captureFallbackActive) {
-      applyRecoverySensorProfile();
-      flushCameraFrames(1);
-      frame = getFrameWithRetry(3, 100);
-    }
+  // Give the sensor a tiny moment to adjust its exposure in the new resolution
+  delay(150);
 
-    if (!frame) {
-      frame = getFrameWithRetry(4, 120);
-    }
-
-    if (!frame) {
-      Serial.print("Capture failed after ");
-      Serial.print(millis() - captureStart);
-      Serial.println(" ms.");
-      return;
-    }
+  // Flush 1 stale frame that might have been queued during the switch
+  camera_fb_t *stale = esp_camera_fb_get();
+  if (stale) {
+    esp_camera_fb_return(stale);
   }
 
-  Serial.print("Captured JPEG bytes: ");
-  Serial.println(frame->len);
-  Serial.print("Capture latency (ms): ");
-  Serial.println(millis() - captureStart);
+  // Grab the actual high-res photo
+  camera_fb_t *photo = esp_camera_fb_get();
+
+  // If the frame is suspiciously small (corrupted JPEG), try one more time
+  if (photo && photo->len < 5000) {
+    esp_camera_fb_return(photo);
+    delay(50);
+    photo = esp_camera_fb_get();
+  }
+
+  if (!photo) {
+    Serial.println(F("ERROR: Hi-res capture failed."));
+    switchToDetectMode();
+    return;
+  }
+
+  Serial.printf("Captured JPEG: %u bytes in %lu ms\n", photo->len,
+                millis() - t0);
 
   String objectPath = makeObjectPath();
-
   bool uploaded = false;
   for (int attempt = 1; attempt <= MAX_UPLOAD_RETRIES; attempt++) {
-    Serial.print("Upload attempt ");
-    Serial.print(attempt);
-    Serial.print("/");
-    Serial.println(MAX_UPLOAD_RETRIES);
-
-    if (uploadToSupabase(frame->buf, frame->len, objectPath)) {
+    Serial.printf("Upload attempt %d/%d\n", attempt, MAX_UPLOAD_RETRIES);
+    if (uploadToSupabase(photo->buf, photo->len, objectPath)) {
       uploaded = true;
       break;
     }
-
     delay(1000);
   }
 
-  if (!uploaded) {
-    Serial.println("Final upload status: FAILED");
-  }
+  esp_camera_fb_return(photo);
+  lastUploadAt = millis();
 
-  esp_camera_fb_return(frame);
+  // Switch back
+  switchToDetectMode();
 }
+
+// ===================== MAIN LOOP =====================
 
 void handleSerialCommands() {
   while (Serial.available() > 0) {
     char command = (char)Serial.read();
 
     if (command == 'c' || command == 'C') {
-      Serial.println("Manual capture command received.");
-      captureAndUpload();
-    } else if (command == 'a' || command == 'A') {
-      autoCaptureEnabled = !autoCaptureEnabled;
-      Serial.print("Auto capture is now: ");
-      Serial.println(autoCaptureEnabled ? "ON" : "OFF");
-      lastCaptureAt = millis();
+      Serial.println(F("Manual capture (bypass detection)."));
+      captureHighResAndUpload();
     } else if (command == 'h' || command == 'H' || command == '?') {
       printCommands();
     }
@@ -339,46 +463,60 @@ void handleSerialCommands() {
 void setup() {
   Serial.begin(115200);
   delay(1500);
-  Serial.println("\nESP32-CAM OV3660 -> Supabase R3 bucket test");
+  Serial.println(F("\n============================================="));
+  Serial.println(F(" ESP32-CAM OV3660 Face-Detection Capture"));
+  Serial.println(F(" ESP-Face (Core 2.0.x) -> Supabase R3 bucket"));
+  Serial.println(F("============================================="));
 
-  esp_log_level_set("cam_hal", ESP_LOG_NONE);
-  esp_log_level_set("camera", ESP_LOG_WARN);
+  esp_log_level_set(
+      "*",
+      ESP_LOG_ERROR); // Suppress all warnings including cam_hal: EV-VSYNC-OVF
+  esp_log_level_set("camera", ESP_LOG_ERROR);
+
+  Serial.printf("PSRAM size: %d bytes\n", ESP.getPsramSize());
+  Serial.printf("Free PSRAM: %d bytes\n", ESP.getFreePsram());
 
   if (hasUnsetConfig()) {
-    Serial.println("Please edit WiFi/Supabase config values at the top of this file.");
-    while (true) {
+    Serial.println(
+        F("ERROR: Missing WiFi or Supabase config. Please edit sketch."));
+    while (true)
       delay(1000);
-    }
   }
 
   connectWiFi();
   initTime();
 
   if (!initCamera()) {
-    Serial.println("Camera setup failed. Halting.");
-    while (true) {
+    Serial.println(F("Camera setup failed. Halting."));
+    while (true)
       delay(1000);
-    }
   }
 
-  camera_fb_t* warmup = esp_camera_fb_get();
-  if (warmup) {
-    esp_camera_fb_return(warmup);
-  }
+  // Allocate ESP-Face model
+  s1 = new HumanFaceDetectMSR01(0.1F, 0.5F, 10, 0.2F);
 
   printCommands();
-  Serial.println("Auto capture is OFF. Type 'c' to capture.");
-
-  lastCaptureAt = millis() - CAPTURE_INTERVAL_MS;
+  Serial.println(F("\nFace detection active. Waiting for faces..."));
 }
 
 void loop() {
   handleSerialCommands();
 
-  if (autoCaptureEnabled && millis() - lastCaptureAt >= CAPTURE_INTERVAL_MS) {
-    lastCaptureAt = millis();
-    captureAndUpload();
+  bool faceFound = runFaceDetection();
+  scanCount++;
+
+  if (faceFound) {
+    personCount++;
+    Serial.printf("=> FACE DETECTED! Frame #%lu. Uploading...\n", scanCount);
+
+    if (millis() - lastUploadAt >= DETECTION_COOLDOWN_MS) {
+      captureHighResAndUpload();
+      Serial.println(F("\nFace detection resumed. Waiting..."));
+    } else {
+      Serial.println(F("Upload skipped (cooldown active)."));
+    }
   }
 
-  delay(20);
+  // A tiny yield so the ESP32 doesn't trigger FreeRTOS watchdogs
+  delay(10);
 }
