@@ -65,6 +65,7 @@ unsigned long lastGps = 0, lastFB = 0, lastSig = 0, lastTimeSync = 0;
 unsigned long lastModemHealth = 0, lastMemReport = 0;
 
 double gpsLat = 0, gpsLon = 0;
+double gpsHdop = 99.9; // Horizontal Dilution of Precision (99.9 = unknown)
 bool gpsFix = false;
 unsigned long dataBytesOut = 0; // Total bytes sent to Firebase
 
@@ -355,10 +356,12 @@ void readGPS() {
   }
 
   // Parse CGNSSINFO format:
-  // <fix>,<sats>,,<beidou>,<galileo>,<lat>,<N/S>,<lon>,<E/W>,<date>,<time>,...
-  int commas[15];
+  // <fix>,<GPS_sat>,<GNSS_sat>,<BeiDou_sat>,<Galileo_sat>,<lat>,<N/S>,<lon>,<E/W>,
+  // <date>,<UTC_time>,<alt>,<speed>,<course>,<HDOP>,<PDOP>,<VDOP>
+  // HDOP is at field 14 (between commas[13] and commas[14]) — needs 15+ commas
+  int commas[17];
   int commaCount = 0;
-  for (int i = 0; i < (int)data.length() && commaCount < 15; i++) {
+  for (int i = 0; i < (int)data.length() && commaCount < 17; i++) {
     if (data.charAt(i) == ',') {
       commas[commaCount++] = i;
     }
@@ -391,6 +394,14 @@ void readGPS() {
       gpsLon = -gpsLon;
 
     gpsFix = true;
+
+    // Extract HDOP (field 14): between commas[13] and commas[14]
+    if (commaCount >= 15) {
+      String hdopStr = data.substring(commas[13] + 1, commas[14]);
+      hdopStr.trim();
+      double h = hdopStr.toDouble();
+      if (h > 0) gpsHdop = h;
+    }
 
     static unsigned long lastFixDebug = 0;
     if (millis() - lastFixDebug >= 30000) {
@@ -1157,17 +1168,18 @@ void sendToFirebase() {
 
   // ── Build location JSON with snprintf ──
   if (gpsFix) {
-    char locationJson[256];
+    char locationJson[320];
     snprintf(locationJson, sizeof(locationJson),
              "{\"latitude\":%.6f,"
              "\"longitude\":%.6f,"
+             "\"hdop\":%.2f,"
              "\"timestamp\":%lu,"
              "\"timestamp_str\":\"%s\","
              "\"source\":\"box\"}",
-             gpsLat, gpsLon, now_epoch, tsBuf);
+             gpsLat, gpsLon, gpsHdop, now_epoch, tsBuf);
 
     char locPath[64];
-    snprintf(locPath, sizeof(locPath), "/locations/%s.json", HARDWARE_ID);
+    snprintf(locPath, sizeof(locPath), "/locations/%s/box.json", HARDWARE_ID);
 
     if (httpPutWithRetry(locPath, locationJson)) {
       Serial.println("LOC:OK!");

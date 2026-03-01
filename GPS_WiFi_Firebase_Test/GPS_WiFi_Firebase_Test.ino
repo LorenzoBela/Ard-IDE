@@ -584,7 +584,7 @@ void sendToFirebase() {
       delay(100);
     }
     
-    String locationPath = "/locations/" + String(HARDWARE_ID) + ".json";
+    String locationPath = "/locations/" + String(HARDWARE_ID) + "/box.json";
     activeClient->print("PUT "); activeClient->print(locationPath); activeClient->println(" HTTP/1.1");
     activeClient->print("Host: "); activeClient->println(FIREBASE_HOST);
     activeClient->println("Content-Type: application/json");
