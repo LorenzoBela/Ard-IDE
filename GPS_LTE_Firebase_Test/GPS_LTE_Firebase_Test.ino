@@ -8,6 +8,7 @@
 
 #include "esp_task_wdt.h"
 #include <Arduino.h>
+#include <WiFi.h>
 
 // TinyGSM - MUST define modem BEFORE include
 #define TINY_GSM_MODEM_A7672X
@@ -27,6 +28,21 @@
   "smart-top-box-default-rtdb.asia-southeast1.firebasedatabase.app"
 #define FIREBASE_AUTH "AIzaSyA7DETBpsdPN6icfWi7PijCbpmLNWEZyTQ"
 #define HARDWARE_ID "BOX_001"
+
+// ==================== HOTSPOT (WiFi AP for ESP32-CAM) ====================
+// The ESP32-CAM connects to this network; images are relayed to Supabase via LTE.
+#define AP_SSID         "SmartTopBox_AP"
+#define AP_PASS         "topbox123"
+#define CAM_SERVER_PORT 8080
+
+// Supabase Storage (matches ESP32-CAM sketch)
+#define SUPABASE_URL    "https://lvpneakciqegwyymtqno.supabase.co"
+#define SUPABASE_BUCKET "r3"
+#define SUPABASE_ANON_KEY \
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9." \
+  "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx2cG5lYWtjaXFlZ3d5eW10cW5vIiwicm9sZSI6Im" \
+  "Fub24iLCJpYXQiOjE3Njc5MDYzNzgsImV4cCI6MjA4MzQ4MjM3OH0." \
+  "liZ3l1u18H7WwIc72P9JgBTp9b7zUlLfPUhCAndW9uU"
 
 // Pins for LILYGO T-SIM A7670E (official pinout)
 #define MODEM_TX 26
@@ -68,6 +84,11 @@ double gpsLat = 0, gpsLon = 0;
 double gpsHdop = 99.9; // Horizontal Dilution of Precision (99.9 = unknown)
 bool gpsFix = false;
 unsigned long dataBytesOut = 0; // Total bytes sent to Firebase
+
+// Hotspot / camera proxy
+WiFiServer camServer(CAM_SERVER_PORT);
+bool apStarted = false;
+String relayDiag = ""; // Diagnostics forwarded to ESP32-CAM via HTTP response body
 
 // Reliability counters
 uint8_t consecutiveModemFailures = 0;
@@ -1202,6 +1223,254 @@ void sendToFirebase() {
   }
 }
 
+// ==================== HOTSPOT + CAMERA PROXY ====================
+
+// Start WiFi SoftAP so the ESP32-CAM can connect and send images.
+void startHotspot() {
+  Serial.println("\nStarting WiFi hotspot for ESP32-CAM...");
+  WiFi.mode(WIFI_AP);
+  IPAddress apIP(192, 168, 4, 1);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  if (WiFi.softAP(AP_SSID, AP_PASS)) {
+    apStarted = true;
+    Serial.printf("[AP] SSID: %s | Pass: %s | IP: %s\n",
+                  AP_SSID, AP_PASS, WiFi.softAPIP().toString().c_str());
+  } else {
+    Serial.println("[AP] Failed to start hotspot!");
+  }
+}
+
+// Forward a JPEG image from the ESP32-CAM to Supabase Storage using A7670E LTE.
+bool uploadToSupabaseViaLTE(const uint8_t *data, size_t len,
+                             const String &objectPath) {
+  relayDiag = ""; // reset for this attempt
+  if (!lteConnected) {
+    relayDiag = "FAIL:lte_not_connected";
+    Serial.println("[RELAY] LTE not connected, cannot upload");
+    return false;
+  }
+  Serial.printf("[RELAY] Uploading %u bytes → Supabase path: %s\n",
+                len, objectPath.c_str());
+
+  String resp;
+  sendATAndWait("+HTTPTERM", 1000);
+  delay(200);
+
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(5000L, resp) != 1) {
+    relayDiag = "FAIL:httpinit_failed";
+    Serial.println("[RELAY] HTTPINIT failed");
+    return false;
+  }
+
+  modem.sendAT("+HTTPPARA=\"CID\",1");
+  modem.waitResponse(3000L);
+
+  String url = String(SUPABASE_URL) + "/storage/v1/object/" +
+               String(SUPABASE_BUCKET) + "/" + objectPath;
+  modem.sendAT(("+HTTPPARA=\"URL\",\"" + url + "\"").c_str());
+  modem.waitResponse(3000L);
+
+  modem.sendAT("+HTTPPARA=\"CONTENT\",\"image/jpeg\"");
+  modem.waitResponse(3000L);
+
+  // Cleaned up the header. 
+  // Removed the \r\n injection which can truncate AT commands over UART.
+  String hdrs = String("Authorization: Bearer ") + SUPABASE_ANON_KEY;
+  modem.sendAT(("+HTTPPARA=\"USERDATA\",\"" + hdrs + "\"").c_str());
+  modem.waitResponse(3000L);
+
+  // ── SSL context configuration ──
+  modem.sendAT("+CSSLCFG=\"sslversion\",1,4");      // TLS 1.2
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"ignorertctime\",1,1");   // ignore RTC for cert expiry
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"authmode\",1,0");        // 0 = no server cert check
+  modem.waitResponse(2000L);
+  
+  // Enable SNI. This is strictly required by Supabase's cloud infrastructure.
+  modem.sendAT("+CSSLCFG=\"enableSNI\",1,1");
+  modem.waitResponse(2000L);
+
+  modem.sendAT("+HTTPPARA=\"SSLCFG\",1");           // attach SSL context 1 to HTTP
+  modem.waitResponse(2000L);
+  modem.sendAT("+HTTPSSL=1");
+  modem.waitResponse(3000L);
+
+  // Tell modem how many binary bytes we are about to send (30s upload window)
+  modem.sendAT(("+HTTPDATA=" + String(len) + ",30000").c_str());
+
+  // Wait for DOWNLOAD prompt
+  unsigned long waitStart = millis();
+  bool gotDownload = false;
+  while (millis() - waitStart < 5000) {
+    if (modem.stream.available()) {
+      String line = modem.stream.readStringUntil('\n');
+      if (line.indexOf("DOWNLOAD") >= 0) {
+        gotDownload = true;
+        break;
+      }
+    }
+    delay(10);
+    esp_task_wdt_reset();
+  }
+  if (!gotDownload) {
+    relayDiag = "FAIL:no_download_prompt";
+    Serial.println("[RELAY] No DOWNLOAD prompt");
+    sendATAndWait("+HTTPTERM", 1000);
+    return false;
+  }
+
+  // Stream JPEG bytes to modem via UART in 1 KB chunks.
+  // Blasting all 58 KB at once overflows the A7670E's ~4 KB UART RX buffer
+  // (no HW flow control on UART1), causing silent byte drops and corrupt JPEGs.
+  {
+    const size_t CHUNK = 1024;
+    for (size_t i = 0; i < len; i += CHUNK) {
+      size_t toWrite = min(CHUNK, len - i);
+      modem.stream.write(data + i, toWrite);
+      modem.stream.flush();   // wait until ESP32 TX FIFO is empty
+      delay(20);              // give the modem a 20 ms breather per 1 KB
+      esp_task_wdt_reset();   // keep watchdog happy during long upload
+    }
+  }
+  // Wait for the modem's "OK" after data upload completes.
+  // Timeout = transfer time + 10 s modem overhead.
+  unsigned long writeSec = (len / 11520UL) + 10UL;
+  modem.waitResponse(writeSec * 1000UL);
+
+  // POST (action=1) — Supabase Storage accepts POST for object upsert/insert
+  modem.sendAT("+HTTPACTION=1");
+
+  waitStart = millis();
+  bool actionOK = false;
+  int httpStatus = 0;
+  while (millis() - waitStart < 60000) {
+    esp_task_wdt_reset();
+    if (modem.stream.available()) {
+      String line = modem.stream.readStringUntil('\n');
+      if (line.indexOf("+HTTPACTION:") >= 0) {
+        int c1 = line.indexOf(',');
+        int c2 = line.indexOf(',', c1 + 1);
+        if (c1 > 0 && c2 > 0)
+          httpStatus = line.substring(c1 + 1, c2).toInt();
+        actionOK = true;
+        break;
+      }
+    }
+    delay(50);
+  }
+
+  sendATAndWait("+HTTPTERM", 1000);
+
+  char diagBuf[48];
+  snprintf(diagBuf, sizeof(diagBuf), "%s:supabase_http_%d",
+           (actionOK && (httpStatus == 200 || httpStatus == 201)) ? "OK" : "FAIL",
+           httpStatus);
+  relayDiag = diagBuf;
+  Serial.printf("[RELAY] Modem HTTP status: %d (actionOK=%d)\n",
+                httpStatus, (int)actionOK);
+
+  if (actionOK && (httpStatus == 200 || httpStatus == 201)) {
+    Serial.printf("[RELAY] Supabase upload OK (HTTP %d)\n", httpStatus);
+    dataBytesOut += len;
+    return true;
+  }
+  Serial.printf("[RELAY] Supabase upload FAILED (HTTP %d)\n", httpStatus);
+  return false;
+}
+
+// Called every loop iteration — non-blocking when no client is waiting.
+// Accepts one image upload from the ESP32-CAM, then relays it to Supabase.
+void handleCameraClient() {
+  WiFiClient client = camServer.available();
+  if (!client) return;
+
+  Serial.println("[AP] ESP32-CAM connected");
+  esp_task_wdt_reset();
+
+  // Wait for the client to start sending
+  unsigned long headerTimeout = millis() + 8000;
+  while (!client.available() && millis() < headerTimeout) {
+    delay(10);
+    esp_task_wdt_reset();
+  }
+  if (!client.available()) {
+    client.stop();
+    return;
+  }
+
+  // ── Parse HTTP headers ──
+  // IMPORTANT: do NOT use while(client.available()) here.
+  // After reading one header line the TCP buffer can momentarily empty,
+  // making client.available()==0 and exiting the loop too early (before
+  // Content-Length is seen). Instead, use readStringUntil('\n') with a
+  // timeout — it blocks waiting for the next byte if the buffer is dry.
+  size_t contentLength = 0;
+  String objectPath = "esp32cam/OV3660_CAM_001/relay_" +
+                      String(millis()) + ".jpg"; // default if header absent
+
+  client.setTimeout(5000); // each readStringUntil waits up to 5 s
+  while (true) {
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) break; // blank line = end of headers (CRLFCRLF)
+    String lower = line;
+    lower.toLowerCase();
+    Serial.println("[AP] HDR: " + line); // print every header for debugging
+    if (lower.startsWith("content-length:")) {
+      String clVal = line.substring(15);
+      clVal.trim();
+      contentLength = (size_t)clVal.toInt();
+    } else if (lower.startsWith("x-object-path:")) {
+      objectPath = line.substring(14);
+      objectPath.trim();
+    }
+  }
+
+  Serial.printf("[AP] Image incoming: %u bytes | path: %s\n",
+                contentLength, objectPath.c_str());
+
+  // ── Buffer and relay image ──
+  bool uploadOK = false;
+  String failReason = "";
+  if (contentLength == 0 || contentLength > 400000) {
+    failReason = "FAIL:bad_content_length:" + String(contentLength);
+    Serial.printf("[AP] Invalid content-length: %u — rejected\n", contentLength);
+  } else {
+    uint8_t *buf = (uint8_t *)malloc(contentLength);
+    if (!buf) {
+      failReason = "FAIL:malloc_oom";
+      Serial.println("[AP] malloc failed — not enough heap");
+    } else {
+      // readBytes() blocks until all bytes received or stream timeout (5s)
+      client.setTimeout(30000);
+      size_t received = client.readBytes(buf, contentLength);
+      Serial.printf("[AP] Received %u/%u bytes\n", received, contentLength);
+      esp_task_wdt_reset();
+      if (received == contentLength) {
+        uploadOK = uploadToSupabaseViaLTE(buf, contentLength, objectPath);
+        if (!uploadOK) failReason = relayDiag;
+      } else {
+        failReason = "FAIL:incomplete_transfer:" + String(received) + "/" + String(contentLength);
+        Serial.println("[AP] Incomplete transfer — upload skipped");
+      }
+      free(buf);
+    }
+  }
+
+  // ── HTTP response to ESP32-CAM (body carries diagnostics) ──
+  String body = uploadOK ? ("OK:" + relayDiag) : failReason;
+  String resp = uploadOK
+    ? "HTTP/1.1 200 OK\r\n"
+    : "HTTP/1.1 500 Internal Server Error\r\n";
+  resp += "Content-Length: " + String(body.length()) + "\r\n\r\n" + body;
+  client.print(resp);
+  delay(50);
+  client.stop();
+  Serial.println("[AP] Relay done — " + body);
+}
+
 // ==================== SETUP ====================
 void setup() {
   Serial.begin(115200);
@@ -1209,14 +1478,9 @@ void setup() {
   Serial.println("\n=== GPS/LTE Firebase Test (LTE Only - AT+HTTP) ===\n");
 
   // ── Initialize Watchdog Timer FIRST (before any modem ops) ──
-  esp_task_wdt_deinit(); // Clear any default WDT config
-  const esp_task_wdt_config_t wdt_config = {
-      .timeout_ms = WDT_TIMEOUT_S * 1000,
-      .idle_core_mask = 0,  // Don't monitor idle tasks
-      .trigger_panic = true // Auto-reboot on timeout
-  };
-  esp_task_wdt_init(&wdt_config);
-  esp_task_wdt_add(NULL); // Add current task (loop) to WDT
+  // Core 2.x API: esp_task_wdt_init(timeout_seconds, panic_on_timeout)
+  esp_task_wdt_init(WDT_TIMEOUT_S, true); // true = reboot on timeout
+  esp_task_wdt_add(NULL);                 // Watch the main loop task
   Serial.printf("[WDT] Watchdog armed (%ds timeout)\n", WDT_TIMEOUT_S);
 
   // Initialize modem with proper power sequence
@@ -1245,6 +1509,15 @@ void setup() {
     Serial.println("         3) Signal coverage in area");
     while (1)
       delay(1000);
+  }
+
+  // ── Start WiFi hotspot so ESP32-CAM can connect and relay images via LTE ──
+  startHotspot();
+  if (apStarted) {
+    camServer.begin();
+    Serial.printf("[AP] Camera proxy server listening on port %d\n", CAM_SERVER_PORT);
+    Serial.printf("[AP] ESP32-CAM should connect to SSID '%s' / '%s'\n",
+                  AP_SSID, AP_PASS);
   }
 
   // ── POST-LTE: Retry AGPS + XTRA now that data is available ──
@@ -1287,6 +1560,9 @@ void setup() {
 void loop() {
   esp_task_wdt_reset(); // Feed watchdog every loop iteration
   unsigned long now = millis();
+
+  // Handle incoming camera image upload (non-blocking when idle)
+  if (apStarted) handleCameraClient();
 
   // Check LTE connection periodically
   if (now - lastSig >= SIGNAL_INTERVAL) {

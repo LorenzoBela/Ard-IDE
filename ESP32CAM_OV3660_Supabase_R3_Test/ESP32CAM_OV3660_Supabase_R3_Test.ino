@@ -36,9 +36,17 @@
 #include "human_face_detect_msr01.hpp"
 
 // ===================== USER CONFIG =====================
-#define WIFI_SSID "GlobeAtHome_e9a28_2.4"
-#define WIFI_PASSWORD "furymabaho912!"
+// WiFi: connect to the hotspot broadcast by the GPS/LTE board
+#define WIFI_SSID     "SmartTopBox_AP"
+#define WIFI_PASSWORD "topbox123"
 
+// Proxy endpoint on the GPS/LTE board (192.168.4.1 is default SoftAP IP)
+// Images are POSTed here; the GPS/LTE board relays them to Supabase via LTE.
+#define PROXY_HOST    "192.168.4.1"
+#define PROXY_PORT    8080
+#define PROXY_PATH    "/upload"
+
+// Supabase credentials kept here for reference (used by GPS/LTE board for relay)
 #define SUPABASE_URL "https://lvpneakciqegwyymtqno.supabase.co"
 #define SUPABASE_BUCKET "r3"
 #define SUPABASE_API_KEY                                                       \
@@ -110,19 +118,31 @@ void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  Serial.print(F("Connecting to WiFi"));
+  // The GPS/LTE board starts its AP after LTE connects, which can take
+  // 30-60 s from power-on. Retry until the AP is reachable (up to 90 s).
+  Serial.print(F("Connecting to hotspot '"));
+  Serial.print(WIFI_SSID);
+  Serial.print(F("'"));
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 30000) {
-    delay(400);
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 90000) {
+    delay(500);
     Serial.print('.');
+    // If WiFi can't associate yet, disconnect+reconnect to trigger a fresh scan
+    if (millis() - start > 15000 &&
+        (millis() - start) % 15000 < 600 &&
+        WiFi.status() != WL_CONNECTED) {
+      WiFi.disconnect();
+      delay(200);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
   }
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("WiFi connected. IP: "));
+    Serial.print(F("WiFi connected to proxy AP. IP: "));
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println(F("WiFi connection failed."));
+    Serial.println(F("WiFi connection failed. Will retry on next upload."));
   }
 }
 
@@ -158,7 +178,7 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 10000000; // 10 MHz: reduces EV-VSYNC-OVF & FB-SIZE corruption when WiFi is active
   config.ledc_timer = LEDC_TIMER_0;
   config.ledc_channel = LEDC_CHANNEL_0;
 
@@ -224,7 +244,7 @@ void switchToUploadMode() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 10000000; // 10 MHz: prevents PSRAM starvation during WiFi bursts
   config.ledc_timer = LEDC_TIMER_0;
   config.ledc_channel = LEDC_CHANNEL_0;
 
@@ -272,7 +292,7 @@ void switchToDetectMode() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 10000000; // 10 MHz: prevents PSRAM starvation during WiFi bursts
   config.ledc_timer = LEDC_TIMER_0;
   config.ledc_channel = LEDC_CHANNEL_0;
 
@@ -359,37 +379,39 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
     if (WiFi.status() != WL_CONNECTED) {
-      Serial.println(F("Upload skipped: WiFi disconnected."));
+      Serial.println(F("Upload skipped: WiFi (proxy AP) disconnected."));
       return false;
     }
   }
 
+  // POST image data to the GPS/LTE board proxy which relays it to Supabase via LTE.
   HTTPClient http;
-  String endpoint = String(SUPABASE_URL) + "/storage/v1/object/" +
-                    SUPABASE_BUCKET + "/" + objectPath;
+  String endpoint = String("http://") + PROXY_HOST + ":" +
+                    String(PROXY_PORT) + PROXY_PATH;
 
-  http.setTimeout(25000);
+  http.setTimeout(90000); // LTE relay can take up to ~60 s for large frames
   http.begin(endpoint);
-  http.addHeader("Authorization", "Bearer " + String(getSupabaseBearerToken()));
-  http.addHeader("apikey", String(SUPABASE_API_KEY));
   http.addHeader("Content-Type", "image/jpeg");
-  http.addHeader("x-upsert", "true");
+  // Tell the proxy the Supabase storage path for this image
+  http.addHeader("X-Object-Path", objectPath);
 
-  Serial.println(F("Uploading to Supabase..."));
+  Serial.printf("Uploading via LTE proxy (%s)...\n", endpoint.c_str());
   int code = http.POST((uint8_t *)data, len);
   String response = http.getString();
   http.end();
 
+  // Always print the relay diagnostic body so the proxy's internals are
+  // visible on this serial monitor even when the LilyGO has no USB attached.
+  Serial.printf("[PROXY] HTTP %d | %s\n", code,
+                response.length() > 0 ? response.c_str() : "(no body)");
+
   if (code == 200 || code == 201) {
-    Serial.print(F("Upload success: HTTP 200 - "));
+    Serial.print(F("Proxy upload success -> "));
     Serial.println(objectPath);
     return true;
   }
 
-  Serial.printf("Upload failed. HTTP %d\n", code);
-  if (response.length() > 0) {
-    Serial.println(response);
-  }
+  Serial.println(F("Proxy upload failed."));
   return false;
 }
 
