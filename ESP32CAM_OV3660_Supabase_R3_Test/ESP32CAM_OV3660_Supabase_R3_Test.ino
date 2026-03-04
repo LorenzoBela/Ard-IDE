@@ -20,6 +20,7 @@
 
 #include <HTTPClient.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <esp_arduino_version.h>
 #include <esp_camera.h>
 #include <esp_log.h>
@@ -37,16 +38,17 @@
 
 // ===================== USER CONFIG =====================
 // WiFi: connect to the hotspot broadcast by the GPS/LTE board
-#define WIFI_SSID     "SmartTopBox_AP"
+#define WIFI_SSID "SmartTopBox_AP"
 #define WIFI_PASSWORD "topbox123"
 
 // Proxy endpoint on the GPS/LTE board (192.168.4.1 is default SoftAP IP)
 // Images are POSTed here; the GPS/LTE board relays them to Supabase via LTE.
-#define PROXY_HOST    "192.168.4.1"
-#define PROXY_PORT    8080
-#define PROXY_PATH    "/upload"
+#define PROXY_HOST "192.168.4.1"
+#define PROXY_PORT 8080
+#define PROXY_PATH "/upload"
 
-// Supabase credentials kept here for reference (used by GPS/LTE board for relay)
+// Supabase credentials kept here for reference (used by GPS/LTE board for
+// relay)
 #define SUPABASE_URL "https://lvpneakciqegwyymtqno.supabase.co"
 #define SUPABASE_BUCKET "r3"
 #define SUPABASE_API_KEY                                                       \
@@ -89,10 +91,42 @@ static unsigned long scanCount = 0;
 static unsigned long personCount = 0;
 static bool cameraInDetectMode = true;
 
+// Deferred upload flag — set by face-check handlers, executed in loop()
+static bool pendingUpload = false;
+
 // Initialize ESP-Face models
 HumanFaceDetectMSR01 *s1;
 
-// ===================== HELPERS =====================
+// HTTP server for face-status endpoint (port 80)
+// Proxy board forwards GET /face-check here
+WiFiServer faceServer(80);
+
+// UART fallback to Tester board (Serial2)
+// Wire: CAM TX(14) → Tester RX2(16), Tester TX2(17) → CAM RX(13), shared GND
+#define TESTER_UART_RX 13
+#define TESTER_UART_TX 14
+#define TESTER_UART_BAUD 9600
+
+// ===================== UDP LOGGING =====================
+WiFiUDP udpClient;
+#define UDP_LOG_PORT 5114
+
+void netLog(const char *format, ...) {
+  char buf[256];
+  va_list args;
+  va_start(args, format);
+  vsnprintf(buf, sizeof(buf), format, args);
+  va_end(args);
+
+  Serial.print(buf);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    udpClient.beginPacket(PROXY_HOST, UDP_LOG_PORT);
+    udpClient.print("[CAM] ");
+    udpClient.print(buf);
+    udpClient.endPacket();
+  }
+} // ===================== HELPERS =====================
 
 void printCommands() {
   Serial.println(F("Commands:"));
@@ -128,8 +162,7 @@ void connectWiFi() {
     delay(500);
     Serial.print('.');
     // If WiFi can't associate yet, disconnect+reconnect to trigger a fresh scan
-    if (millis() - start > 15000 &&
-        (millis() - start) % 15000 < 600 &&
+    if (millis() - start > 15000 && (millis() - start) % 15000 < 600 &&
         WiFi.status() != WL_CONNECTED) {
       WiFi.disconnect();
       delay(200);
@@ -178,7 +211,8 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 10000000; // 10 MHz: reduces EV-VSYNC-OVF & FB-SIZE corruption when WiFi is active
+  config.xclk_freq_hz = 10000000; // 10 MHz: reduces EV-VSYNC-OVF & FB-SIZE
+                                  // corruption when WiFi is active
   config.ledc_timer = LEDC_TIMER_0;
   config.ledc_channel = LEDC_CHANNEL_0;
 
@@ -244,7 +278,8 @@ void switchToUploadMode() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 10000000; // 10 MHz: prevents PSRAM starvation during WiFi bursts
+  config.xclk_freq_hz =
+      10000000; // 10 MHz: prevents PSRAM starvation during WiFi bursts
   config.ledc_timer = LEDC_TIMER_0;
   config.ledc_channel = LEDC_CHANNEL_0;
 
@@ -292,7 +327,8 @@ void switchToDetectMode() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 10000000; // 10 MHz: prevents PSRAM starvation during WiFi bursts
+  config.xclk_freq_hz =
+      10000000; // 10 MHz: prevents PSRAM starvation during WiFi bursts
   config.ledc_timer = LEDC_TIMER_0;
   config.ledc_channel = LEDC_CHANNEL_0;
 
@@ -384,10 +420,11 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
     }
   }
 
-  // POST image data to the GPS/LTE board proxy which relays it to Supabase via LTE.
+  // POST image data to the GPS/LTE board proxy which relays it to Supabase via
+  // LTE.
   HTTPClient http;
-  String endpoint = String("http://") + PROXY_HOST + ":" +
-                    String(PROXY_PORT) + PROXY_PATH;
+  String endpoint =
+      String("http://") + PROXY_HOST + ":" + String(PROXY_PORT) + PROXY_PATH;
 
   http.setTimeout(90000); // LTE relay can take up to ~60 s for large frames
   http.begin(endpoint);
@@ -515,30 +552,144 @@ void setup() {
   }
 
   // Allocate ESP-Face model
-  s1 = new HumanFaceDetectMSR01(0.1F, 0.5F, 10, 0.2F);
+  s1 = new HumanFaceDetectMSR01(0.7F, 0.5F, 10, 0.2F);
+
+  // Start HTTP server for /face-status endpoint
+  faceServer.begin();
+  Serial.println(F("[HTTP] Face-status server on port 80"));
+
+  // Start Serial2 for UART fallback from Tester board
+  Serial2.begin(TESTER_UART_BAUD, SERIAL_8N1, TESTER_UART_RX, TESTER_UART_TX);
+  Serial.println(F("[UART] Serial2 ready (Tester fallback)"));
 
   printCommands();
-  Serial.println(F("\nFace detection active. Waiting for faces..."));
+  Serial.println(F("\nFlushing stale camera frames..."));
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb)
+      esp_camera_fb_return(fb);
+    delay(50);
+  }
+  Serial.println(F("Face detection active. Waiting for faces..."));
+}
+
+// ===================== FACE-STATUS HTTP HANDLER =====================
+// Responds to GET /face-status from the GPS/LTE proxy board.
+// Runs face detection on demand. Responds IMMEDIATELY, then defers upload
+// to loop() to avoid deadlock (CAM uploads back to the same proxy).
+void handleFaceStatusClient() {
+  WiFiClient client = faceServer.available();
+  if (!client)
+    return;
+
+  Serial.println(F("[HTTP] Face-status request received"));
+
+  // Wait for data
+  unsigned long timeout = millis() + 5000;
+  while (!client.available() && millis() < timeout) {
+    delay(10);
+  }
+  if (!client.available()) {
+    client.stop();
+    return;
+  }
+
+  // Read and discard HTTP headers
+  while (client.available()) {
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0)
+      break; // End of headers
+  }
+
+  // Run face detection
+  bool faceFound = runFaceDetection();
+  scanCount++;
+
+  const char *result;
+  if (faceFound) {
+    personCount++;
+    netLog("[HTTP] Face detected!\n");
+    result = "FACE_OK";
+    pendingUpload = true; // Defer upload to loop() to avoid proxy deadlock
+  } else {
+    netLog("[HTTP] No face detected\n");
+    result = "NO_FACE";
+  }
+
+  // Send HTTP response IMMEDIATELY (before any upload)
+  String fullResult = String(result) + "\r\n";
+  char resp[128];
+  snprintf(resp, sizeof(resp),
+           "HTTP/1.1 200 OK\r\n"
+           "Content-Type: text/plain\r\n"
+           "Content-Length: %d\r\n"
+           "Connection: close\r\n\r\n"
+           "%s",
+           (int)fullResult.length(), fullResult.c_str());
+  client.print(resp);
+  client.flush();
+  delay(50);
+  client.stop();
 }
 
 void loop() {
   handleSerialCommands();
+  handleFaceStatusClient(); // On-demand face-check via WiFi (from proxy)
+  handleUartFaceCommand();  // On-demand face-check via UART (from Tester)
 
-  bool faceFound = runFaceDetection();
-  scanCount++;
-
-  if (faceFound) {
-    personCount++;
-    Serial.printf("=> FACE DETECTED! Frame #%lu. Uploading...\n", scanCount);
-
-    if (millis() - lastUploadAt >= DETECTION_COOLDOWN_MS) {
-      captureHighResAndUpload();
-      Serial.println(F("\nFace detection resumed. Waiting..."));
-    } else {
-      Serial.println(F("Upload skipped (cooldown active)."));
-    }
+  // Deferred upload — runs AFTER face-check response was sent
+  // This avoids deadlock (CAM uploads to the same proxy that requested
+  // face-check)
+  if (pendingUpload) {
+    pendingUpload = false;
+    netLog("[UPLOAD] Deferred capture + upload starting...\n");
+    captureHighResAndUpload();
+    netLog("[UPLOAD] Done. One photo captured.\n");
   }
 
   // A tiny yield so the ESP32 doesn't trigger FreeRTOS watchdogs
   delay(10);
+}
+
+// ===================== UART FACE COMMAND HANDLER =====================
+// Responds to "FACE?" from Tester board over Serial2 when WiFi is down.
+void handleUartFaceCommand() {
+  if (!Serial2.available())
+    return;
+
+  char cmd[16] = "";
+  uint8_t len = 0;
+  unsigned long start = millis();
+
+  while (millis() - start < 200) {
+    if (Serial2.available()) {
+      char c = Serial2.read();
+      if (c == '\n' || c == '\r') {
+        if (len > 0)
+          break;
+      } else if (len < sizeof(cmd) - 1) {
+        cmd[len++] = c;
+      }
+    }
+  }
+  cmd[len] = '\0';
+
+  if (strstr(cmd, "FACE?") == NULL)
+    return;
+
+  netLog("[UART] Face check requested from Tester board\n");
+
+  // Run face detection
+  bool detected = runFaceDetection();
+
+  // Respond IMMEDIATELY
+  if (detected) {
+    netLog("[UART] Face DETECTED\n");
+    Serial2.println("FACE_OK");
+    pendingUpload = true; // Defer upload to next loop iteration
+  } else {
+    Serial.println(F("[UART] No face"));
+    Serial2.println("NO_FACE");
+  }
 }
