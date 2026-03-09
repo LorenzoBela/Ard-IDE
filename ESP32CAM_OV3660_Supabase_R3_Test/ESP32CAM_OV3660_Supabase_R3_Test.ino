@@ -100,6 +100,8 @@ static bool cameraInDetectMode = true;
 static bool pendingUpload = false;
 static bool uploadInProgress = false;
 
+static char currentDeliveryId[64] = "UNKNOWN_DELIVERY";
+
 // Initialize ESP-Face models
 HumanFaceDetectMSR01 *s1;
 
@@ -535,9 +537,10 @@ bool runFaceDetectionWindow(unsigned long windowMs) {
 // ===================== UPLOAD =====================
 
 String makeObjectPath() {
-  char filename[96];
-  snprintf(filename, sizeof(filename), "%s_%lu.jpg", FILE_PREFIX, millis());
-  return String("esp32cam/") + DEVICE_ID + "/" + filename;
+  char filename[128];
+  snprintf(filename, sizeof(filename), "%s_%lu.jpg", currentDeliveryId,
+           millis());
+  return String("deliveries/") + DEVICE_ID + "/" + filename;
 }
 
 bool uploadToSupabase(const uint8_t *data, size_t len,
@@ -727,7 +730,7 @@ void handleFaceStatusClient() {
   String requestLine = client.readStringUntil('\n');
   requestLine.trim();
 
-  if (!requestLine.startsWith("GET /face-status ")) {
+  if (!requestLine.startsWith("GET /face-status")) {
     netLog("[HTTP] Ignoring request: %s\n", requestLine.c_str());
     const char *body = "NOT_FOUND\r\n";
     char resp404[160];
@@ -743,6 +746,20 @@ void handleFaceStatusClient() {
     delay(50);
     client.stop();
     return;
+  }
+
+  // Parse deliveryId from query string if present
+  int qIdx = requestLine.indexOf("?delivery_id=");
+  if (qIdx >= 0) {
+    int spIdx = requestLine.indexOf(' ', qIdx);
+    if (spIdx > qIdx) {
+      String delId = requestLine.substring(qIdx + 13, spIdx);
+      if (delId.length() > 0 && delId.length() < sizeof(currentDeliveryId)) {
+        strncpy(currentDeliveryId, delId.c_str(),
+                sizeof(currentDeliveryId) - 1);
+        currentDeliveryId[sizeof(currentDeliveryId) - 1] = '\0';
+      }
+    }
   }
 
   // Read and discard HTTP headers
@@ -828,8 +845,18 @@ void handleUartFaceCommand() {
   }
   cmd[len] = '\0';
 
-  if (strstr(cmd, "FACE?") == NULL)
+  if (strncmp(cmd, "FACE?", 5) != 0)
     return;
+
+  // Extract delivery_id if present
+  if (cmd[5] == ',') {
+    String delId = String(cmd + 6);
+    delId.trim();
+    if (delId.length() > 0 && delId.length() < sizeof(currentDeliveryId)) {
+      strncpy(currentDeliveryId, delId.c_str(), sizeof(currentDeliveryId) - 1);
+      currentDeliveryId[sizeof(currentDeliveryId) - 1] = '\0';
+    }
+  }
 
   netLog("[UART] Face check requested from Tester board\n");
 

@@ -93,11 +93,14 @@ bool apStarted = false;
 String relayDiag =
     ""; // Diagnostics forwarded to ESP32-CAM via HTTP response body
 
-// Cached OTP from Firebase RTDB (served to Tester ESP32 via GET /otp)
+// Cached Delivery Context from Firebase RTDB (served to Tester ESP32 via GET
+// /otp)
 char cachedOtp[8] = "";
 bool otpCacheValid = false;
-unsigned long lastOtpRead = 0;
-#define OTP_READ_INTERVAL 15000 // Re-read OTP from Firebase every 15s
+char cachedDeliveryId[64] = "";
+bool deliveryIdCacheValid = false;
+unsigned long lastDeliveryContextRead = 0;
+#define DELIVERY_CONTEXT_READ_INTERVAL 15000 // Re-read Firebase every 15s
 
 // UDP log receiver
 WiFiUDP udpServer;
@@ -1405,492 +1408,542 @@ bool uploadToSupabaseViaLTE(const uint8_t *data, size_t len,
     Serial.printf("[RELAY] Supabase upload OK (HTTP %d)\n", httpStatus);
     dataBytesOut += len;
     return true;
-  }
-  Serial.printf("[RELAY] Supabase upload FAILED (HTTP %d)\n", httpStatus);
-  return false;
-}
-
-// ==================== OTP READER (Firebase â†’ cached) ====================
-void refreshOtpFromFirebase() {
-  if (!lteConnected)
-    return;
-
-  char otpPath[64];
-  snprintf(otpPath, sizeof(otpPath), "/hardware/%s/otp_code.json", HARDWARE_ID);
-
-  String resp;
-  sendATAndWait("+HTTPTERM", 1000);
-  delay(200);
-
-  modem.sendAT("+HTTPINIT");
-  if (modem.waitResponse(5000L, resp) != 1)
-    return;
-
-  modem.sendAT("+HTTPPARA=\"CID\",1");
-  modem.waitResponse(3000L);
-
-  String url = "https://" + String(FIREBASE_HOST) + otpPath;
-  if (strlen(FIREBASE_AUTH) > 0) {
-    url += "?auth=" + String(FIREBASE_AUTH);
-  }
-  modem.sendAT(("+HTTPPARA=\"URL\",\"" + url + "\"").c_str());
-  modem.waitResponse(3000L);
-
-  modem.sendAT("+HTTPSSL=1");
-  modem.waitResponse(3000L);
-
-  modem.sendAT("+HTTPACTION=0");
-  unsigned long waitStart = millis();
-  bool actionOK = false;
-  int httpStatus = 0;
-  while (millis() - waitStart < 15000) {
-    if (modem.stream.available()) {
-      String line = modem.stream.readStringUntil('\n');
-      line.trim();
-      if (line.indexOf("+HTTPACTION:") >= 0) {
-        int c1 = line.indexOf(',');
-        int c2 = line.indexOf(',', c1 + 1);
-        if (c1 > 0 && c2 > 0)
-          httpStatus = line.substring(c1 + 1, c2).toInt();
-        actionOK = true;
-        break;
-      }
-    }
-    delay(50);
-    esp_task_wdt_reset();
+    Serial.printf("[RELAY] Supabase upload FAILED (HTTP %d)\n", httpStatus);
+    return false;
   }
 
-  if (actionOK && httpStatus == 200) {
-    modem.sendAT("+HTTPREAD=0,64");
-    resp = "";
-    modem.waitResponse(5000L, resp);
-    int q1 = resp.indexOf('"');
-    int q2 = resp.indexOf('"', q1 + 1);
-    if (q1 >= 0 && q2 > q1 + 1) {
-      int len = q2 - q1 - 1;
-      if (len > 0 && len <= 6) {
-        strncpy(cachedOtp, resp.c_str() + q1 + 1, len);
-        cachedOtp[len] = '\0';
-        otpCacheValid = true;
-        Serial.printf("[OTP-CACHE] Refreshed: %s\n", cachedOtp);
-      }
-    }
-  }
+  // ==================== DELIVERY CONTEXT READER (Firebase -> cached)
+  // ====================
+  void refreshDeliveryContextFromFirebase() {
+    if (!lteConnected)
+      return;
 
-  sendATAndWait("+HTTPTERM", 1000);
-}
-
-// ==================== LOCK EVENT WRITER ====================
-void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked) {
-  if (!lteConnected) {
-    Serial.println("[EVENT] LTE not connected");
-    return;
-  }
-
-  unsigned long now_epoch = getCurrentEpoch();
-  char tsBuf[30];
-  String tsStr = formatTimestamp(now_epoch);
-  strncpy(tsBuf, tsStr.c_str(), sizeof(tsBuf) - 1);
-  tsBuf[sizeof(tsBuf) - 1] = '\0';
-
-  char eventJson[256];
-  snprintf(eventJson, sizeof(eventJson),
-           "{\"otp_valid\":%s,\"face_detected\":%s,\"unlocked\":%s,"
-           "\"timestamp\":{\".sv\":\"timestamp\"},\"device_epoch\":%lu,"
-           "\"timestamp_str\":\"%s\"}",
-           otpValid ? "true" : "false", faceDetected ? "true" : "false",
-           unlocked ? "true" : "false", now_epoch, tsBuf);
-
-  char eventPath[64];
-  snprintf(eventPath, sizeof(eventPath), "/lock_events/%s/latest.json",
-           HARDWARE_ID);
-  bool ok = httpPutWithRetry(eventPath, eventJson);
-  Serial.printf("[EVENT] lock_events: %s\n", ok ? "OK" : "FAIL");
-
-  const char *newStatus = unlocked ? "UNLOCKING" : "LOCKED";
-  char statusJson[64];
-  snprintf(statusJson, sizeof(statusJson), "\"%s\"", newStatus);
-  char statusPath[64];
-  snprintf(statusPath, sizeof(statusPath), "/hardware/%s/status.json",
-           HARDWARE_ID);
-  httpPutWithRetry(statusPath, statusJson);
-}
-
-// ==================== FACE CHECK FORWARDER ====================
-String forwardFaceCheck() {
-  // If CAM IP not yet discovered from /upload, try default SoftAP client IP
-  if (!camClientKnown) {
-    Serial.println(
-        "[FACE] CAM IP not from /upload -- trying default 192.168.4.10");
-    camClientIP = IPAddress(192, 168, 4, 10);
-    // Don't set camClientKnown yet -- let /upload confirm later
-  }
-
-  WiFiClient camClient;
-  if (!camClient.connect(camClientIP, CAM_FACE_PORT)) {
-    Serial.println("[FACE] Cannot connect to ESP32-CAM");
-    return "ERROR:cam_unreachable";
-  }
-
-  camClient.print("GET /face-status HTTP/1.1\r\nHost: ");
-  camClient.print(camClientIP.toString());
-  camClient.print("\r\nConnection: close\r\n\r\n");
-
-  unsigned long waitStart = millis();
-  String result = "";
-  bool headersEnded = false;
-  while (millis() - waitStart < 12000) {
-    if (camClient.available()) {
-      String line = camClient.readStringUntil('\n');
-      line.trim();
-      if (!headersEnded) {
-        if (line.length() == 0)
-          headersEnded = true;
-      } else {
-        result = line;
-        break;
-      }
-    } else {
-      delay(10);
-    }
-    esp_task_wdt_reset();
-  }
-
-  camClient.stop();
-  Serial.printf("[FACE] CAM response: %s\n", result.c_str());
-  return result;
-}
-
-// ==================== HOTSPOT HTTP ROUTER ====================
-void handleCameraClient() {
-  WiFiClient client = camServer.available();
-  if (!client)
-    return;
-
-  Serial.println("[AP] Client connected");
-  esp_task_wdt_reset();
-
-  IPAddress clientAddr = client.remoteIP();
-
-  unsigned long headerTimeout = millis() + 8000;
-  while (!client.available() && millis() < headerTimeout) {
-    delay(10);
-    esp_task_wdt_reset();
-  }
-  if (!client.available()) {
-    client.stop();
-    return;
-  }
-
-  client.setTimeout(5000);
-  String requestLine = client.readStringUntil('\n');
-  requestLine.trim();
-  Serial.println("[AP] REQ: " + requestLine);
-
-  char method[8] = "";
-  char reqPath[32] = "";
-  {
-    int sp1 = requestLine.indexOf(' ');
-    int sp2 = requestLine.indexOf(' ', sp1 + 1);
-    if (sp1 > 0 && sp2 > sp1) {
-      String m = requestLine.substring(0, sp1);
-      String p = requestLine.substring(sp1 + 1, sp2);
-      strncpy(method, m.c_str(), sizeof(method) - 1);
-      strncpy(reqPath, p.c_str(), sizeof(reqPath) - 1);
-    }
-  }
-
-  size_t contentLength = 0;
-  String objectPath =
-      "esp32cam/OV3660_CAM_001/relay_" + String(millis()) + ".jpg";
-
-  while (true) {
-    String line = client.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0)
-      break;
-    String lower = line;
-    lower.toLowerCase();
-    if (lower.startsWith("content-length:")) {
-      String clVal = line.substring(15);
-      clVal.trim();
-      contentLength = (size_t)clVal.toInt();
-    } else if (lower.startsWith("x-object-path:")) {
-      objectPath = line.substring(14);
-      objectPath.trim();
-    }
-  }
-
-  // â”€â”€ GET /otp â”€â”€
-  if (strcmp(method, "GET") == 0 && strcmp(reqPath, "/otp") == 0) {
-    Serial.println("[AP] -> GET /otp");
-    String body = otpCacheValid ? String(cachedOtp) : "NO_OTP";
-    String resp =
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
-        String(body.length()) + "\r\n\r\n" + body;
-    client.print(resp);
-    delay(50);
-    client.stop();
-    return;
-  }
-
-  // â”€â”€ GET /face-check â”€â”€
-  if (strcmp(method, "GET") == 0 && strcmp(reqPath, "/face-check") == 0) {
-    Serial.println("[AP] -> GET /face-check");
-    String result = forwardFaceCheck();
-    String resp =
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
-        String(result.length()) + "\r\n\r\n" + result;
-    client.print(resp);
-    delay(50);
-    client.stop();
-    return;
-  }
-
-  // â”€â”€ POST /event â”€â”€
-  if (strcmp(method, "POST") == 0 && strcmp(reqPath, "/event") == 0) {
-    Serial.println("[AP] -> POST /event");
-    char jsonBuf[256] = "";
-    if (contentLength > 0 && contentLength < sizeof(jsonBuf)) {
-      client.setTimeout(5000);
-      size_t rd = client.readBytes(jsonBuf, contentLength);
-      jsonBuf[rd] = '\0';
-    }
-    Serial.printf("[AP] Event: %s\n", jsonBuf);
-    bool ov = (strstr(jsonBuf, "\"otp_valid\":true") != NULL);
-    bool fd = (strstr(jsonBuf, "\"face_detected\":true") != NULL);
-    bool ul = (strstr(jsonBuf, "\"unlocked\":true") != NULL);
-    writeLockEventToFirebase(ov, fd, ul);
-    String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-    client.print(resp);
-    delay(50);
-    client.stop();
-    return;
-  }
-
-  if (!(strcmp(method, "POST") == 0 && strcmp(reqPath, "/upload") == 0)) {
-    Serial.printf("[AP] -> 404 %s %s\n", method, reqPath);
-    String body = "NOT_FOUND";
-    String resp = "HTTP/1.1 404 Not Found\r\nContent-Type: "
-                  "text/plain\r\nContent-Length: " +
-                  String(body.length()) + "\r\n\r\n" + body;
-    client.print(resp);
-    delay(50);
-    client.stop();
-    return;
-  }
-
-  // â”€â”€ POST /upload â€” camera relay only â”€â”€
-  Serial.println("[AP] -> POST /upload");
-  camClientIP = clientAddr;
-  camClientKnown = true;
-  Serial.printf("[AP] CAM IP: %s | Image: %u bytes\n",
-                camClientIP.toString().c_str(), contentLength);
-
-  bool uploadOK = false;
-  String failReason = "";
-  if (contentLength == 0 || contentLength > 400000) {
-    failReason = "FAIL:bad_cl:" + String(contentLength);
-  } else {
-    uint8_t *buf = (uint8_t *)malloc(contentLength);
-    if (!buf) {
-      failReason = "FAIL:malloc_oom";
-    } else {
-      client.setTimeout(30000);
-      size_t received = client.readBytes(buf, contentLength);
-      esp_task_wdt_reset();
-      if (received == contentLength) {
-        uploadOK = uploadToSupabaseViaLTE(buf, contentLength, objectPath);
-        if (!uploadOK)
-          failReason = relayDiag;
-      } else {
-        failReason =
-            "FAIL:incomplete:" + String(received) + "/" + String(contentLength);
-      }
-      free(buf);
-    }
-  }
-
-  String body = uploadOK ? ("OK:" + relayDiag) : failReason;
-  String resp = uploadOK ? "HTTP/1.1 200 OK\r\n"
-                         : "HTTP/1.1 500 Internal Server Error\r\n";
-  resp += "Content-Length: " + String(body.length()) + "\r\n\r\n" + body;
-  client.print(resp);
-  delay(50);
-  client.stop();
-  Serial.println("[AP] Done: " + body);
-}
-
-// ==================== SETUP ====================
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n=== GPS/LTE Firebase Test (LTE Only - AT+HTTP) ===\n");
-
-  // â”€â”€ Initialize Watchdog Timer FIRST (before any modem ops) â”€â”€
-  // Core 2.x API: esp_task_wdt_init(timeout_seconds, panic_on_timeout)
-  esp_task_wdt_init(WDT_TIMEOUT_S, true); // true = reboot on timeout
-  esp_task_wdt_add(NULL);                 // Watch the main loop task
-  Serial.printf("[WDT] Watchdog armed (%ds timeout)\n", WDT_TIMEOUT_S);
-
-  // Initialize modem with proper power sequence
-  modemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
-  powerModem();
-
-  modemOK = initModem();
-
-  if (!modemOK) {
-    Serial.println("\n*** MODEM FAILED - Cannot proceed without LTE ***");
-    Serial.println("  CHECK: 1) Modem hardware connected properly");
-    Serial.println("         2) Power supply sufficient (>2A)");
-    Serial.println("         3) SIM card inserted");
-    while (1)
-      delay(1000);
-  }
-
-  gpsEnabled = initGPS();
-  Serial.println(gpsEnabled ? "GPS: Ready" : "GPS: Failed (continuing)");
-
-  Serial.println("\nConnecting via LTE...");
-  if (!connectLTE()) {
-    Serial.println("\n*** LTE CONNECTION FAILED ***");
-    Serial.println("  CHECK: 1) SIM has active data plan");
-    Serial.println("         2) LTE antenna connected");
-    Serial.println("         3) Signal coverage in area");
-    while (1)
-      delay(1000);
-  }
-
-  // â”€â”€ Start WiFi hotspot so ESP32-CAM can connect and relay images via LTE
-  // â”€â”€
-  startHotspot();
-  if (apStarted) {
-    camServer.begin();
-    Serial.printf("[AP] Camera proxy server listening on port %d\n",
-                  CAM_SERVER_PORT);
-    Serial.printf("[AP] ESP32-CAM should connect to SSID '%s' / '%s'\n",
-                  AP_SSID, AP_PASS);
-  }
-
-  // â”€â”€ POST-LTE: Retry AGPS + XTRA now that data is available â”€â”€
-  // These failed during GPS init because LTE wasn't connected yet
-  if (gpsEnabled) {
-    Serial.println("\nRetrying GPS assistance with LTE data...");
+    // Fetch the entire hardware node since it contains both OTP and delivery_id
+    char path[64];
+    snprintf(path, sizeof(path), "/hardware/%s.json", HARDWARE_ID);
 
     String resp;
-    Serial.print("  AGPS download...");
-    modem.sendAT("+CAGPS");
-    if (modem.waitResponse(15000L, resp) == 1) {
-      Serial.println(" OK (satellite data injected!)");
-    } else {
-      Serial.println(" skip");
+    sendATAndWait("+HTTPTERM", 1000);
+    delay(200);
+
+    modem.sendAT("+HTTPINIT");
+    if (modem.waitResponse(5000L, resp) != 1)
+      return;
+
+    modem.sendAT("+HTTPPARA=\"CID\",1");
+    modem.waitResponse(3000L);
+
+    String url = "https://" + String(FIREBASE_HOST) + path;
+    if (strlen(FIREBASE_AUTH) > 0) {
+      url += "?auth=" + String(FIREBASE_AUTH);
     }
+    modem.sendAT(("+HTTPPARA=\"URL\",\"" + url + "\"").c_str());
+    modem.waitResponse(3000L);
 
-    Serial.print("  XTRA ephemeris download...");
-    modem.sendAT("+CGPSXD=0"); // Trigger immediate XTRA download
-    if (modem.waitResponse(10000L, resp) == 1) {
-      Serial.println(" OK");
-    } else {
-      Serial.println(" skip (auto-download enabled)");
-    }
-  }
+    modem.sendAT("+HTTPSSL=1");
+    modem.waitResponse(3000L);
 
-  // â”€â”€ Sync network time (Philippine Standard Time, UTC+8) â”€â”€
-  Serial.println("\nSyncing clock to Philippine Standard Time...");
-  if (syncNetworkTime()) {
-    Serial.println("Clock: " + formatTimestamp(getCurrentEpoch()));
-  } else {
-    Serial.println("WARNING: Clock not synced â€” timestamps may be incorrect");
-  }
-
-  Serial.println("\n=== Ready (LTE Only - AT+HTTP) ===\n");
-
-  printMemoryReport(); // Baseline memory snapshot
-}
-
-// ==================== LOOP ====================
-void loop() {
-  esp_task_wdt_reset(); // Feed watchdog every loop iteration
-  unsigned long now = millis();
-
-  // Handle incoming camera image upload (non-blocking when idle)
-  if (apStarted) {
-    handleCameraClient();
-
-    // Check for incoming UDP logs
-    int packetSize = udpServer.parsePacket();
-    if (packetSize) {
-      char udpBuf[512] = "";
-      int len = udpServer.read(udpBuf, sizeof(udpBuf) - 1);
-      if (len > 0) {
-        udpBuf[len] = '\0';
-        Serial.printf("%s\n",
-                      udpBuf); // String already contains prefix [TESTER]/[CAM]
+    modem.sendAT("+HTTPACTION=0");
+    unsigned long waitStart = millis();
+    bool actionOK = false;
+    int httpStatus = 0;
+    while (millis() - waitStart < 15000) {
+      if (modem.stream.available()) {
+        String line = modem.stream.readStringUntil('\n');
+        line.trim();
+        if (line.indexOf("+HTTPACTION:") >= 0) {
+          int c1 = line.indexOf(',');
+          int c2 = line.indexOf(',', c1 + 1);
+          if (c1 > 0 && c2 > 0)
+            httpStatus = line.substring(c1 + 1, c2).toInt();
+          actionOK = true;
+          break;
+        }
       }
+      delay(50);
+      esp_task_wdt_reset();
     }
-  }
 
-  // Check LTE connection periodically
-  if (now - lastSig >= SIGNAL_INTERVAL) {
-    if (lteConnected && modemOK) {
-      if (!modem.isGprsConnected()) {
-        Serial.println("LTE: Connection lost, reconnecting...");
-        lteConnected = false;
-        connectLTE();
-      }
-    }
-    lastSig = now;
-  }
+    if (actionOK && httpStatus == 200) {
+      // Read a larger chunk to ensure we capture both fields from the JSON
+      modem.sendAT("+HTTPREAD=0,1024");
+      resp = "";
+      modem.waitResponse(5000L, resp);
 
-  // Modem health check (lightweight AT heartbeat)
-  if (modemOK && now - lastModemHealth >= MODEM_HEALTH_INTERVAL) {
-    checkModemHealth();
-    lastModemHealth = now;
-  }
-
-  // Periodic memory report
-  if (now - lastMemReport >= MEM_REPORT_INTERVAL) {
-    printMemoryReport();
-    lastMemReport = now;
-  }
-
-  // Read GPS (poll faster while acquiring fix, slower once locked)
-  unsigned long gpsInterval =
-      gpsFix ? GPS_INTERVAL_LOCKED : GPS_INTERVAL_ACQUIRING;
-  if (modemOK && gpsEnabled && now - lastGps >= gpsInterval) {
-    readGPS();
-    lastGps = now;
-
-    // Show GPS status periodically
-    static unsigned long lastGpsStatus = 0;
-    if (now - lastGpsStatus >= 10000) { // Every 10 seconds
-      if (gpsFix) {
-        Serial.printf("GPS: %.6f, %.6f\n", gpsLat, gpsLon);
+      // Parse otp_code
+      int otpIdx = resp.indexOf("\"otp_code\":\"");
+      if (otpIdx >= 0) {
+        int start = otpIdx + 12;
+        int end = resp.indexOf('"', start);
+        if (end > start) {
+          int len = end - start;
+          if (len > 0 && len <= 6) {
+            strncpy(cachedOtp, resp.c_str() + start, len);
+            cachedOtp[len] = '\0';
+            otpCacheValid = true;
+          }
+        }
       } else {
-        Serial.println("GPS: No fix yet (needs outdoor + clear sky)");
+        otpCacheValid = false;
       }
-      lastGpsStatus = now;
+
+      // Parse delivery_id
+      int delIdx = resp.indexOf("\"delivery_id\":\"");
+      if (delIdx >= 0) {
+        int start = delIdx + 15;
+        int end = resp.indexOf('"', start);
+        if (end > start) {
+          int len = end - start;
+          if (len > 0 && len < sizeof(cachedDeliveryId)) {
+            strncpy(cachedDeliveryId, resp.c_str() + start, len);
+            cachedDeliveryId[len] = '\0';
+            deliveryIdCacheValid = true;
+          }
+        }
+      } else {
+        deliveryIdCacheValid = false;
+      }
+
+      Serial.printf("[CONTEXT] OTP: %s | Delivery ID: %s\n",
+                    otpCacheValid ? cachedOtp : "NONE",
+                    deliveryIdCacheValid ? cachedDeliveryId : "NONE");
     }
+
+    sendATAndWait("+HTTPTERM", 1000);
   }
 
-  // Re-sync network time periodically to prevent clock drift
-  if (lteConnected && now - lastTimeSync >= TIME_SYNC_INTERVAL) {
-    Serial.println("Periodic time re-sync...");
-    syncNetworkTime();
-    lastTimeSync = now;
+  // ==================== LOCK EVENT WRITER ====================
+  void writeLockEventToFirebase(bool otpValid, bool faceDetected,
+                                bool unlocked) {
+    if (!lteConnected) {
+      Serial.println("[EVENT] LTE not connected");
+      return;
+    }
+
+    unsigned long now_epoch = getCurrentEpoch();
+    char tsBuf[30];
+    String tsStr = formatTimestamp(now_epoch);
+    strncpy(tsBuf, tsStr.c_str(), sizeof(tsBuf) - 1);
+    tsBuf[sizeof(tsBuf) - 1] = '\0';
+
+    char eventJson[256];
+    snprintf(eventJson, sizeof(eventJson),
+             "{\"otp_valid\":%s,\"face_detected\":%s,\"unlocked\":%s,"
+             "\"timestamp\":{\".sv\":\"timestamp\"},\"device_epoch\":%lu,"
+             "\"timestamp_str\":\"%s\"}",
+             otpValid ? "true" : "false", faceDetected ? "true" : "false",
+             unlocked ? "true" : "false", now_epoch, tsBuf);
+
+    char eventPath[64];
+    snprintf(eventPath, sizeof(eventPath), "/lock_events/%s/latest.json",
+             HARDWARE_ID);
+    bool ok = httpPutWithRetry(eventPath, eventJson);
+    Serial.printf("[EVENT] lock_events: %s\n", ok ? "OK" : "FAIL");
+
+    const char *newStatus = unlocked ? "UNLOCKING" : "LOCKED";
+    char statusJson[64];
+    snprintf(statusJson, sizeof(statusJson), "\"%s\"", newStatus);
+    char statusPath[64];
+    snprintf(statusPath, sizeof(statusPath), "/hardware/%s/status.json",
+             HARDWARE_ID);
+    httpPutWithRetry(statusPath, statusJson);
   }
 
-  // Send to Firebase
-  if (lteConnected && now - lastFB >= FIREBASE_INTERVAL) {
-    sendToFirebase();
-    lastFB = now;
+  // ==================== FACE CHECK FORWARDER ====================
+  String forwardFaceCheck(String deliveryId) {
+    // If CAM IP not yet discovered from /upload, try default SoftAP client IP
+    if (!camClientKnown) {
+      Serial.println(
+          "[FACE] CAM IP not from /upload -- trying default 192.168.4.10");
+      camClientIP = IPAddress(192, 168, 4, 10);
+      // Don't set camClientKnown yet -- let /upload confirm later
+    }
+
+    WiFiClient camClient;
+    if (!camClient.connect(camClientIP, CAM_FACE_PORT)) {
+      Serial.println("[FACE] Cannot connect to ESP32-CAM");
+      return "ERROR:cam_unreachable";
+    }
+
+    if (deliveryId.length() > 0) {
+      camClient.print("GET /face-status?delivery_id=");
+      camClient.print(deliveryId);
+      camClient.print(" HTTP/1.1\r\nHost: ");
+    } else {
+      camClient.print("GET /face-status HTTP/1.1\r\nHost: ");
+    }
+    camClient.print(camClientIP.toString());
+    camClient.print("\r\nConnection: close\r\n\r\n");
+
+    unsigned long waitStart = millis();
+    String result = "";
+    bool headersEnded = false;
+    while (millis() - waitStart < 12000) {
+      if (camClient.available()) {
+        String line = camClient.readStringUntil('\n');
+        line.trim();
+        if (!headersEnded) {
+          if (line.length() == 0)
+            headersEnded = true;
+        } else {
+          result = line;
+          break;
+        }
+      } else {
+        delay(10);
+      }
+      esp_task_wdt_reset();
+    }
+
+    camClient.stop();
+    Serial.printf("[FACE] CAM response: %s\n", result.c_str());
+    return result;
   }
 
-  // Refresh cached OTP from Firebase (for Tester ESP32 /otp endpoint)
-  if (lteConnected && now - lastOtpRead >= OTP_READ_INTERVAL) {
-    refreshOtpFromFirebase();
-    lastOtpRead = now;
+  // ==================== HOTSPOT HTTP ROUTER ====================
+  void handleCameraClient() {
+    WiFiClient client = camServer.available();
+    if (!client)
+      return;
+
+    Serial.println("[AP] Client connected");
+    esp_task_wdt_reset();
+
+    IPAddress clientAddr = client.remoteIP();
+
+    unsigned long headerTimeout = millis() + 8000;
+    while (!client.available() && millis() < headerTimeout) {
+      delay(10);
+      esp_task_wdt_reset();
+    }
+    if (!client.available()) {
+      client.stop();
+      return;
+    }
+
+    client.setTimeout(5000);
+    String requestLine = client.readStringUntil('\n');
+    requestLine.trim();
+    Serial.println("[AP] REQ: " + requestLine);
+
+    char method[8] = "";
+    char reqPath[32] = "";
+    {
+      int sp1 = requestLine.indexOf(' ');
+      int sp2 = requestLine.indexOf(' ', sp1 + 1);
+      if (sp1 > 0 && sp2 > sp1) {
+        String m = requestLine.substring(0, sp1);
+        String p = requestLine.substring(sp1 + 1, sp2);
+        strncpy(method, m.c_str(), sizeof(method) - 1);
+        strncpy(reqPath, p.c_str(), sizeof(reqPath) - 1);
+      }
+    }
+
+    size_t contentLength = 0;
+    String objectPath =
+        "esp32cam/OV3660_CAM_001/relay_" + String(millis()) + ".jpg";
+
+    while (true) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0)
+        break;
+      String lower = line;
+      lower.toLowerCase();
+      if (lower.startsWith("content-length:")) {
+        String clVal = line.substring(15);
+        clVal.trim();
+        contentLength = (size_t)clVal.toInt();
+      } else if (lower.startsWith("x-object-path:")) {
+        objectPath = line.substring(14);
+        objectPath.trim();
+      }
+    }
+
+    String reqPathStr = String(reqPath);
+
+    // â”€â”€ GET /otp â”€â”€
+    if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/otp")) {
+      Serial.println("[AP] -> GET /otp");
+      String otpPart = otpCacheValid ? String(cachedOtp) : "NO_OTP";
+      String delPart =
+          deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
+      String body = otpPart + "," + delPart;
+      String resp =
+          "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+          String(body.length()) + "\r\n\r\n" + body;
+      client.print(resp);
+      delay(50);
+      client.stop();
+      return;
+    }
+
+    // â”€â”€ GET /face-check â”€â”€
+    if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/face-check")) {
+      Serial.println("[AP] -> GET /face-check");
+      String deliveryId = "";
+      int qIdx = reqPathStr.indexOf("?delivery_id=");
+      if (qIdx >= 0) {
+        deliveryId = reqPathStr.substring(qIdx + 13);
+      }
+      String result = forwardFaceCheck(deliveryId);
+      String resp =
+          "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+          String(result.length()) + "\r\n\r\n" + result;
+      client.print(resp);
+      delay(50);
+      client.stop();
+      return;
+    }
+
+    // â”€â”€ POST /event â”€â”€
+    if (strcmp(method, "POST") == 0 && strcmp(reqPath, "/event") == 0) {
+      Serial.println("[AP] -> POST /event");
+      char jsonBuf[256] = "";
+      if (contentLength > 0 && contentLength < sizeof(jsonBuf)) {
+        client.setTimeout(5000);
+        size_t rd = client.readBytes(jsonBuf, contentLength);
+        jsonBuf[rd] = '\0';
+      }
+      Serial.printf("[AP] Event: %s\n", jsonBuf);
+      bool ov = (strstr(jsonBuf, "\"otp_valid\":true") != NULL);
+      bool fd = (strstr(jsonBuf, "\"face_detected\":true") != NULL);
+      bool ul = (strstr(jsonBuf, "\"unlocked\":true") != NULL);
+      writeLockEventToFirebase(ov, fd, ul);
+      String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+      client.print(resp);
+      delay(50);
+      client.stop();
+      return;
+    }
+
+    if (!(strcmp(method, "POST") == 0 && strcmp(reqPath, "/upload") == 0)) {
+      Serial.printf("[AP] -> 404 %s %s\n", method, reqPath);
+      String body = "NOT_FOUND";
+      String resp = "HTTP/1.1 404 Not Found\r\nContent-Type: "
+                    "text/plain\r\nContent-Length: " +
+                    String(body.length()) + "\r\n\r\n" + body;
+      client.print(resp);
+      delay(50);
+      client.stop();
+      return;
+    }
+
+    // â”€â”€ POST /upload â€” camera relay only â”€â”€
+    Serial.println("[AP] -> POST /upload");
+    camClientIP = clientAddr;
+    camClientKnown = true;
+    Serial.printf("[AP] CAM IP: %s | Image: %u bytes\n",
+                  camClientIP.toString().c_str(), contentLength);
+
+    bool uploadOK = false;
+    String failReason = "";
+    if (contentLength == 0 || contentLength > 400000) {
+      failReason = "FAIL:bad_cl:" + String(contentLength);
+    } else {
+      uint8_t *buf = (uint8_t *)malloc(contentLength);
+      if (!buf) {
+        failReason = "FAIL:malloc_oom";
+      } else {
+        client.setTimeout(30000);
+        size_t received = client.readBytes(buf, contentLength);
+        esp_task_wdt_reset();
+        if (received == contentLength) {
+          uploadOK = uploadToSupabaseViaLTE(buf, contentLength, objectPath);
+          if (!uploadOK)
+            failReason = relayDiag;
+        } else {
+          failReason = "FAIL:incomplete:" + String(received) + "/" +
+                       String(contentLength);
+        }
+        free(buf);
+      }
+    }
+
+    String body = uploadOK ? ("OK:" + relayDiag) : failReason;
+    String resp = uploadOK ? "HTTP/1.1 200 OK\r\n"
+                           : "HTTP/1.1 500 Internal Server Error\r\n";
+    resp += "Content-Length: " + String(body.length()) + "\r\n\r\n" + body;
+    client.print(resp);
+    delay(50);
+    client.stop();
+    Serial.println("[AP] Done: " + body);
   }
 
-  delay(100);
-}
+  // ==================== SETUP ====================
+  void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("\n=== GPS/LTE Firebase Test (LTE Only - AT+HTTP) ===\n");
+
+    // â”€â”€ Initialize Watchdog Timer FIRST (before any modem ops) â”€â”€
+    // Core 2.x API: esp_task_wdt_init(timeout_seconds, panic_on_timeout)
+    esp_task_wdt_init(WDT_TIMEOUT_S, true); // true = reboot on timeout
+    esp_task_wdt_add(NULL);                 // Watch the main loop task
+    Serial.printf("[WDT] Watchdog armed (%ds timeout)\n", WDT_TIMEOUT_S);
+
+    // Initialize modem with proper power sequence
+    modemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+    powerModem();
+
+    modemOK = initModem();
+
+    if (!modemOK) {
+      Serial.println("\n*** MODEM FAILED - Cannot proceed without LTE ***");
+      Serial.println("  CHECK: 1) Modem hardware connected properly");
+      Serial.println("         2) Power supply sufficient (>2A)");
+      Serial.println("         3) SIM card inserted");
+      while (1)
+        delay(1000);
+    }
+
+    gpsEnabled = initGPS();
+    Serial.println(gpsEnabled ? "GPS: Ready" : "GPS: Failed (continuing)");
+
+    Serial.println("\nConnecting via LTE...");
+    if (!connectLTE()) {
+      Serial.println("\n*** LTE CONNECTION FAILED ***");
+      Serial.println("  CHECK: 1) SIM has active data plan");
+      Serial.println("         2) LTE antenna connected");
+      Serial.println("         3) Signal coverage in area");
+      while (1)
+        delay(1000);
+    }
+
+    // â”€â”€ Start WiFi hotspot so ESP32-CAM can connect and relay images via
+    // LTE â”€â”€
+    startHotspot();
+    if (apStarted) {
+      camServer.begin();
+      Serial.printf("[AP] Camera proxy server listening on port %d\n",
+                    CAM_SERVER_PORT);
+      Serial.printf("[AP] ESP32-CAM should connect to SSID '%s' / '%s'\n",
+                    AP_SSID, AP_PASS);
+    }
+
+    // â”€â”€ POST-LTE: Retry AGPS + XTRA now that data is available â”€â”€
+    // These failed during GPS init because LTE wasn't connected yet
+    if (gpsEnabled) {
+      Serial.println("\nRetrying GPS assistance with LTE data...");
+
+      String resp;
+      Serial.print("  AGPS download...");
+      modem.sendAT("+CAGPS");
+      if (modem.waitResponse(15000L, resp) == 1) {
+        Serial.println(" OK (satellite data injected!)");
+      } else {
+        Serial.println(" skip");
+      }
+
+      Serial.print("  XTRA ephemeris download...");
+      modem.sendAT("+CGPSXD=0"); // Trigger immediate XTRA download
+      if (modem.waitResponse(10000L, resp) == 1) {
+        Serial.println(" OK");
+      } else {
+        Serial.println(" skip (auto-download enabled)");
+      }
+    }
+
+    // â”€â”€ Sync network time (Philippine Standard Time, UTC+8) â”€â”€
+    Serial.println("\nSyncing clock to Philippine Standard Time...");
+    if (syncNetworkTime()) {
+      Serial.println("Clock: " + formatTimestamp(getCurrentEpoch()));
+    } else {
+      Serial.println(
+          "WARNING: Clock not synced â€” timestamps may be incorrect");
+    }
+
+    Serial.println("\n=== Ready (LTE Only - AT+HTTP) ===\n");
+
+    printMemoryReport(); // Baseline memory snapshot
+  }
+
+  // ==================== LOOP ====================
+  void loop() {
+    esp_task_wdt_reset(); // Feed watchdog every loop iteration
+    unsigned long now = millis();
+
+    // Handle incoming camera image upload (non-blocking when idle)
+    if (apStarted) {
+      handleCameraClient();
+
+      // Check for incoming UDP logs
+      int packetSize = udpServer.parsePacket();
+      if (packetSize) {
+        char udpBuf[512] = "";
+        int len = udpServer.read(udpBuf, sizeof(udpBuf) - 1);
+        if (len > 0) {
+          udpBuf[len] = '\0';
+          Serial.printf(
+              "%s\n",
+              udpBuf); // String already contains prefix [TESTER]/[CAM]
+        }
+      }
+    }
+
+    // Check LTE connection periodically
+    if (now - lastSig >= SIGNAL_INTERVAL) {
+      if (lteConnected && modemOK) {
+        if (!modem.isGprsConnected()) {
+          Serial.println("LTE: Connection lost, reconnecting...");
+          lteConnected = false;
+          connectLTE();
+        }
+      }
+      lastSig = now;
+    }
+
+    // Modem health check (lightweight AT heartbeat)
+    if (modemOK && now - lastModemHealth >= MODEM_HEALTH_INTERVAL) {
+      checkModemHealth();
+      lastModemHealth = now;
+    }
+
+    // Periodic memory report
+    if (now - lastMemReport >= MEM_REPORT_INTERVAL) {
+      printMemoryReport();
+      lastMemReport = now;
+    }
+
+    // Read GPS (poll faster while acquiring fix, slower once locked)
+    unsigned long gpsInterval =
+        gpsFix ? GPS_INTERVAL_LOCKED : GPS_INTERVAL_ACQUIRING;
+    if (modemOK && gpsEnabled && now - lastGps >= gpsInterval) {
+      readGPS();
+      lastGps = now;
+
+      // Show GPS status periodically
+      static unsigned long lastGpsStatus = 0;
+      if (now - lastGpsStatus >= 10000) { // Every 10 seconds
+        if (gpsFix) {
+          Serial.printf("GPS: %.6f, %.6f\n", gpsLat, gpsLon);
+        } else {
+          Serial.println("GPS: No fix yet (needs outdoor + clear sky)");
+        }
+        lastGpsStatus = now;
+      }
+    }
+
+    // Re-sync network time periodically to prevent clock drift
+    if (lteConnected && now - lastTimeSync >= TIME_SYNC_INTERVAL) {
+      Serial.println("Periodic time re-sync...");
+      syncNetworkTime();
+      lastTimeSync = now;
+    }
+
+    // Send to Firebase
+    if (lteConnected && now - lastFB >= FIREBASE_INTERVAL) {
+      sendToFirebase();
+      lastFB = now;
+    }
+
+    // Refresh cached Delivery Context from Firebase (for Tester ESP32 /otp
+    // endpoint)
+    if (lteConnected &&
+        now - lastDeliveryContextRead >= DELIVERY_CONTEXT_READ_INTERVAL) {
+      refreshDeliveryContextFromFirebase();
+      lastDeliveryContextRead = now;
+    }
+
+    delay(100);
+  }

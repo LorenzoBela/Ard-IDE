@@ -4,11 +4,12 @@
  *
  * Flow:
  *   1. Connects to LilyGO SoftAP for internet access.
- *   2. Periodically fetches current OTP from proxy GET /otp.
- *   3. User enters PIN on keypad → validates against fetched OTP.
- *   4. If OTP correct → requests face check from proxy GET /face-check.
- *   5. Face detected → fires solenoid (Article 1.2 Photo-First).
- *   6. Reports event to proxy POST /event → written to Firebase.
+ *   2. Fetches live OTP + delivery_id from proxy every 10s.
+ *   3. Stays in STANDBY until an active delivery is available.
+ *   4. User enters PIN on keypad → validates against live OTP.
+ *   5. If OTP correct → requests face check from proxy GET /face-check.
+ *   6. Face detected → fires solenoid (Article 1.2 Photo-First).
+ *   7. Reports event to proxy POST /event → written to Firebase.
  *
  * Hardware: ESP32 DevKit (separate board)
  *   Keypad: rows 13,23,19,26 | cols 14,25,18
@@ -69,11 +70,10 @@ void netLog(const char *format, ...) {
 }
 
 // ==================== TIMING ====================
-#define OTP_REFRESH_INTERVAL 10000 // Fetch OTP every 10s
-#define WIFI_RETRY_BASE_MS 1000    // Exponential backoff base
-#define WIFI_RETRY_MAX_MS 32000    // Max backoff cap
-#define LCD_MESSAGE_DURATION 2000  // Non-blocking message display
-#define FACE_CHECK_TIMEOUT 15000   // HTTP timeout for face check
+#define WIFI_RETRY_BASE_MS 1000   // Exponential backoff base
+#define WIFI_RETRY_MAX_MS 32000   // Max backoff cap
+#define LCD_MESSAGE_DURATION 2000 // Non-blocking message display
+#define FACE_CHECK_TIMEOUT 15000  // HTTP timeout for face check
 
 // ==================== PIN SETUP (ORIGINAL — DO NOT CHANGE)
 // ====================
@@ -97,7 +97,8 @@ Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 // ==================== STATE MACHINE ====================
 enum TesterState {
   STATE_CONNECTING_WIFI, // Initial WiFi connection
-  STATE_IDLE,            // Waiting for keypad input
+  STATE_STANDBY,         // No active delivery — "Box Ready / No Delivery"
+  STATE_IDLE,            // Active delivery — waiting for keypad input
   STATE_ENTERING_PIN,    // User is typing digits
   STATE_VERIFYING_OTP,   // Checking entered PIN vs OTP
   STATE_REQUESTING_FACE, // HTTP GET /face-check in progress
@@ -114,14 +115,18 @@ static char inputCode[8]; // User-entered PIN (max 6 digits + null)
 static uint8_t inputLen = 0;
 
 static char currentOtp[8] =
-    "1234"; // Default for bench testing; overwritten by proxy
-static bool otpLoaded = true;
+    ""; // Empty until fetched from proxy (no hardcoded default)
+static char activeDeliveryId[64] = ""; // Active delivery ID, updated via proxy
+static bool hasActiveDelivery =
+    false; // true when proxy returned a real OTP + delivery_id
+
+static unsigned long lastDeliveryContextFetch = 0;
+#define DELIVERY_CONTEXT_FETCH_INTERVAL 10000 // Re-fetch every 10s
 
 static char lcdLine0[17]; // LCD line 0 buffer (16 chars + null)
 static char lcdLine1[17]; // LCD line 1 buffer
 
 // ==================== TIMING TRACKERS ====================
-static unsigned long lastOtpFetch = 0;
 static unsigned long wifiRetryAt = 0;
 static unsigned long wifiBackoffMs = WIFI_RETRY_BASE_MS;
 static unsigned long solenoidStartAt = 0;
@@ -135,7 +140,6 @@ static bool faceCheckResult = false;
 // ==================== FORWARD DECLARATIONS ====================
 void enterState(TesterState newState);
 void updateDisplay(const char *line0, const char *line1);
-bool fetchOtpFromProxy();
 int requestFaceCheck();
 bool reportEventToProxy(bool otpValid, bool faceDetected, bool unlocked);
 void connectWiFiNonBlocking();
@@ -188,11 +192,12 @@ void loop() {
     wifiBackoffMs = WIFI_RETRY_BASE_MS;
   }
 
-  // ── Periodic OTP refresh ──
-  if (WiFi.status() == WL_CONNECTED && currentState != STATE_CONNECTING_WIFI &&
-      now - lastOtpFetch >= OTP_REFRESH_INTERVAL) {
-    fetchOtpFromProxy();
-    lastOtpFetch = now;
+  // ── Periodic Delivery Context Fetch ──
+  if (WiFi.status() == WL_CONNECTED && currentState != STATE_CONNECTING_WIFI) {
+    if (now - lastDeliveryContextFetch >= DELIVERY_CONTEXT_FETCH_INTERVAL) {
+      fetchDeliveryContext();
+      lastDeliveryContextFetch = now;
+    }
   }
 
   // ── State machine ──
@@ -203,24 +208,24 @@ void loop() {
       Serial.printf("[WIFI] Connected! IP: %s\n",
                     WiFi.localIP().toString().c_str());
       wifiBackoffMs = WIFI_RETRY_BASE_MS; // Reset backoff
-
-      // Fetch OTP immediately
-      if (fetchOtpFromProxy()) {
-        Serial.printf("[OTP] Loaded: %s\n", currentOtp);
-      }
-      lastOtpFetch = now;
-      enterState(STATE_IDLE);
-    } else if (now >= wifiRetryAt) {
-      // After first timeout, go to IDLE anyway so keypad works offline
-      if (wifiBackoffMs > WIFI_RETRY_BASE_MS) {
-        Serial.println(
-            F("[WIFI] No connection — entering OFFLINE mode with default OTP"));
-        updateDisplay("OFFLINE MODE", "Using default PIN");
-        delay(1500);
+      // Fetch delivery context immediately, then decide standby vs idle
+      fetchDeliveryContext();
+      lastDeliveryContextFetch = now;
+      if (hasActiveDelivery) {
         enterState(STATE_IDLE);
       } else {
+        enterState(STATE_STANDBY);
+      }
+    } else if (now >= wifiRetryAt) {
+      // After first timeout, go to STANDBY so LCD shows status
+      if (wifiBackoffMs > WIFI_RETRY_BASE_MS) {
+        Serial.println(F("[WIFI] No connection — entering OFFLINE standby"));
+        updateDisplay("OFFLINE MODE", "No  Delivery");
+        messageStartAt = now;
+        currentState = STATE_SHOW_MESSAGE;
+      } else {
         // Exponential backoff reconnect (Article 2.4)
-        Serial.printf("[WIFI] Retry (backoff %lums)...\n", wifiBackoffMs);
+        Serial.printf("[WIFI] Retry (backoff %lums)....\n", wifiBackoffMs);
         WiFi.disconnect();
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
         wifiRetryAt = now + wifiBackoffMs;
@@ -231,6 +236,18 @@ void loop() {
       }
     }
     break;
+
+  case STATE_STANDBY: {
+    // No active delivery — block keypad input
+    char standbyKey = keypad.getKey();
+    if (standbyKey && standbyKey != '*') {
+      // Flash message on any digit/# press
+      updateDisplay("No active order", "Please wait...");
+      messageStartAt = now;
+      currentState = STATE_SHOW_MESSAGE;
+    }
+    break;
+  }
 
   case STATE_IDLE:
   case STATE_ENTERING_PIN: {
@@ -266,19 +283,6 @@ void loop() {
   }
 
   case STATE_VERIFYING_OTP:
-    if (!otpLoaded) {
-      netLog("[OTP] No OTP loaded, fetching...\n");
-      if (!fetchOtpFromProxy()) {
-        updateDisplay("No OTP loaded", "Check connection");
-        messageStartAt = now;
-        currentState = STATE_SHOW_MESSAGE;
-
-        // Report failure
-        reportEventToProxy(false, false, false);
-        break;
-      }
-    }
-
     if (strcmp(inputCode, currentOtp) == 0) {
       netLog("[OTP] CORRECT! Requesting face check...\n");
       updateDisplay("PIN Correct!", "Face check...");
@@ -366,7 +370,12 @@ void loop() {
 
   case STATE_SHOW_MESSAGE:
     if (now - messageStartAt >= LCD_MESSAGE_DURATION) {
-      enterState(STATE_IDLE);
+      // Return to the right state based on delivery availability
+      if (hasActiveDelivery) {
+        enterState(STATE_IDLE);
+      } else {
+        enterState(STATE_STANDBY);
+      }
     }
     break;
   }
@@ -377,6 +386,12 @@ void enterState(TesterState newState) {
   currentState = newState;
 
   switch (newState) {
+  case STATE_STANDBY:
+    updateDisplay("Box Ready", "No  Delivery");
+    inputLen = 0;
+    inputCode[0] = '\0';
+    faceCheckPending = false;
+    break;
   case STATE_IDLE:
     updateDisplay("Enter PIN:", "PIN: ");
     inputLen = 0;
@@ -403,46 +418,6 @@ void updateDisplay(const char *line0, const char *line1) {
 // ==================== PROXY HTTP HELPERS ====================
 
 /**
- * GET /otp — fetch current OTP from proxy (which reads Firebase RTDB).
- * Returns true if OTP was successfully loaded.
- */
-bool fetchOtpFromProxy() {
-  if (WiFi.status() != WL_CONNECTED)
-    return false;
-
-  HTTPClient http;
-  char url[64];
-  snprintf(url, sizeof(url), "http://%s:%d/otp", PROXY_HOST, PROXY_PORT);
-
-  http.setTimeout(5000);
-  http.begin(url);
-  int code = http.GET();
-
-  if (code == 200) {
-    String body = http.getString();
-    body.trim();
-    // Only accept all-digit OTP (reject "NO_OTP" and other non-numeric
-    // responses)
-    bool allDigits = body.length() > 0 && body.length() <= 6;
-    for (unsigned int i = 0; i < body.length() && allDigits; i++) {
-      if (body[i] < '0' || body[i] > '9')
-        allDigits = false;
-    }
-    if (allDigits) {
-      strncpy(currentOtp, body.c_str(), sizeof(currentOtp) - 1);
-      currentOtp[sizeof(currentOtp) - 1] = '\0';
-      otpLoaded = true;
-      http.end();
-      return true;
-    }
-  }
-
-  Serial.printf("[OTP] Fetch failed: HTTP %d\n", code);
-  http.end();
-  return false;
-}
-
-/**
  * GET /face-check — ask proxy to query ESP-CAM for face detection.
  * Falls back to UART Serial2 if WiFi is down.
  * Returns: 1 = face detected, 0 = no face, -1 = error/timeout.
@@ -451,9 +426,16 @@ int requestFaceCheck() {
   // ── Primary: WiFi via proxy ──
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    char url[64];
-    snprintf(url, sizeof(url), "http://%s:%d/face-check", PROXY_HOST,
-             PROXY_PORT);
+    char url[128];
+    if (strlen(activeDeliveryId) > 0 &&
+        strcmp(activeDeliveryId, "NO_DELIVERY") != 0 &&
+        strcmp(activeDeliveryId, "null") != 0) {
+      snprintf(url, sizeof(url), "http://%s:%d/face-check?delivery_id=%s",
+               PROXY_HOST, PROXY_PORT, activeDeliveryId);
+    } else {
+      snprintf(url, sizeof(url), "http://%s:%d/face-check", PROXY_HOST,
+               PROXY_PORT);
+    }
 
     http.setTimeout(FACE_CHECK_TIMEOUT);
     http.begin(url);
@@ -485,7 +467,14 @@ int requestFaceCheck() {
   while (Serial2.available())
     Serial2.read();
 
-  Serial2.println("FACE?");
+  // Send FACE?,{delivery_id}
+  if (strlen(activeDeliveryId) > 0 &&
+      strcmp(activeDeliveryId, "NO_DELIVERY") != 0 &&
+      strcmp(activeDeliveryId, "null") != 0) {
+    Serial2.printf("FACE?,%s\n", activeDeliveryId);
+  } else {
+    Serial2.println("FACE?");
+  }
 
   unsigned long uartStart = millis();
   char uartBuf[32] = "";
@@ -514,6 +503,84 @@ int requestFaceCheck() {
 
   Serial.println(F("[FACE] UART fallback failed"));
   return -1;
+}
+
+/**
+ * GET /otp -> Fetches "OTP,delivery_id" from proxy and updates locals
+ */
+void fetchDeliveryContext() {
+  if (WiFi.status() != WL_CONNECTED)
+    return;
+
+  HTTPClient http;
+  char url[64];
+  snprintf(url, sizeof(url), "http://%s:%d/otp", PROXY_HOST, PROXY_PORT);
+
+  http.setTimeout(3000);
+  http.begin(url);
+  int code = http.GET();
+
+  bool wasActive = hasActiveDelivery;
+
+  if (code == 200) {
+    String body = http.getString();
+    body.trim();
+    // Format: "123456,deliv_abc123"
+    int commaIdx = body.indexOf(',');
+    if (commaIdx > 0) {
+      String otpPart = body.substring(0, commaIdx);
+      String delPart = body.substring(commaIdx + 1);
+
+      bool validOtp = (otpPart != "NO_OTP" && otpPart != "null" &&
+                       otpPart.length() > 0 && otpPart.length() <= 6);
+      bool validDel = (delPart != "NO_DELIVERY" && delPart != "null" &&
+                       delPart.length() > 0);
+
+      if (validOtp) {
+        strncpy(currentOtp, otpPart.c_str(), sizeof(currentOtp) - 1);
+        currentOtp[sizeof(currentOtp) - 1] = '\0';
+      } else {
+        currentOtp[0] = '\0'; // Clear stale OTP
+      }
+      if (validDel) {
+        strncpy(activeDeliveryId, delPart.c_str(),
+                sizeof(activeDeliveryId) - 1);
+        activeDeliveryId[sizeof(activeDeliveryId) - 1] = '\0';
+      } else {
+        activeDeliveryId[0] = '\0'; // Clear stale delivery_id
+      }
+
+      hasActiveDelivery = (validOtp && validDel);
+    } else {
+      // Legacy format (just OTP, no delivery_id)
+      if (body != "NO_OTP" && body != "null" && body.length() > 0 &&
+          body.length() <= 6) {
+        strncpy(currentOtp, body.c_str(), sizeof(currentOtp) - 1);
+        currentOtp[sizeof(currentOtp) - 1] = '\0';
+        hasActiveDelivery = true;
+      } else {
+        currentOtp[0] = '\0';
+        hasActiveDelivery = false;
+      }
+    }
+  }
+  http.end();
+
+  // Drive state transitions based on delivery availability
+  if (hasActiveDelivery && !wasActive) {
+    // New delivery arrived — switch from standby to idle
+    netLog("[CONTEXT] Delivery active! OTP: %s | ID: %s\n", currentOtp,
+           activeDeliveryId);
+    if (currentState == STATE_STANDBY || currentState == STATE_SHOW_MESSAGE) {
+      enterState(STATE_IDLE);
+    }
+  } else if (!hasActiveDelivery && wasActive) {
+    // Delivery cleared — return to standby
+    netLog("[CONTEXT] No active delivery — returning to standby\n");
+    if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN) {
+      enterState(STATE_STANDBY);
+    }
+  }
 }
 
 /**
