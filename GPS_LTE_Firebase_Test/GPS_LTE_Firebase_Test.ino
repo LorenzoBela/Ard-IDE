@@ -1408,6 +1408,8 @@ bool uploadToSupabaseViaLTE(const uint8_t *data, size_t len,
     Serial.printf("[RELAY] Supabase upload OK (HTTP %d)\n", httpStatus);
     dataBytesOut += len;
     return true;
+  }
+
     Serial.printf("[RELAY] Supabase upload FAILED (HTTP %d)\n", httpStatus);
     return false;
   }

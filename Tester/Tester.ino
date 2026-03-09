@@ -159,7 +159,7 @@ void setup() {
   keypad.setDebounceTime(50);
 
   // LCD init
-  lcd.init();
+  lcd.begin();
   lcd.backlight();
   updateDisplay("Parcel-Safe v2", "Connecting WiFi");
 
