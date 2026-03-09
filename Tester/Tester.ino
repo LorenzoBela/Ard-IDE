@@ -121,7 +121,8 @@ static bool hasActiveDelivery =
     false; // true when proxy returned a real OTP + delivery_id
 
 static unsigned long lastDeliveryContextFetch = 0;
-#define DELIVERY_CONTEXT_FETCH_INTERVAL 10000 // Re-fetch every 10s
+#define DELIVERY_CONTEXT_FETCH_INTERVAL                                        \
+  1000 // Re-fetch every 1s (proxy is local WiFi)
 
 static char lcdLine0[17]; // LCD line 0 buffer (16 chars + null)
 static char lcdLine1[17]; // LCD line 1 buffer
@@ -158,8 +159,10 @@ void setup() {
   // Keypad debounce
   keypad.setDebounceTime(50);
 
-  // LCD init
-  lcd.begin();
+  // LCD init — reliable sequence for ESP32 + I2C HD44780 backpack
+  Wire.begin(21, 22); // Explicit SDA/SCL pins for ESP32 DevKit
+  delay(500);         // Allow LCD Vcc rail to fully stabilise before any I2C
+  lcd.begin();        // <-- Changed from begin() to init()!
   lcd.backlight();
   updateDisplay("Parcel-Safe v2", "Connecting WiFi");
 
@@ -238,6 +241,14 @@ void loop() {
     break;
 
   case STATE_STANDBY: {
+    // Transition immediately when a delivery context arrives
+    if (hasActiveDelivery) {
+      netLog("[STANDBY] Active delivery detected! OTP='%s' ID='%s' -> entering "
+             "IDLE\n",
+             currentOtp, activeDeliveryId);
+      enterState(STATE_IDLE);
+      break;
+    }
     // No active delivery — block keypad input
     char standbyKey = keypad.getKey();
     if (standbyKey && standbyKey != '*') {
@@ -408,11 +419,15 @@ void enterState(TesterState newState) {
 
 // ==================== LCD HELPER ====================
 void updateDisplay(const char *line0, const char *line1) {
-  lcd.clear();
+  // Overwrite each line with space-padding instead of lcd.clear() — eliminates
+  // blink flash
+  char buf[17];
   lcd.setCursor(0, 0);
-  lcd.print(line0);
+  snprintf(buf, sizeof(buf), "%-16s", line0); // left-justify, pad to 16 chars
+  lcd.print(buf);
   lcd.setCursor(0, 1);
-  lcd.print(line1);
+  snprintf(buf, sizeof(buf), "%-16s", line1);
+  lcd.print(buf);
 }
 
 // ==================== PROXY HTTP HELPERS ====================
@@ -509,22 +524,27 @@ int requestFaceCheck() {
  * GET /otp -> Fetches "OTP,delivery_id" from proxy and updates locals
  */
 void fetchDeliveryContext() {
-  if (WiFi.status() != WL_CONNECTED)
+  if (WiFi.status() != WL_CONNECTED) {
+    netLog("[FETCH] Skip — WiFi not connected\n");
     return;
+  }
 
   HTTPClient http;
   char url[64];
   snprintf(url, sizeof(url), "http://%s:%d/otp", PROXY_HOST, PROXY_PORT);
+  netLog("[FETCH] GET %s\n", url);
 
   http.setTimeout(3000);
   http.begin(url);
   int code = http.GET();
+  netLog("[FETCH] HTTP %d\n", code);
 
   bool wasActive = hasActiveDelivery;
 
   if (code == 200) {
     String body = http.getString();
     body.trim();
+    netLog("[FETCH] Body: '%s'\n", body.c_str());
     // Format: "123456,deliv_abc123"
     int commaIdx = body.indexOf(',');
     if (commaIdx > 0) {
@@ -551,6 +571,9 @@ void fetchDeliveryContext() {
       }
 
       hasActiveDelivery = (validOtp && validDel);
+      netLog("[FETCH] validOtp=%d validDel=%d hasActive=%d OTP='%s' ID='%s'\n",
+             validOtp, validDel, hasActiveDelivery, currentOtp,
+             activeDeliveryId);
     } else {
       // Legacy format (just OTP, no delivery_id)
       if (body != "NO_OTP" && body != "null" && body.length() > 0 &&
@@ -576,7 +599,7 @@ void fetchDeliveryContext() {
     }
   } else if (!hasActiveDelivery && wasActive) {
     // Delivery cleared — return to standby
-    netLog("[CONTEXT] No active delivery — returning to standby\n");
+    netLog("[CONTEXT] Delivery cleared — returning to standby\n");
     if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN) {
       enterState(STATE_STANDBY);
     }
