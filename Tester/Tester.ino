@@ -18,7 +18,7 @@
  * Rules enforced:
  *   - No delay() in loop (Article 2.1)
  *   - char[] buffers, no String class for long-running logic (Article 2.2)
- *   - Solenoid max 5s hard limit (Article 2.3)
+ *   - Solenoid relocks manually via '*' key after unlock
  *   - WiFi reconnect with exponential backoff (Article 2.4)
  */
 
@@ -72,7 +72,6 @@ void netLog(const char *format, ...) {
 #define OTP_REFRESH_INTERVAL 10000 // Fetch OTP every 10s
 #define WIFI_RETRY_BASE_MS 1000    // Exponential backoff base
 #define WIFI_RETRY_MAX_MS 32000    // Max backoff cap
-#define SOLENOID_MAX_MS 5000       // Article 2.3: thermal protection
 #define LCD_MESSAGE_DURATION 2000  // Non-blocking message display
 #define FACE_CHECK_TIMEOUT 15000   // HTTP timeout for face check
 
@@ -102,7 +101,7 @@ enum TesterState {
   STATE_ENTERING_PIN,    // User is typing digits
   STATE_VERIFYING_OTP,   // Checking entered PIN vs OTP
   STATE_REQUESTING_FACE, // HTTP GET /face-check in progress
-  STATE_UNLOCKING,       // Solenoid active (timed)
+  STATE_UNLOCKING,       // Solenoid active (manual relock using '*')
   STATE_RELOCKING,       // Solenoid deactivated, showing message
   STATE_SHOW_MESSAGE     // Temporary LCD message (non-blocking)
 };
@@ -156,7 +155,7 @@ void setup() {
   keypad.setDebounceTime(50);
 
   // LCD init
-  lcd.begin();
+  lcd.init();
   lcd.backlight();
   updateDisplay("Parcel-Safe v2", "Connecting WiFi");
 
@@ -346,14 +345,14 @@ void loop() {
       digitalWrite(LOCK_PIN, HIGH);
       solenoidStartAt = now;
       netLog("[LOCK] Solenoid ON\n");
-      updateDisplay("Box Unlocked!", "");
+      updateDisplay("Box Unlocked!", "* = Relock");
     }
 
-    // Article 2.3: hard thermal limit
-    if (now - solenoidStartAt >= SOLENOID_MAX_MS) {
+    // Manual relock control
+    if (keypad.getKey() == '*') {
       digitalWrite(LOCK_PIN, LOW);
       solenoidStartAt = 0;
-      netLog("[LOCK] Solenoid OFF (thermal limit)\n");
+      netLog("[LOCK] Solenoid OFF (manual relock)\n");
       enterState(STATE_RELOCKING);
     }
     break;

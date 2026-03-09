@@ -66,6 +66,11 @@
 #define DETECTION_COOLDOWN_MS 5000     // Min time between uploads
 #define UPLOAD_FRAME_SIZE FRAMESIZE_HD // 1280×720
 #define UPLOAD_JPEG_QUALITY 8
+#define FACE_DETECT_WINDOW_MS 6000  // Repeated detect window per request
+#define FACE_DETECT_RETRY_GAP_MS 30 // Gap between detect attempts
+#define WIFI_BOOT_CONNECT_TIMEOUT_MS 120000
+#define WIFI_RECONNECT_TIMEOUT_MS 20000
+#define WIFI_MAINTAIN_INTERVAL_MS 8000
 
 // ===================== CAMERA PINS: AI THINKER =====================
 #define PWDN_GPIO_NUM 32
@@ -93,6 +98,7 @@ static bool cameraInDetectMode = true;
 
 // Deferred upload flag — set by face-check handlers, executed in loop()
 static bool pendingUpload = false;
+static bool uploadInProgress = false;
 
 // Initialize ESP-Face models
 HumanFaceDetectMSR01 *s1;
@@ -128,6 +134,24 @@ void netLog(const char *format, ...) {
   }
 } // ===================== HELPERS =====================
 
+bool queueSingleUpload(const char *source) {
+  unsigned long now = millis();
+
+  if (uploadInProgress || pendingUpload) {
+    netLog("[UPLOAD] Skip queue from %s (busy)\n", source);
+    return false;
+  }
+
+  if (lastUploadAt != 0 && (now - lastUploadAt) < DETECTION_COOLDOWN_MS) {
+    netLog("[UPLOAD] Skip queue from %s (cooldown)\n", source);
+    return false;
+  }
+
+  pendingUpload = true;
+  netLog("[UPLOAD] Queued from %s\n", source);
+  return true;
+}
+
 void printCommands() {
   Serial.println(F("Commands:"));
   Serial.println(F("  c = force capture & upload (bypass detection)"));
@@ -148,35 +172,128 @@ const char *getSupabaseBearerToken() {
 
 // ===================== WIFI =====================
 
-void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+const char *wifiStatusText(wl_status_t status) {
+  switch (status) {
+  case WL_IDLE_STATUS:
+    return "IDLE";
+  case WL_NO_SSID_AVAIL:
+    return "NO_SSID";
+  case WL_SCAN_COMPLETED:
+    return "SCAN_COMPLETED";
+  case WL_CONNECTED:
+    return "CONNECTED";
+  case WL_CONNECT_FAILED:
+    return "CONNECT_FAILED";
+  case WL_CONNECTION_LOST:
+    return "CONNECTION_LOST";
+  case WL_DISCONNECTED:
+    return "DISCONNECTED";
+  default:
+    return "UNKNOWN";
+  }
+}
 
-  // The GPS/LTE board starts its AP after LTE connects, which can take
-  // 30-60 s from power-on. Retry until the AP is reachable (up to 90 s).
-  Serial.print(F("Connecting to hotspot '"));
-  Serial.print(WIFI_SSID);
-  Serial.print(F("'"));
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 90000) {
-    delay(500);
-    Serial.print('.');
-    // If WiFi can't associate yet, disconnect+reconnect to trigger a fresh scan
-    if (millis() - start > 15000 && (millis() - start) % 15000 < 600 &&
-        WiFi.status() != WL_CONNECTED) {
-      WiFi.disconnect();
-      delay(200);
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+void logTargetApVisibility() {
+  int found = WiFi.scanNetworks();
+  if (found <= 0) {
+    Serial.println(F("[WIFI] Scan result: no APs found"));
+    return;
+  }
+
+  bool targetFound = false;
+  for (int i = 0; i < found; i++) {
+    if (WiFi.SSID(i) == WIFI_SSID) {
+      targetFound = true;
+      Serial.printf("[WIFI] Target AP visible | RSSI %d dBm | CH %d\n",
+                    WiFi.RSSI(i), WiFi.channel(i));
+      break;
     }
   }
-  Serial.println();
+
+  if (!targetFound) {
+    Serial.printf("[WIFI] Target AP '%s' not visible in scan (%d APs)\n",
+                  WIFI_SSID, found);
+  }
+
+  WiFi.scanDelete();
+}
+
+bool connectWiFi(unsigned long timeoutMs = WIFI_BOOT_CONNECT_TIMEOUT_MS) {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+
+  WiFi.disconnect(true, false);
+  delay(150);
+
+  // Static IP so the LilyGO proxy can always reach us on 192.168.4.10
+  // (matches the hardcoded fallback in forwardFaceCheck() on the LilyGO side)
+  IPAddress staticIP(192, 168, 4, 10);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.config(staticIP, gateway, subnet, gateway);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.printf("[WIFI] Connecting to '%s'\n", WIFI_SSID);
+  unsigned long start = millis();
+  unsigned long lastRetryAt = start;
+  wl_status_t lastStatus = WiFi.status();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs) {
+    wl_status_t statusNow = WiFi.status();
+    if (statusNow != lastStatus) {
+      Serial.printf("[WIFI] Status -> %s (%d)\n", wifiStatusText(statusNow),
+                    (int)statusNow);
+      lastStatus = statusNow;
+    }
+
+    if (millis() - lastRetryAt >= 12000) {
+      Serial.println(F("[WIFI] Re-associate attempt..."));
+      WiFi.disconnect();
+      delay(100);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      lastRetryAt = millis();
+    }
+
+    delay(250);
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("WiFi connected to proxy AP. IP: "));
-    Serial.println(WiFi.localIP());
+    Serial.printf("[WIFI] Connected. IP: %s | RSSI: %d dBm | CH: %d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI(),
+                  WiFi.channel());
+    return true;
   } else {
-    Serial.println(F("WiFi connection failed. Will retry on next upload."));
+    wl_status_t statusNow = WiFi.status();
+    Serial.printf("[WIFI] Connect FAILED. Final status: %s (%d)\n",
+                  wifiStatusText(statusNow), (int)statusNow);
+    logTargetApVisibility();
+    return false;
   }
+}
+
+void maintainWiFiConnection() {
+  static unsigned long lastAttemptAt = 0;
+  unsigned long now = millis();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  if (now - lastAttemptAt < WIFI_MAINTAIN_INTERVAL_MS) {
+    return;
+  }
+
+  lastAttemptAt = now;
+  Serial.printf("[WIFI] Link down (%s). Reconnecting...\n",
+                wifiStatusText(WiFi.status()));
+  connectWiFi(WIFI_RECONNECT_TIMEOUT_MS);
 }
 
 void initTime() {
@@ -402,6 +519,19 @@ bool runFaceDetection() {
   return detected;
 }
 
+bool runFaceDetectionWindow(unsigned long windowMs) {
+  unsigned long detectStart = millis();
+  while (millis() - detectStart < windowMs) {
+    if (runFaceDetection()) {
+      scanCount++;
+      return true;
+    }
+    scanCount++;
+    delay(FACE_DETECT_RETRY_GAP_MS);
+  }
+  return false;
+}
+
 // ===================== UPLOAD =====================
 
 String makeObjectPath() {
@@ -413,7 +543,7 @@ String makeObjectPath() {
 bool uploadToSupabase(const uint8_t *data, size_t len,
                       const String &objectPath) {
   if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi();
+    connectWiFi(WIFI_RECONNECT_TIMEOUT_MS);
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Upload skipped: WiFi (proxy AP) disconnected."));
       return false;
@@ -542,7 +672,7 @@ void setup() {
       delay(1000);
   }
 
-  connectWiFi();
+  connectWiFi(WIFI_BOOT_CONNECT_TIMEOUT_MS);
   initTime();
 
   if (!initCamera()) {
@@ -552,7 +682,7 @@ void setup() {
   }
 
   // Allocate ESP-Face model
-  s1 = new HumanFaceDetectMSR01(0.7F, 0.5F, 10, 0.2F);
+  s1 = new HumanFaceDetectMSR01(0.1F, 0.5F, 10, 0.2F);
 
   // Start HTTP server for /face-status endpoint
   faceServer.begin();
@@ -594,6 +724,27 @@ void handleFaceStatusClient() {
     return;
   }
 
+  String requestLine = client.readStringUntil('\n');
+  requestLine.trim();
+
+  if (!requestLine.startsWith("GET /face-status ")) {
+    netLog("[HTTP] Ignoring request: %s\n", requestLine.c_str());
+    const char *body = "NOT_FOUND\r\n";
+    char resp404[160];
+    snprintf(resp404, sizeof(resp404),
+             "HTTP/1.1 404 Not Found\r\n"
+             "Content-Type: text/plain\r\n"
+             "Content-Length: %d\r\n"
+             "Connection: close\r\n\r\n"
+             "%s",
+             (int)strlen(body), body);
+    client.print(resp404);
+    client.flush();
+    delay(50);
+    client.stop();
+    return;
+  }
+
   // Read and discard HTTP headers
   while (client.available()) {
     String line = client.readStringUntil('\n');
@@ -602,16 +753,15 @@ void handleFaceStatusClient() {
       break; // End of headers
   }
 
-  // Run face detection
-  bool faceFound = runFaceDetection();
-  scanCount++;
+  // Run repeated face detection in a window (old working logic style)
+  bool faceFound = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS);
 
   const char *result;
   if (faceFound) {
     personCount++;
     netLog("[HTTP] Face detected!\n");
     result = "FACE_OK";
-    pendingUpload = true; // Defer upload to loop() to avoid proxy deadlock
+    queueSingleUpload("HTTP");
   } else {
     netLog("[HTTP] No face detected\n");
     result = "NO_FACE";
@@ -635,17 +785,20 @@ void handleFaceStatusClient() {
 
 void loop() {
   handleSerialCommands();
+  maintainWiFiConnection();
   handleFaceStatusClient(); // On-demand face-check via WiFi (from proxy)
   handleUartFaceCommand();  // On-demand face-check via UART (from Tester)
 
   // Deferred upload — runs AFTER face-check response was sent
   // This avoids deadlock (CAM uploads to the same proxy that requested
   // face-check)
-  if (pendingUpload) {
+  if (pendingUpload && !uploadInProgress) {
     pendingUpload = false;
+    uploadInProgress = true;
     netLog("[UPLOAD] Deferred capture + upload starting...\n");
     captureHighResAndUpload();
     netLog("[UPLOAD] Done. One photo captured.\n");
+    uploadInProgress = false;
   }
 
   // A tiny yield so the ESP32 doesn't trigger FreeRTOS watchdogs
@@ -680,14 +833,14 @@ void handleUartFaceCommand() {
 
   netLog("[UART] Face check requested from Tester board\n");
 
-  // Run face detection
-  bool detected = runFaceDetection();
+  // Run repeated face detection in a window (old working logic style)
+  bool detected = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS);
 
   // Respond IMMEDIATELY
   if (detected) {
     netLog("[UART] Face DETECTED\n");
     Serial2.println("FACE_OK");
-    pendingUpload = true; // Defer upload to next loop iteration
+    queueSingleUpload("UART");
   } else {
     Serial.println(F("[UART] No face"));
     Serial2.println("NO_FACE");

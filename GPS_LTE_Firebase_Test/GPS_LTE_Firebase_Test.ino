@@ -1521,8 +1521,8 @@ String forwardFaceCheck() {
   // If CAM IP not yet discovered from /upload, try default SoftAP client IP
   if (!camClientKnown) {
     Serial.println(
-        "[FACE] CAM IP not from /upload -- trying default 192.168.4.3");
-    camClientIP = IPAddress(192, 168, 4, 3);
+        "[FACE] CAM IP not from /upload -- trying default 192.168.4.10");
+    camClientIP = IPAddress(192, 168, 4, 10);
     // Don't set camClientKnown yet -- let /upload confirm later
   }
 
@@ -1668,7 +1668,20 @@ void handleCameraClient() {
     return;
   }
 
-  // â”€â”€ POST /upload (default â€” camera relay) â”€â”€
+  if (!(strcmp(method, "POST") == 0 && strcmp(reqPath, "/upload") == 0)) {
+    Serial.printf("[AP] -> 404 %s %s\n", method, reqPath);
+    String body = "NOT_FOUND";
+    String resp = "HTTP/1.1 404 Not Found\r\nContent-Type: "
+                  "text/plain\r\nContent-Length: " +
+                  String(body.length()) + "\r\n\r\n" + body;
+    client.print(resp);
+    delay(50);
+    client.stop();
+    return;
+  }
+
+  // â”€â”€ POST /upload â€” camera relay only â”€â”€
+  Serial.println("[AP] -> POST /upload");
   camClientIP = clientAddr;
   camClientKnown = true;
   Serial.printf("[AP] CAM IP: %s | Image: %u bytes\n",
