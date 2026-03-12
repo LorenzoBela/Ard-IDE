@@ -102,7 +102,7 @@ enum TesterState {
   STATE_ENTERING_PIN,    // User is typing digits
   STATE_VERIFYING_OTP,   // Checking entered PIN vs OTP
   STATE_REQUESTING_FACE, // HTTP GET /face-check in progress
-  STATE_UNLOCKING,       // Solenoid active (manual relock using '*')
+  STATE_UNLOCKING,       // Solenoid active (manual relock using '*' or 5s thermal limit)
   STATE_RELOCKING,       // Solenoid deactivated, showing message
   STATE_SHOW_MESSAGE     // Temporary LCD message (non-blocking)
 };
@@ -142,8 +142,10 @@ static bool faceCheckResult = false;
 void enterState(TesterState newState);
 void updateDisplay(const char *line0, const char *line1);
 int requestFaceCheck();
-bool reportEventToProxy(bool otpValid, bool faceDetected, bool unlocked);
+bool reportEventToProxy(bool otpValid, bool faceDetected, bool unlocked, bool thermalCutoff = false);
 void connectWiFiNonBlocking();
+
+#define SOLENOID_MAX_ACTIVE_MS 5000 // 5 seconds thermal protection (Article 2.3)
 
 // ==================== SETUP ====================
 void setup() {
@@ -306,7 +308,7 @@ void loop() {
       currentState = STATE_SHOW_MESSAGE;
 
       // Report wrong OTP
-      reportEventToProxy(false, false, false);
+      reportEventToProxy(false, false, false, false);
     }
 
     // Reset input
@@ -329,14 +331,14 @@ void loop() {
         enterState(STATE_UNLOCKING);
 
         // Report success
-        reportEventToProxy(true, true, true);
+        reportEventToProxy(true, true, true, false);
       } else if (result == 0) {
         // No face detected — do NOT fire solenoid
         netLog("[FACE] NOT DETECTED! Solenoid stays locked.\n");
         updateDisplay("No face found!", "Box stays locked");
 
         // Report: OTP valid but face failed
-        reportEventToProxy(true, false, false);
+        reportEventToProxy(true, false, false, false);
 
         messageStartAt = millis();
         currentState = STATE_SHOW_MESSAGE;
@@ -346,7 +348,7 @@ void loop() {
         updateDisplay("Camera offline!", "Box stays locked");
 
         // Report: OTP valid but camera error
-        reportEventToProxy(true, false, false);
+        reportEventToProxy(true, false, false, false);
 
         messageStartAt = millis();
         currentState = STATE_SHOW_MESSAGE;
@@ -363,11 +365,22 @@ void loop() {
       updateDisplay("Box Unlocked!", "* = Relock");
     }
 
+    // Thermal safety limits (Article 2.3)
+    if (solenoidStartAt > 0 && now - solenoidStartAt >= SOLENOID_MAX_ACTIVE_MS) {
+      digitalWrite(LOCK_PIN, LOW);
+      solenoidStartAt = 0;
+      netLog("[LOCK] Solenoid CUT OFF (Thermal Safety 5s)\n");
+      updateDisplay("Lock timeout!", "Relocking");
+      // Report cutoff to Firebase via proxy so lock_health overheated passes through
+      reportEventToProxy(false, false, false, true);
+      enterState(STATE_RELOCKING);
+    }
     // Manual relock control
-    if (keypad.getKey() == '*') {
+    else if (keypad.getKey() == '*') {
       digitalWrite(LOCK_PIN, LOW);
       solenoidStartAt = 0;
       netLog("[LOCK] Solenoid OFF (manual relock)\n");
+      reportEventToProxy(false, false, false, false); // relay locked state back
       enterState(STATE_RELOCKING);
     }
     break;
@@ -540,16 +553,28 @@ void fetchDeliveryContext() {
   netLog("[FETCH] HTTP %d\n", code);
 
   bool wasActive = hasActiveDelivery;
+  String statusPart = "";
 
   if (code == 200) {
     String body = http.getString();
     body.trim();
     netLog("[FETCH] Body: '%s'\n", body.c_str());
-    // Format: "123456,deliv_abc123"
-    int commaIdx = body.indexOf(',');
-    if (commaIdx > 0) {
-      String otpPart = body.substring(0, commaIdx);
-      String delPart = body.substring(commaIdx + 1);
+    // Format: "123456,deliv_abc123" OR "123456,deliv_abc123,UNLOCKING"
+    int firstComma = body.indexOf(',');
+    int secondComma = body.indexOf(',', firstComma + 1);
+
+    if (firstComma > 0) {
+      String otpPart = "";
+      String delPart = "";
+
+      if (secondComma > 0) {
+        otpPart = body.substring(0, firstComma);
+        delPart = body.substring(firstComma + 1, secondComma);
+        statusPart = body.substring(secondComma + 1);
+      } else {
+        otpPart = body.substring(0, firstComma);
+        delPart = body.substring(firstComma + 1);
+      }
 
       bool validOtp = (otpPart != "NO_OTP" && otpPart != "null" &&
                        otpPart.length() > 0 && otpPart.length() <= 6);
@@ -571,9 +596,9 @@ void fetchDeliveryContext() {
       }
 
       hasActiveDelivery = (validOtp && validDel);
-      netLog("[FETCH] validOtp=%d validDel=%d hasActive=%d OTP='%s' ID='%s'\n",
+      netLog("[FETCH] validOtp=%d validDel=%d hasActive=%d OTP='%s' ID='%s' Status='%s'\n",
              validOtp, validDel, hasActiveDelivery, currentOtp,
-             activeDeliveryId);
+             activeDeliveryId, statusPart.c_str());
     } else {
       // Legacy format (just OTP, no delivery_id)
       if (body != "NO_OTP" && body != "null" && body.length() > 0 &&
@@ -604,13 +629,24 @@ void fetchDeliveryContext() {
       enterState(STATE_STANDBY);
     }
   }
+
+  // Handle remote lock/unlock requests via statusPart
+  if (statusPart == "UNLOCKING" && currentState != STATE_UNLOCKING) {
+    netLog("[CONTEXT] Remote UNLOCK commanded!\n");
+    enterState(STATE_UNLOCKING);
+  } else if (statusPart == "LOCKED" && currentState == STATE_UNLOCKING) {
+    netLog("[CONTEXT] Remote LOCK commanded!\n");
+    digitalWrite(LOCK_PIN, LOW);
+    solenoidStartAt = 0;
+    enterState(STATE_RELOCKING);
+  }
 }
 
 /**
  * POST /event — report lock event to proxy (which writes to Firebase).
  * JSON: { "otp_valid": bool, "face_detected": bool, "unlocked": bool }
  */
-bool reportEventToProxy(bool otpValid, bool faceDetected, bool unlocked) {
+bool reportEventToProxy(bool otpValid, bool faceDetected, bool unlocked, bool thermalCutoff) {
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
@@ -618,12 +654,12 @@ bool reportEventToProxy(bool otpValid, bool faceDetected, bool unlocked) {
   char url[64];
   snprintf(url, sizeof(url), "http://%s:%d/event", PROXY_HOST, PROXY_PORT);
 
-  char json[128];
+  char json[150];
   snprintf(json, sizeof(json),
            "{\"otp_valid\":%s,\"face_detected\":%s,\"unlocked\":%s,\"box_id\":"
-           "\"%s\"}",
+           "\"%s\",\"thermal_cutoff\":%s}",
            otpValid ? "true" : "false", faceDetected ? "true" : "false",
-           unlocked ? "true" : "false", HARDWARE_ID);
+           unlocked ? "true" : "false", HARDWARE_ID, thermalCutoff ? "true" : "false");
 
   http.setTimeout(5000);
   http.begin(url);
