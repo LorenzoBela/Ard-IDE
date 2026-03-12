@@ -212,12 +212,13 @@ bool reportEventToProxy(bool otpValid, bool faceDetected, bool unlocked, bool th
   char url[64];
   snprintf(url, sizeof(url), "http://%s:%d/event", PROXY_HOST, PROXY_PORT);
 
-  char json[150];
+  char json[256];
   snprintf(json, sizeof(json),
            "{\"otp_valid\":%s,\"face_detected\":%s,\"unlocked\":%s,\"box_id\":"
-           "\"%s\",\"thermal_cutoff\":%s}",
+           "\"%s\",\"delivery_id\":\"%s\",\"thermal_cutoff\":%s}",
            otpValid ? "true" : "false", faceDetected ? "true" : "false",
-           unlocked ? "true" : "false", HARDWARE_ID, thermalCutoff ? "true" : "false");
+           unlocked ? "true" : "false", HARDWARE_ID, activeDeliveryId,
+           thermalCutoff ? "true" : "false");
 
   http.setTimeout(5000);
   http.begin(url);
@@ -251,6 +252,32 @@ bool reportAlertToProxy(const char *alertType, const char *details) {
   int code = http.POST((uint8_t *)json, strlen(json));
 
   Serial.printf("[ALERT] %s → HTTP %d\n", alertType, code);
+  http.end();
+
+  return (code == 200 || code == 201);
+}
+
+// ==================== TAMPER REPORT ====================
+bool reportTamperToProxy() {
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  HTTPClient http;
+  char url[64];
+  snprintf(url, sizeof(url), "http://%s:%d/event", PROXY_HOST, PROXY_PORT);
+
+  char json[256];
+  snprintf(json, sizeof(json),
+           "{\"alert_type\":\"REED_TAMPER\",\"details\":\"lid_opened_no_unlock\","
+           "\"box_id\":\"%s\",\"delivery_id\":\"%s\",\"tamper\":true}",
+           HARDWARE_ID, activeDeliveryId);
+
+  http.setTimeout(5000);
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST((uint8_t *)json, strlen(json));
+
+  Serial.printf("[TAMPER] Report → HTTP %d\n", code);
   http.end();
 
   return (code == 200 || code == 201);

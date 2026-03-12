@@ -96,6 +96,7 @@ unsigned long lastModemHealth = 0, lastMemReport = 0;
 
 double gpsLat = 0, gpsLon = 0;
 double gpsHdop = 99.9; // Horizontal Dilution of Precision (99.9 = unknown)
+float  gpsSpeed = 0.0f; // Speed in knots from CGNSSINFO, converted to m/s
 bool gpsFix = false;
 unsigned long dataBytesOut = 0; // Total bytes sent to Firebase
 
@@ -109,8 +110,17 @@ String relayDiag =
 // /otp)
 char cachedOtp[8] = "";
 bool otpCacheValid = false;
+// EC-32: Return protocol (OTP at pickup on cancellation)
+char cachedReturnOtp[8] = "";
+bool returnOtpCacheValid = false;
+bool returnActive = false;
+bool lastReturnActive = false;
 char cachedDeliveryId[64] = "";
 bool deliveryIdCacheValid = false;
+double destLat = 0.0, destLon = 0.0;
+bool destCoordsValid = false;
+double pickupLat = 0.0, pickupLon = 0.0;
+bool pickupCoordsValid = false;
 unsigned long lastDeliveryContextRead = 0;
 #define DELIVERY_CONTEXT_READ_INTERVAL 5000 // Re-read Firebase every 5s
 
@@ -466,6 +476,16 @@ void readGPS() {
       double h = hdopStr.toDouble();
       if (h > 0)
         gpsHdop = h;
+    }
+
+    // Extract speed (field 12): between commas[11] and commas[12], in knots
+    if (commaCount >= 13) {
+      String spdStr = data.substring(commas[11] + 1, commas[12]);
+      spdStr.trim();
+      if (spdStr.length() > 0) {
+        float knots = spdStr.toFloat();
+        gpsSpeed = knots * 0.514444f; // knots -> m/s
+      }
     }
 
     static unsigned long lastFixDebug = 0;
@@ -1019,21 +1039,17 @@ bool httpPutToFirebase(const char *path, const String &jsonData) {
     esp_task_wdt_reset();
   }
 
-  // If PUT (action=4) failed, try with PATCH via POST workaround
+  // If PUT (action=4) failed, use POST + X-HTTP-Method-Override: PUT
   if (!actionOK || httpStatus == 0) {
-    // Some A7670E firmware doesn't support action=4 (PUT)
-    // Fallback: use PATCH with URL parameter
-    Serial.print("(PUT unsupported, using PATCH)... ");
+    Serial.print("(PUT unsupported, using Override)... ");
     sendATAndWait("+HTTPTERM", 1000);
     delay(200);
 
-    // Re-init with PATCH URL (Firebase supports PATCH via REST)
     modem.sendAT("+HTTPINIT");
     modem.waitResponse(5000L);
     modem.sendAT("+HTTPPARA=\"CID\",1");
     modem.waitResponse(3000L);
 
-    // Firebase REST API accepts PATCH on the URL to update data
     String patchUrl = "https://" + String(FIREBASE_HOST) + path;
     if (strlen(FIREBASE_AUTH) > 0) {
       patchUrl += "?auth=" + String(FIREBASE_AUTH);
@@ -1044,6 +1060,10 @@ bool httpPutToFirebase(const char *path, const String &jsonData) {
 
     modem.sendAT("+HTTPPARA=\"CONTENT\",\"application/json\"");
     modem.waitResponse(3000L);
+
+    modem.sendAT("+HTTPPARA=\"USERDATA\",\"X-HTTP-Method-Override: PUT\"");
+    modem.waitResponse(3000L);
+
     modem.sendAT("+HTTPSSL=1");
     modem.waitResponse(3000L);
 
@@ -1071,7 +1091,7 @@ bool httpPutToFirebase(const char *path, const String &jsonData) {
       delay(500);
       modem.waitResponse(5000L);
 
-      // Use POST (action=1) â€” Firebase will overwrite the node
+      // POST + X-HTTP-Method-Override: PUT ensures Firebase overwrites the node
       modem.sendAT("+HTTPACTION=1");
 
       waitStart = millis();
@@ -1683,6 +1703,36 @@ void refreshDeliveryContextFromFirebase() {
     Serial.printf("[CONTEXT] dataLen=%d body(120): %.120s\n", dataLen,
                   body.c_str());
 
+    // EC-32: Parse return_active flag
+    // We parse both explicit true and explicit false. If missing, default false.
+    {
+      bool parsed = false;
+      int raTrueIdx  = body.indexOf("\"return_active\":true");
+      int raFalseIdx = body.indexOf("\"return_active\":false");
+      if (raTrueIdx >= 0)  { returnActive = true;  parsed = true; }
+      if (raFalseIdx >= 0) { returnActive = false; parsed = true; }
+      if (!parsed) {
+        returnActive = false;
+      }
+    }
+
+    // EC-32: Parse return_otp (6-digit) when returnActive is enabled
+    int rotpIdx = body.indexOf("\"return_otp\":\"");
+    if (rotpIdx >= 0) {
+      int start = rotpIdx + 13;
+      int end = body.indexOf('"', start);
+      if (end > start) {
+        int len = end - start;
+        if (len > 0 && len <= 6) {
+          strncpy(cachedReturnOtp, body.c_str() + start, len);
+          cachedReturnOtp[len] = '\0';
+          returnOtpCacheValid = true;
+        }
+      }
+    } else {
+      returnOtpCacheValid = false;
+    }
+
     // Parse otp_code
     int otpIdx = body.indexOf("\"otp_code\":\"");
     if (otpIdx >= 0) {
@@ -1716,6 +1766,86 @@ void refreshDeliveryContextFromFirebase() {
     } else {
       deliveryIdCacheValid = false;
     }
+
+    // Parse destination coords for geofence + theft guard targeting.
+    // Mobile app writes "target_lat"/"target_lng"; accept both that and
+    // the legacy "dest_lat"/"dest_lon" so either naming convention works.
+    int dLatIdx = body.indexOf("\"dest_lat\":");
+    int dLonIdx = body.indexOf("\"dest_lon\":");
+    if (dLatIdx < 0) dLatIdx = body.indexOf("\"target_lat\":");
+    if (dLonIdx < 0) dLonIdx = body.indexOf("\"target_lng\":");
+    int dLatValOffset = (body.indexOf("\"target_lat\":") == dLatIdx) ? 13 : 11;
+    int dLonValOffset = (body.indexOf("\"target_lng\":") == dLonIdx) ? 13 : 11;
+    if (dLatIdx >= 0 && dLonIdx >= 0) {
+      double dLa = body.substring(dLatIdx + dLatValOffset).toDouble();
+      double dLo = body.substring(dLonIdx + dLonValOffset).toDouble();
+      if (dLa != 0.0 || dLo != 0.0) {
+        bool changed = (dLa != destLat || dLo != destLon);
+        destLat = dLa;
+        destLon = dLo;
+        destCoordsValid = true;
+        if (changed) {
+          geoProxy.setTarget(destLat, destLon);
+          theftGuardSetGeofence((float)destLat, (float)destLon,
+                               TG_GEOFENCE_RADIUS_KM);
+          Serial.printf("[GEO] Target set: %.6f, %.6f\n", destLat, destLon);
+        }
+      }
+    } else if (!deliveryIdCacheValid) {
+      destCoordsValid = false;
+    }
+
+    // Parse pickup coords (pickup_lat / pickup_lng) for dual-geofence gating
+    int pLatIdx = body.indexOf("\"pickup_lat\":");
+    int pLonIdx = body.indexOf("\"pickup_lng\":");
+    if (pLatIdx >= 0 && pLonIdx >= 0) {
+      double pLa = body.substring(pLatIdx + 13).toDouble();
+      double pLo = body.substring(pLonIdx + 13).toDouble();
+      if (pLa != 0.0 || pLo != 0.0) {
+        bool changed = (pLa != pickupLat || pLo != pickupLon);
+        pickupLat = pLa;
+        pickupLon = pLo;
+        pickupCoordsValid = true;
+        if (changed) {
+          geoProxy.setPickup(pickupLat, pickupLon);
+          Serial.printf("[GEO] Pickup set: %.6f, %.6f\n", pickupLat, pickupLon);
+        }
+      }
+    } else if (!deliveryIdCacheValid) {
+      pickupCoordsValid = false;
+    }
+
+    // EC-32: Swap the PRIMARY geofence target when returning.
+    // - Normal trip: target = dropoff (destLat/destLon)
+    // - Return trip: target = pickup (pickupLat/pickupLon)
+    //
+    // Note: isNearAnyTarget() already checks both points. This swap is for the
+    // stability state machine + distance telemetry, and for consistent gating.
+    // Detect return->normal transition for cache cleanup
+    bool returnEnded = (lastReturnActive && !returnActive);
+
+    if (returnActive && pickupCoordsValid) {
+      bool targetChanged = (geoProxy.targetLat != pickupLat) || (geoProxy.targetLon != pickupLon);
+      if (targetChanged || !lastReturnActive) {
+        geoProxy.setTarget(pickupLat, pickupLon);
+        theftGuardSetGeofence((float)pickupLat, (float)pickupLon, TG_GEOFENCE_RADIUS_KM);
+        Serial.printf("[EC-32] Return mode: target->PICKUP %.6f, %.6f\n", pickupLat, pickupLon);
+      }
+    } else if (!returnActive && destCoordsValid) {
+      bool targetChanged = (geoProxy.targetLat != destLat) || (geoProxy.targetLon != destLon);
+      if (targetChanged || lastReturnActive) {
+        geoProxy.setTarget(destLat, destLon);
+        theftGuardSetGeofence((float)destLat, (float)destLon, TG_GEOFENCE_RADIUS_KM);
+        Serial.printf("[EC-32] Normal mode: target->DROPOFF %.6f, %.6f\n", destLat, destLon);
+      }
+    }
+
+    if (returnEnded) {
+      cachedReturnOtp[0] = '\0';
+      returnOtpCacheValid = false;
+      Serial.println("[EC-32] Return ended: cleared cached return OTP");
+    }
+    lastReturnActive = returnActive;
 
     // ── NVS persistence ──
     if (otpCacheValid)          dpSaveOtp(cachedOtp);
@@ -1777,6 +1907,13 @@ void refreshDeliveryContextFromFirebase() {
         "[CONTEXT] Parsed -> OTP: %s (valid=%d) | DeliveryID: %s (valid=%d)\n",
         otpCacheValid ? cachedOtp : "NONE", otpCacheValid,
         deliveryIdCacheValid ? cachedDeliveryId : "NONE", deliveryIdCacheValid);
+
+    // EC-32: Return-mode visibility in logs
+    if (returnActive) {
+      Serial.printf("[CONTEXT] Return active -> returnOtp: %s (valid=%d)\n",
+                    returnOtpCacheValid ? cachedReturnOtp : "NONE",
+                    (int)returnOtpCacheValid);
+    }
   }
 
   sendATAndWait("+HTTPTERM", 1000);
@@ -1816,6 +1953,55 @@ void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked) {
   snprintf(statusPath, sizeof(statusPath), "/hardware/%s/status.json",
            HARDWARE_ID);
   httpPutWithRetry(statusPath, statusJson);
+}
+
+// ==================== TAMPER EVENT WRITER ====================
+void writeTamperToFirebase() {
+  if (!lteConnected) {
+    Serial.println("[TAMPER] LTE not connected");
+    return;
+  }
+
+  unsigned long now_epoch = getCurrentEpoch();
+  char tsBuf[30];
+  String tsStr = formatTimestamp(now_epoch);
+  strncpy(tsBuf, tsStr.c_str(), sizeof(tsBuf) - 1);
+  tsBuf[sizeof(tsBuf) - 1] = '\0';
+
+  // Write tamper state to hardware/{boxId}/tamper
+  char tamperJson[256];
+  snprintf(tamperJson, sizeof(tamperJson),
+           "{\"detected\":true,\"lockdown\":true,"
+           "\"timestamp\":{\".sv\":\"timestamp\"},"
+           "\"device_epoch\":%lu,\"timestamp_str\":\"%s\","
+           "\"source\":\"reed_switch\"}",
+           now_epoch, tsBuf);
+
+  char tamperPath[64];
+  snprintf(tamperPath, sizeof(tamperPath), "/hardware/%s/tamper.json",
+           HARDWARE_ID);
+  bool ok = httpPutWithRetry(tamperPath, tamperJson);
+  Serial.printf("[TAMPER] Firebase tamper write: %s\n", ok ? "OK" : "FAIL");
+
+  // Also update the top-level theft_state so useSecurityAlerts fires
+  char theftJson[32];
+  snprintf(theftJson, sizeof(theftJson), "\"STOLEN\"");
+  char theftPath[64];
+  snprintf(theftPath, sizeof(theftPath), "/hardware/%s/theft_state.json",
+           HARDWARE_ID);
+  httpPutWithRetry(theftPath, theftJson);
+
+  // Log tamper event to lock_events
+  char eventJson[256];
+  snprintf(eventJson, sizeof(eventJson),
+           "{\"tamper\":true,\"source\":\"reed_switch\","
+           "\"timestamp\":{\".sv\":\"timestamp\"},"
+           "\"device_epoch\":%lu,\"timestamp_str\":\"%s\"}",
+           now_epoch, tsBuf);
+  char eventPath[64];
+  snprintf(eventPath, sizeof(eventPath), "/lock_events/%s/latest.json",
+           HARDWARE_ID);
+  httpPutWithRetry(eventPath, eventJson);
 }
 
 // ==================== FACE CHECK FORWARDER ====================
@@ -1933,10 +2119,32 @@ void handleCameraClient() {
 
   // â”€â”€ GET /otp â”€â”€
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/otp")) {
-    String otpPart = otpCacheValid ? String(cachedOtp) : "NO_OTP";
-    String delPart =
-        deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
+    String otpPart, delPart;
+    if (theftGuardShouldBlockOtp()) {
+      otpPart = "NO_OTP";
+      delPart = "NO_DELIVERY";
+      Serial.printf("[AP] OTP suppressed — theft state: %s\n",
+                    theftGuardStateStr());
+    } else if (destCoordsValid && gpsFix &&
+               !geoProxy.isNearAnyTarget(gpsLat, gpsLon)) {
+      otpPart = "NO_OTP";
+      delPart = "NO_DELIVERY";
+      Serial.printf("[AP] OTP suppressed — outside geofence (%.0fm)\n",
+                    geoProxy.snap.distanceM);
+    } else {
+      // EC-32: During RETURNING, serve the return OTP instead of the delivery OTP.
+      if (returnActive) {
+        otpPart = returnOtpCacheValid ? String(cachedReturnOtp) : "NO_OTP";
+      } else {
+        otpPart = otpCacheValid ? String(cachedOtp) : "NO_OTP";
+      }
+      delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
+    }
+
     String body = otpPart + "," + delPart;
+    if (returnActive) {
+      body += ",RETURNING";
+    }
     Serial.printf("[AP] -> GET /otp  serving: '%s'\n", body.c_str());
     String resp =
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
@@ -1950,6 +2158,21 @@ void handleCameraClient() {
   // â”€â”€ GET /face-check â”€â”€
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/face-check")) {
     Serial.println("[AP] -> GET /face-check");
+
+    // Block face check when outside geofence or stolen/lockdown
+    if (theftGuardShouldBlockOtp() ||
+        (destCoordsValid && gpsFix && !geoProxy.isNearAnyTarget(gpsLat, gpsLon))) {
+      Serial.println("[AP] Face-check blocked — outside geofence or theft state");
+      String blocked = "NO_FACE";
+      String resp =
+          "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+          String(blocked.length()) + "\r\n\r\n" + blocked;
+      client.print(resp);
+      delay(50);
+      client.stop();
+      return;
+    }
+
     String deliveryId = "";
     int qIdx = reqPathStr.indexOf("?delivery_id=");
     if (qIdx >= 0) {
@@ -1975,10 +2198,18 @@ void handleCameraClient() {
       jsonBuf[rd] = '\0';
     }
     Serial.printf("[AP] Event: %s\n", jsonBuf);
-    bool ov = (strstr(jsonBuf, "\"otp_valid\":true") != NULL);
-    bool fd = (strstr(jsonBuf, "\"face_detected\":true") != NULL);
-    bool ul = (strstr(jsonBuf, "\"unlocked\":true") != NULL);
-    writeLockEventToFirebase(ov, fd, ul);
+
+    // Reed switch tamper: Controller detected unauthorized lid-open
+    if (strstr(jsonBuf, "\"tamper\":true") != NULL) {
+      Serial.println("[AP] TAMPER event received — writing to Firebase");
+      writeTamperToFirebase();
+    } else {
+      bool ov = (strstr(jsonBuf, "\"otp_valid\":true") != NULL);
+      bool fd = (strstr(jsonBuf, "\"face_detected\":true") != NULL);
+      bool ul = (strstr(jsonBuf, "\"unlocked\":true") != NULL);
+      writeLockEventToFirebase(ov, fd, ul);
+    }
+
     String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
     client.print(resp);
     delay(50);
@@ -2026,6 +2257,33 @@ void handleCameraClient() {
             "FAIL:incomplete:" + String(received) + "/" + String(contentLength);
       }
       free(buf);
+    }
+  }
+
+  // Write the public URL back to Firebase so web/mobile apps can find the image
+  if (uploadOK && lteConnected) {
+    char publicUrl[256];
+    snprintf(publicUrl, sizeof(publicUrl),
+             "%s/storage/v1/object/public/%s/%s",
+             SUPABASE_URL, SUPABASE_BUCKET, objectPath.c_str());
+
+    char urlJson[320];
+    snprintf(urlJson, sizeof(urlJson),
+             "{\"last_upload_public_url\":\"%s\"}", publicUrl);
+
+    char camPath[64];
+    snprintf(camPath, sizeof(camPath), "/hardware/%s/camera.json", HARDWARE_ID);
+    bool fbOK = httpPatchWithRetry(camPath, urlJson);
+    Serial.printf("[RELAY] Firebase URL writeback: %s\n", fbOK ? "OK" : "FAIL");
+
+    if (deliveryIdCacheValid && cachedDeliveryId[0] != '\0') {
+      char auditJson[320];
+      snprintf(auditJson, sizeof(auditJson),
+               "{\"latest_photo_url\":\"%s\"}", publicUrl);
+      char auditPath[96];
+      snprintf(auditPath, sizeof(auditPath),
+               "/audit_logs/%s.json", cachedDeliveryId);
+      httpPatchWithRetry(auditPath, auditJson);
     }
   }
 
@@ -2398,7 +2656,7 @@ void loop() {
     geoProxy.update(gpsLat, gpsLon, gpsHdop, 0);
 
     bool ignitionOn = (deliveryIdCacheValid && cachedDeliveryId[0] != '\0');
-    theftGuardUpdate((float)gpsLat, (float)gpsLon, 0.0f, ignitionOn, now);
+    theftGuardUpdate((float)gpsLat, (float)gpsLon, gpsSpeed, ignitionOn, now);
 
     TheftState curTheft = theftGuardGetState();
     if (curTheft != prevTheftState) {

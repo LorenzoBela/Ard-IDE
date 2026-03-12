@@ -60,4 +60,8 @@ bool reportAlertToProxy(const char *alertType, const char *details);
  *  Returns: 1 = face detected, 0 = no face, -1 = error/timeout. */
 int requestFaceCheck();
 
+/** Report reed switch tamper (unauthorized lid-open) to Proxy.
+ *  Proxy writes tamper state to Firebase, triggering push notifications. */
+bool reportTamperToProxy();
+
 #endif // PROXY_CLIENT_H

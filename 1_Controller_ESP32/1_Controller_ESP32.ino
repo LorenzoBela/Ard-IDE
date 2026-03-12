@@ -117,6 +117,18 @@ void loop() {
     enterState(STATE_RELOCKING);
   }
 
+  // ── 2b. Reed switch tamper detection ──
+  if (isTamperDetected()) {
+    netLog("[TAMPER] Unauthorized lid-open detected! Reporting...\n");
+    if (!isDisplayFailed()) {
+      updateDisplay("TAMPER ALERT!", "Box breached!");
+    } else {
+      fallbackError();
+    }
+    reportTamperToProxy();
+    clearTamper();
+  }
+
   // ── 3. Periodic delivery context fetch ──
   if (WiFi.status() == WL_CONNECTED && currentState != STATE_CONNECTING_WIFI) {
     if (now - lastDeliveryContextFetch >= DELIVERY_CONTEXT_FETCH_MS) {
@@ -353,6 +365,7 @@ void handleStateMachine(unsigned long now) {
 
   case STATE_UNLOCKING: {
     if (!isSolenoidActive()) {
+      suppressTamper(); // Authorized unlock — don't flag lid-open as tamper
       // EC-21: Try unlock with retry logic + EC-96 thermal check
       LockStatus ls = tryUnlock();
 
@@ -398,6 +411,7 @@ void handleStateMachine(unsigned long now) {
   }
 
   case STATE_RELOCKING:
+    armTamper(); // Re-enable tamper detection after authorized unlock completes
     if (!isDisplayFailed()) {
       updateDisplay("Box Locked", "Ready");
     }
@@ -430,7 +444,12 @@ void enterState(TesterState newState) {
     break;
   case STATE_IDLE:
     if (!isDisplayFailed()) {
-      updateDisplay("Enter PIN:", "PIN: ");
+      // EC-32: Return protocol hint — show Return PIN prompt when returning.
+      if (lastStatusCommand == "RETURNING") {
+        updateDisplay("Return PIN:", "PIN: ");
+      } else {
+        updateDisplay("Enter PIN:", "PIN: ");
+      }
     }
     inputLen = 0;
     inputCode[0] = '\0';

@@ -17,6 +17,11 @@ static bool          reedRaw         = true;  // true = closed/locked
 static bool          reedStable      = true;
 static unsigned long reedLastChange  = 0;
 
+// ── Tamper detection ──
+static bool          tamperLatch     = false; // latched until cleared
+static bool          tamperSuppressed = false; // true during authorized unlock
+static bool          prevReedStable  = true;  // for edge detection
+
 // ── Internal helpers ──
 static bool readReedRaw() {
   return digitalRead(REED_SWITCH_PIN) == LOW; // LOW = magnet present = locked
@@ -111,6 +116,13 @@ bool maintainLockSafety(unsigned long now) {
     reedStable = reedRaw;
   }
 
+  // ── Tamper detection: lid opened while solenoid is off and not suppressed ──
+  if (prevReedStable && !reedStable && !isSolenoidActive() && !tamperSuppressed) {
+    tamperLatch = true;
+    Serial.println(F("[TAMPER] Reed opened without unlock — TAMPER DETECTED"));
+  }
+  prevReedStable = reedStable;
+
   // ── EC-96: Passive cooling ──
   if (now > lastCoolTick) {
     unsigned long elapsed = now - lastCoolTick;
@@ -133,6 +145,10 @@ bool isBoxLocked()       { return reedStable; }
 bool isOverheated()      { return coilTempC >= LOCK_THERMAL_MAX_TEMP; }
 bool isSolenoidActive()  { return solenoidOnAt > 0; }
 uint8_t getLastRetryCount() { return lastRetryCount; }
+bool isTamperDetected()  { return tamperLatch; }
+void clearTamper()       { tamperLatch = false; }
+void suppressTamper()    { tamperSuppressed = true; }
+void armTamper()         { tamperSuppressed = false; }
 
 const char* lockStatusStr(LockStatus s) {
   switch (s) {

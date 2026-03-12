@@ -45,7 +45,9 @@ struct GeoSnapshot {
 
 struct GeofenceProxy {
 
-  double targetLat, targetLon;
+  double targetLat, targetLon;       // dropoff (primary target for state machine)
+  double pickupLat, pickupLon;       // pickup point
+  bool   pickupSet;
   double warehouseLat, warehouseLon;
   bool   warehouseSet;
 
@@ -57,6 +59,8 @@ struct GeofenceProxy {
 
   void reset() {
     targetLat = targetLon = 0;
+    pickupLat = pickupLon = 0;
+    pickupSet = false;
     warehouseLat = warehouseLon = 0;
     warehouseSet = false;
     snap.stableState   = GEO_OUTSIDE;
@@ -74,6 +78,11 @@ struct GeofenceProxy {
   }
 
   void setTarget(double lat, double lon) { targetLat = lat; targetLon = lon; }
+
+  void setPickup(double lat, double lon) {
+    pickupLat = lat; pickupLon = lon;
+    pickupSet = (lat != 0.0 || lon != 0.0);
+  }
 
   void setWarehouse(double lat, double lon) {
     warehouseLat = lat;
@@ -125,6 +134,17 @@ struct GeofenceProxy {
 
   bool isArrived()          const { return snap.stableState == GEO_INSIDE; }
   double effectiveRadius()  const { return snap.urbanCanyon ? GEO_EXPANDED_RADIUS_M : GEO_DEFAULT_RADIUS_M; }
+
+  /** True if current position is within the outer radius of EITHER pickup or dropoff */
+  bool isNearAnyTarget(double lat, double lon) const {
+    double dropDist = haversineM(lat, lon, targetLat, targetLon);
+    if (dropDist <= GEO_OUTER_RADIUS_M) return true;
+    if (pickupSet) {
+      double pickDist = haversineM(lat, lon, pickupLat, pickupLon);
+      if (pickDist <= GEO_OUTER_RADIUS_M) return true;
+    }
+    return false;
+  }
 
   const char* stateStr(GeoState s) const {
     switch (s) {

@@ -541,8 +541,12 @@ bool runFaceDetection() {
     return false;
   }
 
+  int fbWidth  = (int)fb->width;
+  int fbHeight = (int)fb->height;
+
   bool converted = fmt2rgb888(fb->buf, fb->len, fb->format, rgbBuffer);
-  esp_camera_fb_return(fb); // Free fb early
+  esp_camera_fb_return(fb); // Free fb early — do not access fb after this
+  fb = nullptr;
 
   if (!converted) {
     free(rgbBuffer);
@@ -551,7 +555,7 @@ bool runFaceDetection() {
 
   // Run MSR01 Face Detection
   std::list<dl::detect::result_t> &results =
-      s1->infer(rgbBuffer, {(int)fb->height, (int)fb->width, 3});
+      s1->infer(rgbBuffer, {fbHeight, fbWidth, 3});
 
   bool detected = false;
   if (results.size() > 0) {

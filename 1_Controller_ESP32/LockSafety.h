@@ -68,4 +68,25 @@ uint8_t getLastRetryCount();
 /** Human-readable status string for logging / proxy reporting. */
 const char* lockStatusStr(LockStatus s);
 
+/**
+ * Tamper detection via reed switch.
+ * Returns true if the lid opened while the solenoid was NOT energised
+ * (i.e. nobody asked for an unlock — physical forced entry).
+ * Latch stays set until clearTamper() is called.
+ */
+bool isTamperDetected();
+
+/** Clear the tamper latch (call after reporting to Proxy). */
+void clearTamper();
+
+/**
+ * Suppress tamper detection for an authorized unlock window.
+ * Call when entering STATE_UNLOCKING so the legitimate lid-open
+ * is not misinterpreted as tampering.
+ */
+void suppressTamper();
+
+/** Re-enable tamper detection (call when relocking / leaving unlock state). */
+void armTamper();
+
 #endif // LOCK_SAFETY_H
