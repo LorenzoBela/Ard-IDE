@@ -24,6 +24,7 @@ char  currentOtp[8]          = "";
 char  activeDeliveryId[64]   = "";
 bool  hasActiveDelivery      = false;
 String lastStatusCommand     = "";
+bool  proxyReachable         = false;
 
 // ── WiFi backoff state ──
 static unsigned long wifiRetryAt    = 0;
@@ -126,6 +127,7 @@ void maintainWiFiConnection(unsigned long now) {
 void fetchDeliveryContext() {
   if (WiFi.status() != WL_CONNECTED) {
     netLog("[FETCH] Skip — WiFi not connected\n");
+    proxyReachable = false;
     return;
   }
 
@@ -162,6 +164,7 @@ void fetchDeliveryContext() {
   lastStatusCommand = "";
 
   if (code == 200) {
+    proxyReachable = true;
     netLog("[FETCH] Body: '%s'\n", body.c_str());
 
     // Format: "123456,deliv_abc123" OR "123456,deliv_abc123,UNLOCKING"
@@ -215,6 +218,8 @@ void fetchDeliveryContext() {
         hasActiveDelivery = false;
       }
     }
+  } else if (code < 0) {
+    proxyReachable = false;
   }
 
   // Drive state transitions based on delivery availability

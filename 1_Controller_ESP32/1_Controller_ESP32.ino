@@ -452,7 +452,11 @@ void enterState(TesterState newState) {
   switch (newState) {
   case STATE_STANDBY:
     if (!isDisplayFailed()) {
-      updateDisplay("Box Ready", "No Delivery");
+      if (!proxyReachable) {
+        updateDisplay("Proxy offline", "Reconnecting...");
+      } else {
+        updateDisplay("Box Ready", "No Delivery");
+      }
     }
     inputLen = 0;
     inputCode[0] = '\0';
