@@ -2475,7 +2475,15 @@ void handleCameraClient() {
         "Content-Length: " + String(body.length()) + "\r\n\r\n" + body;
     client.print(resp);
     // Increased delay before closing to ensure ESP32 proxy client receives data
+    client.flush();
     delay(150);
+
+    // PURGE REMAINING BYTES to prevent ghost connections
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) {
+      client.read();
+    }
+
     client.stop();
     return;
   }
