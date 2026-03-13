@@ -157,6 +157,7 @@ void loop() {
       if (lastStatusCommand == "UNLOCKING" && currentState != STATE_UNLOCKING) {
         netLog("[EC-77] Remote UNLOCK (admin override)\n");
         adminOverride.trigger(now);
+        reportCommandAckToProxy("UNLOCKING", "accepted", "state_transition_unlocking");
         // Clear any in-progress keypad input
         inputLen = 0;
         inputCode[0] = '\0';
@@ -164,7 +165,14 @@ void loop() {
         reportAlertToProxy("ADMIN_OVERRIDE", "remote_unlock");
       } else if (lastStatusCommand == "LOCKED" && currentState == STATE_UNLOCKING) {
         netLog("[CONTEXT] Remote LOCK commanded\n");
+        reportCommandAckToProxy("LOCKED", "accepted", "state_transition_relocking");
         enterState(STATE_RELOCKING);
+      } else if (lastStatusCommand.length() > 0) {
+        netLog("[EC-77] Remote command '%s' received but not actionable in state=%d\n",
+               lastStatusCommand.c_str(), (int)currentState);
+        char stateDetail[32];
+        snprintf(stateDetail, sizeof(stateDetail), "state_%d", (int)currentState);
+        reportCommandAckToProxy(lastStatusCommand.c_str(), "rejected_state", stateDetail);
       }
     }
   }
@@ -365,12 +373,17 @@ void handleStateMachine(unsigned long now) {
 
   case STATE_UNLOCKING: {
     if (!isSolenoidActive()) {
+      bool overrideAttempt = adminOverride.pending;
       suppressTamper(); // Authorized unlock — don't flag lid-open as tamper
       // EC-21: Try unlock with retry logic + EC-96 thermal check
       LockStatus ls = tryUnlock();
 
       if (ls == LOCK_OK) {
         netLog("[LOCK] Solenoid ON (unlock OK)\n");
+        if (overrideAttempt) {
+          reportCommandAckToProxy("UNLOCKING", "executed", "lock_ok");
+          adminOverride.clear();
+        }
         if (!isDisplayFailed()) {
           updateDisplay("Box Unlocked!", "* = Relock");
         } else {
@@ -384,6 +397,10 @@ void handleStateMachine(unsigned long now) {
         snprintf(detail, sizeof(detail), "%s_retries_%u",
                  lockStatusStr(ls), getLastRetryCount());
         reportAlertToProxy("SOLENOID_STUCK", detail);
+        if (overrideAttempt) {
+          reportCommandAckToProxy("UNLOCKING", "failed_unlock", lockStatusStr(ls));
+          adminOverride.clear();
+        }
 
         if (!isDisplayFailed()) {
           updateDisplay("Lock jammed!", "Contact support");

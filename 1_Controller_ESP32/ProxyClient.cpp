@@ -87,6 +87,9 @@ bool scanForProxy() {
 
 void startWiFiConnection() {
   WiFi.mode(WIFI_STA);
+  // SoftAP link is local and latency-sensitive; disable modem sleep to reduce
+  // intermittent HTTP read timeouts (e.g., HTTP -11) on frequent /otp polling.
+  WiFi.setSleep(false);
   if (WIFI_SSID[0] == '\0') {
     scanForProxy();
   }
@@ -126,22 +129,39 @@ void fetchDeliveryContext() {
     return;
   }
 
-  HTTPClient http;
   char url[64];
   snprintf(url, sizeof(url), "http://%s:%d/otp", PROXY_HOST, PROXY_PORT);
   netLog("[FETCH] GET %s\n", url);
 
-  http.setTimeout(3000);
-  http.begin(url);
-  int code = http.GET();
+  auto doGet = [&](String &bodyOut) -> int {
+    WiFiClient client;
+    HTTPClient http;
+    http.setTimeout(5000);
+    http.setReuse(false); // Do not keep-alive; prevents stale connection issues
+    // You can optionally pass client: http.begin(client, url);
+    char url[64];
+    snprintf(url, sizeof(url), "http://%s:%d/otp", PROXY_HOST, PROXY_PORT);
+    http.begin(client, url);
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+      bodyOut = http.getString();
+    }
+    http.end();
+    return httpCode;
+  };
+
+  String body = "";
+  int code = doGet(body);
+  if (code < 0) {
+    netLog("[FETCH] First GET failed (%d), retrying once...\n", code);
+    code = doGet(body);
+  }
   netLog("[FETCH] HTTP %d\n", code);
 
   bool wasActive = hasActiveDelivery;
   lastStatusCommand = "";
 
   if (code == 200) {
-    String body = http.getString();
-    body.trim();
     netLog("[FETCH] Body: '%s'\n", body.c_str());
 
     // Format: "123456,deliv_abc123" OR "123456,deliv_abc123,UNLOCKING"
@@ -196,7 +216,6 @@ void fetchDeliveryContext() {
       }
     }
   }
-  http.end();
 
   // Drive state transitions based on delivery availability
   // (State machine transitions are handled in the main .ino — this function
@@ -278,6 +297,33 @@ bool reportTamperToProxy() {
   int code = http.POST((uint8_t *)json, strlen(json));
 
   Serial.printf("[TAMPER] Report → HTTP %d\n", code);
+  http.end();
+
+  return (code == 200 || code == 201);
+}
+
+// ==================== COMMAND ACK REPORT ====================
+bool reportCommandAckToProxy(const char *command, const char *status, const char *details) {
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  HTTPClient http;
+  char url[72];
+  snprintf(url, sizeof(url), "http://%s:%d/command-ack", PROXY_HOST, PROXY_PORT);
+
+  char json[320];
+  snprintf(json, sizeof(json),
+           "{\"command\":\"%s\",\"status\":\"%s\",\"details\":\"%s\","
+           "\"box_id\":\"%s\",\"delivery_id\":\"%s\"}",
+           command ? command : "", status ? status : "", details ? details : "",
+           HARDWARE_ID, activeDeliveryId);
+
+  http.setTimeout(5000);
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST((uint8_t *)json, strlen(json));
+
+  Serial.printf("[CMD_ACK] %s/%s -> HTTP %d\n", command ? command : "", status ? status : "", code);
   http.end();
 
   return (code == 200 || code == 201);

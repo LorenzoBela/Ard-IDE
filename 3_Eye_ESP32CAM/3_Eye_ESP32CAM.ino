@@ -50,7 +50,7 @@ char WIFI_SSID[24] = "";
 // Supabase credentials kept here for reference (used by GPS/LTE board for
 // relay)
 #define SUPABASE_URL "https://lvpneakciqegwyymtqno.supabase.co"
-#define SUPABASE_BUCKET "r3"
+#define SUPABASE_BUCKET "proof-photos"
 #define SUPABASE_API_KEY                                                       \
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."                                      \
   "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx2cG5lYWtjaXFlZ3d5eW10cW5vIiwicm9sZSI6Im" \
@@ -663,6 +663,13 @@ void captureHighResAndUpload() {
 
   Serial.printf("Captured JPEG: %u bytes in %lu ms\n", photo->len,
                 millis() - t0);
+
+  // DELAY UPLOAD TO PREVENT BROWNOUT DURING SOLENOID FIRING
+  // The solenoid is actively firing right now (takes ~1000ms).
+  // The Proxy LTE transmission draws huge current spikes up to 2A.
+  // Delaying the HTTP POST ensures the physical lock actuates securely
+  // before the modem blasts the network.
+  delay(1500);
 
   String objectPath = makeObjectPath();
   bool uploaded = false;

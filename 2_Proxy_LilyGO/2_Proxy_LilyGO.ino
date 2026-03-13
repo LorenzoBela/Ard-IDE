@@ -51,7 +51,7 @@ uint8_t boxNum       = 0;
 
 // Supabase Storage (matches ESP32-CAM sketch)
 #define SUPABASE_URL "https://lvpneakciqegwyymtqno.supabase.co"
-#define SUPABASE_BUCKET "r3"
+#define SUPABASE_BUCKET "proof-photos"
 #define SUPABASE_ANON_KEY                                                      \
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."                                      \
   "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx2cG5lYWtjaXFlZ3d5eW10cW5vIiwicm9sZSI6Im" \
@@ -117,6 +117,12 @@ bool returnActive = false;
 bool lastReturnActive = false;
 char cachedDeliveryId[64] = "";
 bool deliveryIdCacheValid = false;
+// EC-FIX: Remote lock/unlock status command from Firebase (UNLOCKING/LOCKED)
+char cachedStatus[16] = "";
+unsigned long cachedStatusSetAt = 0;
+uint8_t cachedStatusServesRemaining = 0;
+#define STATUS_COMMAND_MAX_SERVES 60
+#define STATUS_COMMAND_RETRY_WINDOW_MS 60000
 double destLat = 0.0, destLon = 0.0;
 bool destCoordsValid = false;
 double pickupLat = 0.0, pickupLon = 0.0;
@@ -130,6 +136,33 @@ WiFiUDP udpServer;
 
 // ESP32-CAM IP tracking (for face-check forwarding)
 IPAddress camClientIP;
+static bool extractJsonStringValue(const char *json, const char *key,
+                                   char *out, size_t outSize) {
+  if (!json || !key || !out || outSize == 0) {
+    return false;
+  }
+  out[0] = '\0';
+
+  char pattern[48];
+  snprintf(pattern, sizeof(pattern), "\"%s\":\"", key);
+  const char *start = strstr(json, pattern);
+  if (!start) {
+    return false;
+  }
+  start += strlen(pattern);
+  const char *end = strchr(start, '"');
+  if (!end || end <= start) {
+    return false;
+  }
+
+  size_t len = (size_t)(end - start);
+  if (len >= outSize) {
+    len = outSize - 1;
+  }
+  strncpy(out, start, len);
+  out[len] = '\0';
+  return out[0] != '\0';
+}
 bool camClientKnown = false;
 #define CAM_FACE_PORT 80 // ESP32-CAM runs a tiny HTTP server on port 80
 
@@ -168,6 +201,9 @@ static int parseMonthFromStr(const char *m) {
 // Forward-declare dateTimeToEpoch (defined below)
 unsigned long dateTimeToEpoch(int year, int month, int day, int hour, int min,
                               int sec);
+
+// Forward declaration (implementation appears in auto-provisioning section).
+String httpGetFromFirebase(const char *path);
 
 static unsigned long getCompileTimeEpoch() {
   // __DATE__ = "Mmm dd yyyy"  __TIME__ = "hh:mm:ss"
@@ -1596,6 +1632,169 @@ bool uploadToSupabaseViaLTE(const uint8_t *data, size_t len,
 
 // ==================== DELIVERY CONTEXT READER (Firebase -> cached)
 // ====================
+static bool isDeliveryStillActiveInFirebase(const char *deliveryId) {
+  if (!deliveryId || deliveryId[0] == '\0') {
+    return false;
+  }
+
+  char statusPath[128];
+  snprintf(statusPath, sizeof(statusPath), "/deliveries/%s/status.json", deliveryId);
+
+  String statusBody = httpGetFromFirebase(statusPath);
+  statusBody.trim();
+
+  if (statusBody.length() == 0 || statusBody == "null") {
+    Serial.printf("[CONTEXT] Delivery %s missing in /deliveries -> stale context\n",
+                  deliveryId);
+    return false;
+  }
+
+  // JSON string payload comes back quoted from RTDB REST (e.g. "ASSIGNED").
+  if (statusBody.length() >= 2 && statusBody[0] == '"' &&
+      statusBody[statusBody.length() - 1] == '"') {
+    statusBody = statusBody.substring(1, statusBody.length() - 1);
+  }
+  statusBody.toUpperCase();
+
+  // Terminal states should not keep OTP context active on hardware.
+  if (statusBody == "COMPLETED" || statusBody == "CANCELLED" ||
+      statusBody == "RETURNED" || statusBody == "FAILED") {
+    Serial.printf("[CONTEXT] Delivery %s is terminal (%s) -> stale context\n",
+                  deliveryId, statusBody.c_str());
+    return false;
+  }
+
+  return true;
+}
+
+static bool readTopLevelJsonString(const String &json, const char *key,
+                                   char *out, size_t outLen) {
+  if (!key || !out || outLen == 0) {
+    return false;
+  }
+
+  String token = "\"" + String(key) + "\":";
+  int depth = 0;
+  bool inString = false;
+  bool escaped = false;
+
+  for (int i = 0; i < json.length(); i++) {
+    char c = json[i];
+
+    if (!inString && c == '{') {
+      depth++;
+    } else if (!inString && c == '}') {
+      depth--;
+    }
+
+    // Key tokens start with a quote. Check before toggling inString so the
+    // opening quote of top-level keys is still visible to startsWith().
+    if (!inString && depth == 1 && c == '"' && json.startsWith(token, i)) {
+      int v = i + token.length();
+      while (v < json.length() &&
+             (json[v] == ' ' || json[v] == '\t' || json[v] == '\r' ||
+              json[v] == '\n')) {
+        v++;
+      }
+      if (v >= json.length() || json[v] != '"') {
+        return false;
+      }
+
+      v++; // skip opening quote
+      String value = "";
+      bool valEscaped = false;
+      for (; v < json.length(); v++) {
+        char ch = json[v];
+        if (valEscaped) {
+          value += ch;
+          valEscaped = false;
+        } else if (ch == '\\') {
+          valEscaped = true;
+        } else if (ch == '"') {
+          break;
+        } else {
+          value += ch;
+        }
+      }
+
+      strncpy(out, value.c_str(), outLen - 1);
+      out[outLen - 1] = '\0';
+      return true;
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (c == '"') {
+      inString = true;
+      continue;
+    }
+  }
+
+  return false;
+}
+
+static bool readTopLevelJsonBool(const String &json, const char *key, bool &outVal) {
+  String token = "\"" + String(key) + "\":";
+  int depth = 0;
+  bool inString = false;
+  bool escaped = false;
+
+  for (int i = 0; i < json.length(); i++) {
+    char c = json[i];
+
+    if (!inString && c == '{') {
+      depth++;
+    } else if (!inString && c == '}') {
+      depth--;
+    }
+
+    if (!inString && depth == 1 && c == '"' && json.startsWith(token, i)) {
+      int v = i + token.length();
+      while (v < json.length() &&
+             (json[v] == ' ' || json[v] == '\t' || json[v] == '\r' ||
+              json[v] == '\n')) {
+        v++;
+      }
+      if (v + 4 <= json.length() && json.startsWith("true", v)) {
+        outVal = true;
+        return true;
+      }
+      if (v + 5 <= json.length() && json.startsWith("false", v)) {
+        outVal = false;
+        return true;
+      }
+      return false;
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (c == '"') {
+      inString = true;
+      continue;
+    }
+  }
+
+  return false;
+}
+
 void refreshDeliveryContextFromFirebase() {
   if (!lteConnected) {
     Serial.println("[CONTEXT] Skip Firebase fetch — LTE not connected");
@@ -1633,6 +1832,7 @@ void refreshDeliveryContextFromFirebase() {
   unsigned long waitStart = millis();
   bool actionOK = false;
   int httpStatus = 0;
+  int totalResponseLen = 0;
   while (millis() - waitStart < 15000) {
     if (modem.stream.available()) {
       String line = modem.stream.readStringUntil('\n');
@@ -1640,8 +1840,10 @@ void refreshDeliveryContextFromFirebase() {
       if (line.indexOf("+HTTPACTION:") >= 0) {
         int c1 = line.indexOf(',');
         int c2 = line.indexOf(',', c1 + 1);
-        if (c1 > 0 && c2 > 0)
+        if (c1 > 0 && c2 > 0) {
           httpStatus = line.substring(c1 + 1, c2).toInt();
+          totalResponseLen = line.substring(c2 + 1).toInt();
+        }
         actionOK = true;
         break;
       }
@@ -1654,117 +1856,154 @@ void refreshDeliveryContextFromFirebase() {
                 httpStatus, actionOK);
 
   if (actionOK && httpStatus == 200) {
-    // modem.waitResponse() cannot capture +HTTPREAD body on A7672X —
-    // the data arrives as a raw stream after +HTTPREAD:<start>,<len>.
-    // Read the stream directly instead.
-    modem.stream.print("AT+HTTPREAD=0,1024\r\n");
+    // A7670E/A7672X caps each AT+HTTPREAD at 1024 bytes.
+    // Firebase returns JSON keys alphabetically, so "background_location_status"
+    // fills the first chunk, pushing "delivery_id" and "otp_code" past 1024.
+    // Solution: read in 1024-byte chunks with increasing offsets.
+    #define CTX_CHUNK  1024
+    #define CTX_MAX    16384
 
     String body = "";
-    int dataLen = -1;
-    unsigned long t0 = millis();
+    body.reserve(CTX_MAX); // Pre-allocate to avoid realloc fragmentation
+    int offset = 0;
 
-    // Phase 1: wait for "+HTTPREAD: <len>"  or "+HTTPREAD: 0,<len>" line (up to
-    // 6 s)
-    while (millis() - t0 < 6000) {
-      if (modem.stream.available()) {
-        String line = modem.stream.readStringUntil('\n');
-        line.trim();
-        if (line.indexOf("+HTTPREAD:") >= 0) {
-          // A7672X format: "+HTTPREAD: <len>"  (no start offset)
-          // Some firmware: "+HTTPREAD: 0,<len>"
-          int comma = line.lastIndexOf(',');
-          if (comma >= 0) {
-            dataLen = line.substring(comma + 1).toInt();
-          } else {
-            int colon = line.lastIndexOf(':');
-            if (colon >= 0)
-              dataLen = line.substring(colon + 1).toInt();
+    while (offset < CTX_MAX) {
+      // Request next chunk from modem
+      char readCmd[40];
+      snprintf(readCmd, sizeof(readCmd), "AT+HTTPREAD=%d,%d\r\n", offset, CTX_CHUNK);
+      modem.stream.print(readCmd);
+
+      // Phase 1: wait for "+HTTPREAD: <len>" header (up to 6 s)
+      int chunkLen = -1;
+      unsigned long t0 = millis();
+      while (millis() - t0 < 6000) {
+        if (modem.stream.available()) {
+          String line = modem.stream.readStringUntil('\n');
+          line.trim();
+          if (line.indexOf("+HTTPREAD:") >= 0) {
+            int comma = line.lastIndexOf(',');
+            if (comma >= 0) {
+              chunkLen = line.substring(comma + 1).toInt();
+            } else {
+              int colon = line.lastIndexOf(':');
+              if (colon >= 0)
+                chunkLen = line.substring(colon + 1).toInt();
+            }
+            break;
           }
-          break; // start reading data bytes next
         }
+        esp_task_wdt_reset();
       }
-      esp_task_wdt_reset();
+
+      // No data or read error — stop paging
+      if (chunkLen <= 0) break;
+
+      // Phase 2: read exactly chunkLen bytes from UART
+      int before = body.length();
+      unsigned long t1 = millis();
+      while ((int)body.length() - before < chunkLen && millis() - t1 < 5000) {
+        while (modem.stream.available() && (int)body.length() - before < chunkLen) {
+          body += (char)modem.stream.read();
+        }
+        esp_task_wdt_reset();
+      }
+
+      // Drain trailing OK / CRLF after this chunk
+      delay(100);
+      while (modem.stream.available())
+        modem.stream.read();
+
+      offset += chunkLen;
+
+      // If modem returned fewer bytes than requested, we've read everything
+      if (chunkLen < CTX_CHUNK) break;
     }
 
-    // Phase 2: read exactly dataLen bytes (or up to 1024 if unknown)
-    int toRead = (dataLen > 0 && dataLen <= 1024) ? dataLen : 1024;
-    unsigned long t1 = millis();
-    while ((int)body.length() < toRead && millis() - t1 < 5000) {
-      while (modem.stream.available() && (int)body.length() < toRead) {
-        body += (char)modem.stream.read();
-      }
-      esp_task_wdt_reset();
-    }
-    // Drain trailing OK / CRLF
-    delay(100);
-    while (modem.stream.available())
-      modem.stream.read();
+    #undef CTX_CHUNK
+    #undef CTX_MAX
 
-    Serial.printf("[CONTEXT] dataLen=%d body(120): %.120s\n", dataLen,
+    Serial.printf("[CONTEXT] totalBytes=%d body(120): %.120s\n", (int)body.length(),
                   body.c_str());
+    if (totalResponseLen > 0 && totalResponseLen > (int)body.length()) {
+      Serial.printf(
+          "[CONTEXT] WARNING: Response %d > CTX_MAX window (%d bytes read) — fields near the end may be truncated!\n",
+          totalResponseLen, (int)body.length());
+    }
 
-    // EC-32: Parse return_active flag
-    // We parse both explicit true and explicit false. If missing, default false.
+    // EC-32: Parse top-level return_active (ignore nested historical fields).
     {
-      bool parsed = false;
-      int raTrueIdx  = body.indexOf("\"return_active\":true");
-      int raFalseIdx = body.indexOf("\"return_active\":false");
-      if (raTrueIdx >= 0)  { returnActive = true;  parsed = true; }
-      if (raFalseIdx >= 0) { returnActive = false; parsed = true; }
-      if (!parsed) {
+      bool parsedReturnActive = false;
+      bool returnActiveValue = false;
+      parsedReturnActive = readTopLevelJsonBool(body, "return_active", returnActiveValue);
+      returnActive = parsedReturnActive ? returnActiveValue : false;
+    }
+
+    // Parse top-level return_otp.
+    {
+      char parsedReturnOtp[8] = "";
+      if (readTopLevelJsonString(body, "return_otp", parsedReturnOtp, sizeof(parsedReturnOtp)) &&
+          strlen(parsedReturnOtp) > 0 && strlen(parsedReturnOtp) <= 6) {
+        strncpy(cachedReturnOtp, parsedReturnOtp, sizeof(cachedReturnOtp) - 1);
+        cachedReturnOtp[sizeof(cachedReturnOtp) - 1] = '\0';
+        returnOtpCacheValid = true;
+      } else {
+        cachedReturnOtp[0] = '\0';
+        returnOtpCacheValid = false;
+      }
+    }
+
+    // Parse top-level otp_code only.
+    {
+      char parsedOtp[8] = "";
+      if (readTopLevelJsonString(body, "otp_code", parsedOtp, sizeof(parsedOtp)) &&
+          strlen(parsedOtp) > 0 && strlen(parsedOtp) <= 6) {
+        strncpy(cachedOtp, parsedOtp, sizeof(cachedOtp) - 1);
+        cachedOtp[sizeof(cachedOtp) - 1] = '\0';
+        otpCacheValid = true;
+      } else {
+        cachedOtp[0] = '\0';
+        otpCacheValid = false;
+      }
+    }
+
+    // Parse top-level delivery_id only.
+    {
+      char parsedDeliveryId[64] = "";
+      if (readTopLevelJsonString(body, "delivery_id", parsedDeliveryId,
+                                 sizeof(parsedDeliveryId)) &&
+          strlen(parsedDeliveryId) > 0) {
+        strncpy(cachedDeliveryId, parsedDeliveryId, sizeof(cachedDeliveryId) - 1);
+        cachedDeliveryId[sizeof(cachedDeliveryId) - 1] = '\0';
+        deliveryIdCacheValid = true;
+      } else {
+        cachedDeliveryId[0] = '\0';
+        deliveryIdCacheValid = false;
+      }
+    }
+
+    // Guard against stale /hardware context (e.g., deliveries node was wiped).
+    // If the referenced delivery no longer exists or is terminal, clear caches
+    // and self-heal /hardware to stop serving old OTP/delivery over GET /otp.
+    if (otpCacheValid && deliveryIdCacheValid) {
+      if (!isDeliveryStillActiveInFirebase(cachedDeliveryId)) {
+        otpCacheValid = false;
+        cachedOtp[0] = '\0';
+        deliveryIdCacheValid = false;
+        cachedDeliveryId[0] = '\0';
+        returnOtpCacheValid = false;
+        cachedReturnOtp[0] = '\0';
         returnActive = false;
-      }
-    }
 
-    // EC-32: Parse return_otp (6-digit) when returnActive is enabled
-    int rotpIdx = body.indexOf("\"return_otp\":\"");
-    if (rotpIdx >= 0) {
-      int start = rotpIdx + 13;
-      int end = body.indexOf('"', start);
-      if (end > start) {
-        int len = end - start;
-        if (len > 0 && len <= 6) {
-          strncpy(cachedReturnOtp, body.c_str() + start, len);
-          cachedReturnOtp[len] = '\0';
-          returnOtpCacheValid = true;
-        }
-      }
-    } else {
-      returnOtpCacheValid = false;
-    }
+        dpClear();
 
-    // Parse otp_code
-    int otpIdx = body.indexOf("\"otp_code\":\"");
-    if (otpIdx >= 0) {
-      int start = otpIdx + 12;
-      int end = body.indexOf('"', start);
-      if (end > start) {
-        int len = end - start;
-        if (len > 0 && len <= 6) {
-          strncpy(cachedOtp, body.c_str() + start, len);
-          cachedOtp[len] = '\0';
-          otpCacheValid = true;
-        }
+        char hwPath[64];
+        snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
+        bool clearOk = httpPatchWithRetry(
+            hwPath,
+            "{\"otp_code\":null,\"delivery_id\":null,\"return_otp\":null,\"return_active\":false}");
+        Serial.printf("[CONTEXT] Cleared stale hardware delivery context: %s\n",
+                      clearOk ? "OK" : "FAIL");
       }
-    } else {
-      otpCacheValid = false;
-    }
-
-    // Parse delivery_id
-    int delIdx = body.indexOf("\"delivery_id\":\"");
-    if (delIdx >= 0) {
-      int start = delIdx + 15;
-      int end = body.indexOf('"', start);
-      if (end > start) {
-        int len = end - start;
-        if (len > 0 && len < sizeof(cachedDeliveryId)) {
-          strncpy(cachedDeliveryId, body.c_str() + start, len);
-          cachedDeliveryId[len] = '\0';
-          deliveryIdCacheValid = true;
-        }
-      }
-    } else {
-      deliveryIdCacheValid = false;
     }
 
     // Parse destination coords for geofence + theft guard targeting.
@@ -1895,6 +2134,37 @@ void refreshDeliveryContextFromFirebase() {
       }
     }
 
+    // ── EC-FIX: Parse remote lock/unlock command ──
+    // Mobile app writes command: "UNLOCKING" / "LOCKED" to hardware/{boxId}
+    int stIdx = body.indexOf("\"command\":\"");
+    if (stIdx >= 0) {
+      int start = stIdx + 11;
+      int end = body.indexOf('"', start);
+      if (end > start) {
+        int len = end - start;
+        if (len > 0 && len < (int)sizeof(cachedStatus)) {
+          strncpy(cachedStatus, body.c_str() + start, len);
+          cachedStatus[len] = '\0';
+          if (strcmp(cachedStatus, "NONE") == 0) {
+            cachedStatus[0] = '\0';
+            cachedStatusSetAt = 0;
+            cachedStatusServesRemaining = 0;
+            Serial.println("[CONTEXT] Remote command cleared (NONE)");
+          } else {
+            cachedStatusSetAt = millis();
+            cachedStatusServesRemaining = STATUS_COMMAND_MAX_SERVES;
+            Serial.printf("[CONTEXT] Remote command parsed: '%s' (retry window armed)\n",
+                          cachedStatus);
+
+            // Clear command from Firebase after caching locally.
+            char hwPath[64];
+            snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
+            httpPatchWithRetry(hwPath, "{\"command\":\"NONE\"}");
+          }
+        }
+      }
+    }
+
     // ── EC-81: Parse lockdown command ──
     int ldIdx = body.indexOf("\"lockdown\":true");
     if (ldIdx >= 0 && !theftGuardIsLockdown()) {
@@ -1904,9 +2174,10 @@ void refreshDeliveryContextFromFirebase() {
     }
 
     Serial.printf(
-        "[CONTEXT] Parsed -> OTP: %s (valid=%d) | DeliveryID: %s (valid=%d)\n",
+        "[CONTEXT] Parsed -> OTP: %s (valid=%d) | DeliveryID: %s (valid=%d) | Status: %s\n",
         otpCacheValid ? cachedOtp : "NONE", otpCacheValid,
-        deliveryIdCacheValid ? cachedDeliveryId : "NONE", deliveryIdCacheValid);
+        deliveryIdCacheValid ? cachedDeliveryId : "NONE", deliveryIdCacheValid,
+        cachedStatus[0] ? cachedStatus : "NONE");
 
     // EC-32: Return-mode visibility in logs
     if (returnActive) {
@@ -1953,6 +2224,30 @@ void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked) {
   snprintf(statusPath, sizeof(statusPath), "/hardware/%s/status.json",
            HARDWARE_ID);
   httpPutWithRetry(statusPath, statusJson);
+}
+
+// ==================== COMMAND ACK WRITER ====================
+void writeCommandAckToFirebase(const char *command, const char *status,
+                               const char *details) {
+  if (!lteConnected) {
+    Serial.println("[CMD_ACK] LTE not connected");
+    return;
+  }
+
+  unsigned long now_epoch = getCurrentEpoch();
+  char json[320];
+  snprintf(json, sizeof(json),
+           "{\"command_ack_command\":\"%s\",\"command_ack_status\":\"%s\","
+           "\"command_ack_details\":\"%s\",\"command_ack_at\":{\".sv\":\"timestamp\"},"
+           "\"command_ack_epoch\":%lu}",
+           command ? command : "", status ? status : "", details ? details : "",
+           now_epoch);
+
+  char hwPath[64];
+  snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
+  bool ok = httpPatchWithRetry(hwPath, json);
+  Serial.printf("[CMD_ACK] Firebase write: %s (%s/%s)\n", ok ? "OK" : "FAIL",
+                command ? command : "", status ? status : "");
 }
 
 // ==================== TAMPER EVENT WRITER ====================
@@ -2142,19 +2437,85 @@ void handleCameraClient() {
     }
 
     String body = otpPart + "," + delPart;
-    if (returnActive) {
+    // EC-FIX: Append remote status command (UNLOCKING/LOCKED) if present.
+    // Keep command available for a short retry window so controller can catch it.
+    unsigned long nowMs = millis();
+    bool statusActive =
+        cachedStatus[0] != '\0' &&
+        cachedStatusServesRemaining > 0 &&
+        (unsigned long)(nowMs - cachedStatusSetAt) <= STATUS_COMMAND_RETRY_WINDOW_MS;
+
+    // Priority: status command > return mode (they are mutually exclusive actions).
+    if (statusActive) {
+      body += "," + String(cachedStatus);
+      if (cachedStatusServesRemaining > 0) {
+        cachedStatusServesRemaining--;
+      }
+      if (cachedStatusServesRemaining == 0) {
+        Serial.printf("[AP] Status command consumed max serves: %s\n", cachedStatus);
+        cachedStatus[0] = '\0';
+        cachedStatusSetAt = 0;
+      }
+    } else if (returnActive) {
+      // Drop stale command if retry window elapsed.
+      if (cachedStatus[0] != '\0' &&
+          (unsigned long)(nowMs - cachedStatusSetAt) > STATUS_COMMAND_RETRY_WINDOW_MS) {
+        Serial.printf("[AP] Status command expired after retry window: %s\n", cachedStatus);
+        cachedStatus[0] = '\0';
+        cachedStatusSetAt = 0;
+        cachedStatusServesRemaining = 0;
+      }
       body += ",RETURNING";
     }
     Serial.printf("[AP] -> GET /otp  serving: '%s'\n", body.c_str());
     String resp =
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
-        String(body.length()) + "\r\n\r\n" + body;
+        "HTTP/1.1 200 OK\r\n"
+        "Connection: close\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: " + String(body.length()) + "\r\n\r\n" + body;
+    client.print(resp);
+    // Increased delay before closing to ensure ESP32 proxy client receives data
+    delay(150);
+    client.stop();
+    return;
+  }
+
+  // ── POST /command-ack ──
+  if (strcmp(method, "POST") == 0 && strcmp(reqPath, "/command-ack") == 0) {
+    Serial.println("[AP] -> POST /command-ack");
+    char jsonBuf[320] = "";
+    if (contentLength > 0 && contentLength < sizeof(jsonBuf)) {
+      client.setTimeout(5000);
+      size_t rd = client.readBytes(jsonBuf, contentLength);
+      jsonBuf[rd] = '\0';
+    }
+
+    char cmd[24] = "";
+    char status[32] = "";
+    char details[96] = "";
+    extractJsonStringValue(jsonBuf, "command", cmd, sizeof(cmd));
+    extractJsonStringValue(jsonBuf, "status", status, sizeof(status));
+    extractJsonStringValue(jsonBuf, "details", details, sizeof(details));
+
+    if (cmd[0] == '\0' && cachedStatus[0] != '\0') {
+      strncpy(cmd, cachedStatus, sizeof(cmd) - 1);
+      cmd[sizeof(cmd) - 1] = '\0';
+    }
+    if (status[0] == '\0') {
+      strncpy(status, "unknown", sizeof(status) - 1);
+      status[sizeof(status) - 1] = '\0';
+    }
+
+    Serial.printf("[CMD_ACK] command=%s status=%s details=%s\n", cmd, status,
+                  details);
+    writeCommandAckToFirebase(cmd, status, details);
+
+    String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
     client.print(resp);
     delay(50);
     client.stop();
     return;
   }
-
   // â”€â”€ GET /face-check â”€â”€
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/face-check")) {
     Serial.println("[AP] -> GET /face-check");

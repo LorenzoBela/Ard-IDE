@@ -10,10 +10,7 @@ static uint8_t       failCount    = 0;
 static uint8_t       totalErrors  = 0;
 
 void initDisplayHealth() {
-  pinMode(LED_STATUS_PIN, OUTPUT);
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(LED_STATUS_PIN, LOW);
-  noTone(BUZZER_PIN);
+  // No hardware LED/Buzzer to initialize
 }
 
 bool checkDisplayHealth() {
@@ -53,45 +50,17 @@ uint8_t getDisplayErrorCount()   { return totalErrors; }
 // ── Fallback patterns (non-blocking where possible) ──
 
 void fallbackKeyFeedback() {
-  digitalWrite(LED_STATUS_PIN, HIGH);
-  tone(BUZZER_PIN, 1200, 40);
-  // Caller should schedule LED off after ~40 ms via maintainLockSafety tick
-  // For simplicity, use a short blocking flash here (acceptable during keypress)
-  delay(40);
-  digitalWrite(LED_STATUS_PIN, LOW);
+  // No hardware support for LED/Buzzer feedback
 }
 
 void fallbackSuccess() {
-  // Rising triple-beep: 800 → 1200 → 1600 Hz
-  for (int f = 800; f <= 1600; f += 400) {
-    tone(BUZZER_PIN, f, 100);
-    digitalWrite(LED_STATUS_PIN, HIGH);
-    delay(120);
-    digitalWrite(LED_STATUS_PIN, LOW);
-    delay(30);
-  }
-  noTone(BUZZER_PIN);
+  // No hardware support for LED/Buzzer feedback
 }
 
 void fallbackError() {
-  // Descending double-beep: 400 → 200 Hz
-  tone(BUZZER_PIN, 400, 150);
-  digitalWrite(LED_STATUS_PIN, HIGH);
-  delay(180);
-  tone(BUZZER_PIN, 200, 150);
-  delay(180);
-  digitalWrite(LED_STATUS_PIN, LOW);
-  noTone(BUZZER_PIN);
+  // No hardware support for LED/Buzzer feedback
 }
 
 void fallbackLockout() {
-  // Rapid triple low beep
-  for (int i = 0; i < 3; i++) {
-    tone(BUZZER_PIN, 300, 100);
-    digitalWrite(LED_STATUS_PIN, HIGH);
-    delay(130);
-    digitalWrite(LED_STATUS_PIN, LOW);
-    delay(70);
-  }
-  noTone(BUZZER_PIN);
+  // No hardware support for LED/Buzzer feedback
 }

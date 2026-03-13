@@ -27,9 +27,7 @@ extern char HARDWARE_ID[12];
 
 // ==================== PINS ====================
 #define LOCK_PIN          32    // MOSFET gate for solenoid
-#define REED_SWITCH_PIN   34    // Lock position sensor (input-only GPIO)
-#define LED_STATUS_PIN    2     // Onboard LED (active HIGH)
-#define BUZZER_PIN        15    // Piezo buzzer for audio feedback
+#define REED_SWITCH_PIN   4     // Lock position sensor (input-only GPIO)
 
 // ==================== KEYPAD ====================
 static const byte KP_ROWS = 4;
@@ -45,7 +43,7 @@ static const byte KP_COLS = 3;
 // ==================== LOCK SAFETY (EC-21/22/95/96) ====================
 #define LOCK_MAX_ACTIVE_MS        5000    // Hard thermal cutoff (Article 2.3)
 #define LOCK_RETRY_MAX            3       // EC-21: Max unlock retry attempts
-#define LOCK_RETRY_DELAY_MS       200     // Delay between retries
+#define LOCK_RETRY_DELAY_MS       1000    // Delay between retries (increased from 200 to give user time to open lid)
 #define LOCK_DEBOUNCE_MS          50      // EC-95: Reed switch debounce
 #define LOCK_THERMAL_MAX_TEMP     80.0f   // EC-96: Modeled coil temp ceiling (C)
 #define LOCK_HEAT_PER_ACTUATION   15.0f   // C added per actuation

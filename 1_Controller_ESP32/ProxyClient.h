@@ -64,4 +64,8 @@ int requestFaceCheck();
  *  Proxy writes tamper state to Firebase, triggering push notifications. */
 bool reportTamperToProxy();
 
+/** Report admin command handling result to proxy POST /command-ack.
+ *  status examples: accepted, rejected_state, executed, failed_unlock */
+bool reportCommandAckToProxy(const char *command, const char *status, const char *details);
+
 #endif // PROXY_CLIENT_H
