@@ -2520,7 +2520,10 @@ void handleCameraClient() {
 
     String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
     client.print(resp);
-    delay(50);
+    client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
     client.stop();
     return;
   }
@@ -2537,8 +2540,11 @@ void handleCameraClient() {
           "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
           String(blocked.length()) + "\r\n\r\n" + blocked;
       client.print(resp);
-      delay(50);
-      client.stop();
+      client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
+    client.stop();
       return;
     }
 
@@ -2552,7 +2558,10 @@ void handleCameraClient() {
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
         String(result.length()) + "\r\n\r\n" + result;
     client.print(resp);
-    delay(50);
+    client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
     client.stop();
     return;
   }
@@ -2581,7 +2590,10 @@ void handleCameraClient() {
 
     String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
     client.print(resp);
-    delay(50);
+    client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
     client.stop();
     return;
   }
@@ -2593,7 +2605,10 @@ void handleCameraClient() {
                   "text/plain\r\nContent-Length: " +
                   String(body.length()) + "\r\n\r\n" + body;
     client.print(resp);
-    delay(50);
+    client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
     client.stop();
     return;
   }
@@ -2661,8 +2676,11 @@ void handleCameraClient() {
                          : "HTTP/1.1 500 Internal Server Error\r\n";
   resp += "Content-Length: " + String(body.length()) + "\r\n\r\n" + body;
   client.print(resp);
-  delay(50);
-  client.stop();
+  client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
+    client.stop();
   Serial.println("[AP] Done: " + body);
 }
 
