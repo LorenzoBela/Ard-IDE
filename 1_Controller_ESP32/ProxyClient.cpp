@@ -24,7 +24,6 @@ char  currentOtp[8]          = "";
 char  activeDeliveryId[64]   = "";
 bool  hasActiveDelivery      = false;
 String lastStatusCommand     = "";
-bool  proxyReachable         = false;
 
 // ── WiFi backoff state ──
 static unsigned long wifiRetryAt    = 0;
@@ -127,7 +126,6 @@ void maintainWiFiConnection(unsigned long now) {
 void fetchDeliveryContext() {
   if (WiFi.status() != WL_CONNECTED) {
     netLog("[FETCH] Skip — WiFi not connected\n");
-    proxyReachable = false;
     return;
   }
 
@@ -138,7 +136,7 @@ void fetchDeliveryContext() {
   auto doGet = [&](String &bodyOut) -> int {
     WiFiClient client;
     HTTPClient http;
-    http.setTimeout(5000);
+    http.setTimeout(3000);
     http.setReuse(false); // Do not keep-alive; prevents stale connection issues
     // You can optionally pass client: http.begin(client, url);
     char url[64];
@@ -155,8 +153,10 @@ void fetchDeliveryContext() {
   String body = "";
   int code = doGet(body);
   if (code < 0) {
-    netLog("[FETCH] First GET failed (%d), retrying once...\n", code);
-    code = doGet(body);
+    // If it fails, maybe LilyGO is overloaded. Wait briefly before fallback or just return.
+    // By returning early and not retrying immediately, we keep loop() insanely fast.
+    netLog("[FETCH] GET failed (%d)\n", code);
+    return; // Don't block. Try again next time cleanly.
   }
   netLog("[FETCH] HTTP %d\n", code);
 
@@ -164,7 +164,6 @@ void fetchDeliveryContext() {
   lastStatusCommand = "";
 
   if (code == 200) {
-    proxyReachable = true;
     netLog("[FETCH] Body: '%s'\n", body.c_str());
 
     // Format: "123456,deliv_abc123" OR "123456,deliv_abc123,UNLOCKING"
@@ -218,8 +217,6 @@ void fetchDeliveryContext() {
         hasActiveDelivery = false;
       }
     }
-  } else if (code < 0) {
-    proxyReachable = false;
   }
 
   // Drive state transitions based on delivery availability

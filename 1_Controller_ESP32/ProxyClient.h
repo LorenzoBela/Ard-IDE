@@ -20,9 +20,6 @@ extern char  currentOtp[8];
 extern char  activeDeliveryId[64];
 extern bool  hasActiveDelivery;
 
-// ── Proxy reachability flag (HTTP 200 from /otp) ──
-extern bool  proxyReachable;
-
 // ── Last parsed status command from proxy ("UNLOCKING" / "LOCKED" / "") ──
 extern String lastStatusCommand;
 
