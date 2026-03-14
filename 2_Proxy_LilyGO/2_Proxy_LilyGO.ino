@@ -69,7 +69,7 @@ uint8_t boxNum       = 0;
 // Timing (ms)
 #define GPS_INTERVAL_ACQUIRING 500 // Fast polling while seeking fix
 #define GPS_INTERVAL_LOCKED 2000   // Normal polling once fix acquired
-#define FIREBASE_INTERVAL 5000
+#define FIREBASE_INTERVAL 3000
 #define SIGNAL_INTERVAL 10000
 #define TIME_SYNC_INTERVAL 1800000 // Re-sync time every 30 minutes
 
@@ -117,18 +117,23 @@ bool returnActive = false;
 bool lastReturnActive = false;
 char cachedDeliveryId[64] = "";
 bool deliveryIdCacheValid = false;
+char cachedDeliveryStatus[32] = ""; // To track "ASSIGNED", "PICKED_UP", "IN_TRANSIT" etc.
 // EC-FIX: Remote lock/unlock status command from Firebase (UNLOCKING/LOCKED)
 char cachedStatus[16] = "";
 unsigned long cachedStatusSetAt = 0;
 uint8_t cachedStatusServesRemaining = 0;
 #define STATUS_COMMAND_MAX_SERVES 60
 #define STATUS_COMMAND_RETRY_WINDOW_MS 60000
+
+// Internal proxy state to prevent telemetry from overwriting physical lock state on Firebase
+bool isBoxLocked = true;
+
 double destLat = 0.0, destLon = 0.0;
 bool destCoordsValid = false;
 double pickupLat = 0.0, pickupLon = 0.0;
 bool pickupCoordsValid = false;
 unsigned long lastDeliveryContextRead = 0;
-#define DELIVERY_CONTEXT_READ_INTERVAL 5000 // Re-read Firebase every 5s
+#define DELIVERY_CONTEXT_READ_INTERVAL 3000 // Re-read Firebase every 3s
 
 // UDP log receiver
 WiFiUDP udpServer;
@@ -1359,14 +1364,10 @@ void sendToFirebase() {
   Serial.print("Firebase... ");
 
   // Derive box status — theft overrides normal status
-  const char *boxStatus = "IDLE";
+  const char *boxStatus = isBoxLocked ? "LOCKED" : "UNLOCKING";
   TheftState tState = theftGuardGetState();
   if (tState == TG_STOLEN || tState == TG_LOCKDOWN) {
     boxStatus = theftGuardStateStr();
-  } else if (gpsFix) {
-    boxStatus = "ACTIVE";
-  } else if (lteConnected) {
-    boxStatus = "STANDBY";
   }
 
   // Get current timestamp
@@ -1643,7 +1644,12 @@ static bool isDeliveryStillActiveInFirebase(const char *deliveryId) {
   String statusBody = httpGetFromFirebase(statusPath);
   statusBody.trim();
 
-  if (statusBody.length() == 0 || statusBody == "null") {
+if (statusBody.length() == 0) {
+      Serial.printf("[CONTEXT] Network failure checking %s (empty body). Assuming active.\n", deliveryId);
+      return true;
+    }
+
+    if (statusBody == "null") {
     Serial.printf("[CONTEXT] Delivery %s missing in /deliveries -> stale context\n",
                   deliveryId);
     return false;
@@ -1661,10 +1667,13 @@ static bool isDeliveryStillActiveInFirebase(const char *deliveryId) {
       statusBody == "RETURNED" || statusBody == "FAILED") {
     Serial.printf("[CONTEXT] Delivery %s is terminal (%s) -> stale context\n",
                   deliveryId, statusBody.c_str());
-    return false;
-  }
+      cachedDeliveryStatus[0] = '\0';
+      return false;
+    }
 
-  return true;
+    strncpy(cachedDeliveryStatus, statusBody.c_str(), sizeof(cachedDeliveryStatus) - 1);
+    cachedDeliveryStatus[sizeof(cachedDeliveryStatus) - 1] = '\0';
+    return true;
 }
 
 static bool readTopLevelJsonString(const String &json, const char *key,
@@ -1834,6 +1843,7 @@ void refreshDeliveryContextFromFirebase() {
   int httpStatus = 0;
   int totalResponseLen = 0;
   while (millis() - waitStart < 15000) {
+    if (apStarted) handleCameraClient(); // Fast local serving to avoid HTTP timeout
     if (modem.stream.available()) {
       String line = modem.stream.readStringUntil('\n');
       line.trim();
@@ -1877,6 +1887,7 @@ void refreshDeliveryContextFromFirebase() {
       int chunkLen = -1;
       unsigned long t0 = millis();
       while (millis() - t0 < 6000) {
+        if (apStarted) handleCameraClient(); // Fast local serving
         if (modem.stream.available()) {
           String line = modem.stream.readStringUntil('\n');
           line.trim();
@@ -2218,6 +2229,7 @@ void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked) {
   Serial.printf("[EVENT] lock_events: %s\n", ok ? "OK" : "FAIL");
 
   const char *newStatus = unlocked ? "UNLOCKING" : "LOCKED";
+  isBoxLocked = !unlocked;
   char statusJson[64];
   snprintf(statusJson, sizeof(statusJson), "\"%s\"", newStatus);
   char statusPath[64];
@@ -2248,6 +2260,17 @@ void writeCommandAckToFirebase(const char *command, const char *status,
   bool ok = httpPatchWithRetry(hwPath, json);
   Serial.printf("[CMD_ACK] Firebase write: %s (%s/%s)\n", ok ? "OK" : "FAIL",
                 command ? command : "", status ? status : "");
+
+  // Sync internal state and immediately patch `status` at root too if executed/already_locked
+  if (ok && (strcmp(status, "executed") == 0 || strcmp(status, "already_locked") == 0 || strcmp(status, "already_unlocked") == 0)) {
+    if (strcmp(command, "LOCKED") == 0) {
+      isBoxLocked = true;
+      httpPatchWithRetry(hwPath, "{\"status\":\"LOCKED\"}");
+    } else if (strcmp(command, "UNLOCKING") == 0) {
+      isBoxLocked = false;
+      httpPatchWithRetry(hwPath, "{\"status\":\"UNLOCKING\"}");
+    }
+  }
 }
 
 // ==================== TAMPER EVENT WRITER ====================
@@ -2361,7 +2384,7 @@ void handleCameraClient() {
 
   IPAddress clientAddr = client.remoteIP();
 
-  unsigned long headerTimeout = millis() + 8000;
+  unsigned long headerTimeout = millis() + 500;
   while (!client.available() && millis() < headerTimeout) {
     delay(10);
     esp_task_wdt_reset();
@@ -2371,7 +2394,7 @@ void handleCameraClient() {
     return;
   }
 
-  client.setTimeout(5000);
+  client.setTimeout(2000);
   String requestLine = client.readStringUntil('\n');
   requestLine.trim();
   Serial.println("[AP] REQ: " + requestLine);
@@ -2412,22 +2435,47 @@ void handleCameraClient() {
 
   String reqPathStr = String(reqPath);
 
-  // â”€â”€ GET /otp â”€â”€
+  // ── GET /otp ──
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/otp")) {
     String otpPart, delPart;
+    String geoOverride = "";
+
     if (theftGuardShouldBlockOtp()) {
       otpPart = "NO_OTP";
       delPart = "NO_DELIVERY";
       Serial.printf("[AP] OTP suppressed — theft state: %s\n",
                     theftGuardStateStr());
-    } else if (destCoordsValid && gpsFix &&
-               !geoProxy.isNearAnyTarget(gpsLat, gpsLon)) {
-      otpPart = "NO_OTP";
-      delPart = "NO_DELIVERY";
-      Serial.printf("[AP] OTP suppressed — outside geofence (%.0fm)\n",
-                    geoProxy.snap.distanceM);
+    } else if (destCoordsValid && gpsFix) {
+      bool atPickup = geoProxy.isNearPickup(gpsLat, gpsLon);
+      bool atDropoff = geoProxy.isNearDropoff(gpsLat, gpsLon);
+
+      if (atDropoff) {
+        // At dropoff: serve normally (Controller shows Enter PIN)
+        if (returnActive) {
+          otpPart = returnOtpCacheValid ? String(cachedReturnOtp) : "NO_OTP";
+        } else {
+          otpPart = otpCacheValid ? String(cachedOtp) : "NO_OTP";
+        }
+        delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
+      } else if (atPickup) {
+        // At pickup: NO OTP, tell Controller we are at pickup -> Ongoing Pickup
+        otpPart = "NO_OTP";
+        delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
+        geoOverride = "GEO_PICKUP";
+      } else {
+        // In transit
+        otpPart = "NO_OTP";
+        delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
+        if (String(cachedDeliveryStatus) == "PICKED_UP" || String(cachedDeliveryStatus) == "IN_TRANSIT" || String(cachedDeliveryStatus) == "\"PICKED_UP\"") {
+          geoOverride = "GEO_TRANSIT_DROP";
+        } else {
+          geoOverride = "GEO_TRANSIT_PICK";
+        }
+        Serial.printf("[AP] OTP suppressed — outside geofence (%.0fm) Status: %s\n",
+                      geoProxy.snap.distanceM, geoOverride.c_str());
+      }
     } else {
-      // EC-32: During RETURNING, serve the return OTP instead of the delivery OTP.
+      // Fallback
       if (returnActive) {
         otpPart = returnOtpCacheValid ? String(cachedReturnOtp) : "NO_OTP";
       } else {
@@ -2445,7 +2493,7 @@ void handleCameraClient() {
         cachedStatusServesRemaining > 0 &&
         (unsigned long)(nowMs - cachedStatusSetAt) <= STATUS_COMMAND_RETRY_WINDOW_MS;
 
-    // Priority: status command > return mode (they are mutually exclusive actions).
+    // Priority: status command > geo override > return mode (they are mutually exclusive actions).
     if (statusActive) {
       body += "," + String(cachedStatus);
       if (cachedStatusServesRemaining > 0) {
@@ -2456,6 +2504,8 @@ void handleCameraClient() {
         cachedStatus[0] = '\0';
         cachedStatusSetAt = 0;
       }
+    } else if (geoOverride != "") {
+      body += "," + geoOverride;
     } else if (returnActive) {
       // Drop stale command if retry window elapsed.
       if (cachedStatus[0] != '\0' &&
@@ -2516,17 +2566,26 @@ void handleCameraClient() {
 
     Serial.printf("[CMD_ACK] command=%s status=%s details=%s\n", cmd, status,
                   details);
-    writeCommandAckToFirebase(cmd, status, details);
 
+    if (cmd[0] != '\0' && strcmp(cachedStatus, cmd) == 0) {
+      cachedStatus[0] = '\0';
+      cachedStatusServesRemaining = 0;
+      cachedStatusSetAt = 0;
+      Serial.println("[AP] Cleared cachedStatus locally upon ACK");
+    }
+
+    // Send HTTP 200 OK before blocking on Firebase write
     String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
     client.print(resp);
     client.flush();
     delay(10);
-    unsigned long _purgeLimit = millis() + 500;
-    while (client.available() && millis() < _purgeLimit) client.read();
-    client.stop();
+    client.stop(); // Disconnect ESP32 immediately to prevent -11 timeout
+    
+    // Now write to Firebase (takes a few seconds)
+    writeCommandAckToFirebase(cmd, status, details);
     return;
   }
+
   // â”€â”€ GET /face-check â”€â”€
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/face-check")) {
     Serial.println("[AP] -> GET /face-check");
@@ -2577,6 +2636,13 @@ void handleCameraClient() {
     }
     Serial.printf("[AP] Event: %s\n", jsonBuf);
 
+    // Send HTTP 200 OK before blocking on Firebase write
+    String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+    client.print(resp);
+    client.flush();
+    delay(10);
+    client.stop(); // Disconnect ESP32 immediately to prevent -11 timeout
+
     // Reed switch tamper: Controller detected unauthorized lid-open
     if (strstr(jsonBuf, "\"tamper\":true") != NULL) {
       Serial.println("[AP] TAMPER event received — writing to Firebase");
@@ -2585,16 +2651,11 @@ void handleCameraClient() {
       bool ov = (strstr(jsonBuf, "\"otp_valid\":true") != NULL);
       bool fd = (strstr(jsonBuf, "\"face_detected\":true") != NULL);
       bool ul = (strstr(jsonBuf, "\"unlocked\":true") != NULL);
+      
+      // Also write alert events to the lock_events stream so it appears in web UI
       writeLockEventToFirebase(ov, fd, ul);
     }
-
-    String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
-    client.print(resp);
-    client.flush();
-    delay(10);
-    unsigned long _purgeLimit = millis() + 500;
-    while (client.available() && millis() < _purgeLimit) client.read();
-    client.stop();
+    
     return;
   }
 
@@ -2668,6 +2729,16 @@ void handleCameraClient() {
       snprintf(auditPath, sizeof(auditPath),
                "/audit_logs/%s.json", cachedDeliveryId);
       httpPatchWithRetry(auditPath, auditJson);
+
+      // IMPORTANT: Write the proof_photo_url directly to the delivery document
+      // so the web/mobile app sync engines pick it up correctly.
+      char deliveryJson[320];
+      snprintf(deliveryJson, sizeof(deliveryJson),
+               "{\"proof_photo_url\":\"%s\"}", publicUrl);
+      char deliveryPath[96];
+      snprintf(deliveryPath, sizeof(deliveryPath),
+               "/deliveries/%s.json", cachedDeliveryId);
+      httpPatchWithRetry(deliveryPath, deliveryJson);
     }
   }
 
@@ -2714,6 +2785,7 @@ String httpGetFromFirebase(const char *path) {
   bool actionOK = false;
   int httpStatus = 0;
   while (millis() - waitStart < 15000) {
+    if (apStarted) handleCameraClient(); // Fast local serving
     if (modem.stream.available()) {
       String line = modem.stream.readStringUntil('\n');
       line.trim();
@@ -2737,6 +2809,7 @@ String httpGetFromFirebase(const char *path) {
     int dataLen = -1;
     unsigned long t0 = millis();
     while (millis() - t0 < 6000) {
+      if (apStarted) handleCameraClient(); // Fast local serving
       if (modem.stream.available()) {
         String line = modem.stream.readStringUntil('\n');
         line.trim();

@@ -135,6 +135,15 @@ struct GeofenceProxy {
   bool isArrived()          const { return snap.stableState == GEO_INSIDE; }
   double effectiveRadius()  const { return snap.urbanCanyon ? GEO_EXPANDED_RADIUS_M : GEO_DEFAULT_RADIUS_M; }
 
+  bool isNearDropoff(double lat, double lon) const {
+    return haversineM(lat, lon, targetLat, targetLon) <= GEO_OUTER_RADIUS_M;
+  }
+
+  bool isNearPickup(double lat, double lon) const {
+    if (!pickupSet) return false;
+    return haversineM(lat, lon, pickupLat, pickupLon) <= GEO_OUTER_RADIUS_M;
+  }
+
   /** True if current position is within the outer radius of EITHER pickup or dropoff */
   bool isNearAnyTarget(double lat, double lon) const {
     double dropDist = haversineM(lat, lon, targetLat, targetLon);

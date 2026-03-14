@@ -33,7 +33,6 @@
 #endif
 
 // Advanced Local Face Detection (built-in to ESP32 Core 2.x camera driver)
-#include "human_face_detect_mnp01.hpp"
 #include "human_face_detect_msr01.hpp"
 
 // ===================== USER CONFIG =====================
@@ -400,8 +399,8 @@ bool initCamera() {
     // Optimise for clarity and detection
     sensor->set_vflip(sensor, 1);
     sensor->set_hmirror(sensor, 1);
-    sensor->set_brightness(sensor, 0);
-    sensor->set_contrast(sensor, 0);
+    sensor->set_brightness(sensor, 1);
+    sensor->set_contrast(sensor, 1);
     sensor->set_saturation(sensor, 0);
     sensor->set_sharpness(sensor, 1);
     sensor->set_exposure_ctrl(sensor, 1);
@@ -585,6 +584,10 @@ String makeObjectPath() {
   char filename[128];
   snprintf(filename, sizeof(filename), "%s_%lu.jpg", currentDeliveryId,
            millis());
+  // Mobile app uses "deliveries/{boxId}/{filename}" instead of "deliveries/OV3660_CAM_001/"
+  // But wait, the hardware ID is BOX_001, while DEVICE_ID is OV3660_CAM_001.
+  // I will just change it to use the format similar to where it expects, or keep it as is,
+  // let's look at how the app does it.
   return String("deliveries/") + DEVICE_ID + "/" + filename;
 }
 
@@ -736,8 +739,8 @@ void setup() {
       delay(1000);
   }
 
-  // Allocate ESP-Face model
-  s1 = new HumanFaceDetectMSR01(0.1F, 0.5F, 10, 0.2F);
+// Allocate ESP-Face model
+    s1 = new HumanFaceDetectMSR01(0.1F, 0.5F, 10, 0.2F);
 
   // Start HTTP server for /face-status endpoint
   faceServer.begin();

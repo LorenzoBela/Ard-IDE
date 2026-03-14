@@ -11,7 +11,7 @@
  *
  * Hardware:
  *   LOCK_PIN        → MOSFET gate (active HIGH = solenoid energised)
- *   REED_SWITCH_PIN → Magnetic sensor (LOW = closed/locked, HIGH = open)
+ *   REED_SWITCH_PIN → Magnetic sensor (HIGH = closed/locked, LOW = open)
  */
 
 #ifndef LOCK_SAFETY_H
@@ -36,13 +36,13 @@ void initLock();
  * Retries up to LOCK_RETRY_MAX times, verifying reed switch each attempt.
  * Blocks briefly (retries use delay — only called on explicit unlock action).
  */
-LockStatus tryUnlock();
+LockStatus tryUnlock(bool ignoreReed = false);
 
 /**
  * EC-22: Attempt to lock and verify via reed switch.
  * Returns LOCK_STUCK_OPEN if reed switch still reads open after de-energising.
  */
-LockStatus tryLock();
+LockStatus tryLock(bool ignoreReed = false);
 
 /**
  * Call every loop() tick. Non-blocking.

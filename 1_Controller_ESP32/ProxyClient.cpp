@@ -136,7 +136,7 @@ void fetchDeliveryContext() {
   auto doGet = [&](String &bodyOut) -> int {
     WiFiClient client;
     HTTPClient http;
-    http.setTimeout(3000);
+    http.setTimeout(2000);
     http.setReuse(false); // Do not keep-alive; prevents stale connection issues
     // You can optionally pass client: http.begin(client, url);
     char url[64];
@@ -201,7 +201,7 @@ void fetchDeliveryContext() {
         activeDeliveryId[0] = '\0';
       }
 
-      hasActiveDelivery = (validOtp && validDel);
+      hasActiveDelivery = validDel; // Active even if NO_OTP (e.g. at pickup / transit)
       netLog("[FETCH] validOtp=%d validDel=%d hasActive=%d OTP='%s' ID='%s' Status='%s'\n",
              validOtp, validDel, hasActiveDelivery, currentOtp,
              activeDeliveryId, lastStatusCommand.c_str());

@@ -106,14 +106,19 @@ void loop() {
 
   // ── 2. LockSafety tick (thermal model, reed debounce, cutoff) ──
   if (maintainLockSafety(now) && currentState == STATE_UNLOCKING) {
-    netLog("[LOCK] Solenoid CUT OFF (Thermal Safety)\n");
+    netLog("[LOCK] Solenoid CUT OFF (Thermal Safety or Auto-Relock Timeout)\n");
     if (!isDisplayFailed()) {
       updateDisplay("Lock timeout!", "Relocking...");
     } else {
       fallbackError();
     }
     reportEventToProxy(false, false, false, true);
-    reportAlertToProxy("THERMAL_CUTOFF", "5s_safety_limit");
+    reportAlertToProxy("THERMAL_CUTOFF", "10s_safety_limit");
+    
+    // Auto-update the mobile app UI back to 'Lock Box' since the mechanical 
+    // hold has ended to prevent burnout.
+    reportCommandAckToProxy("LOCKED", "executed", "auto_relock_timeout");
+    
     enterState(STATE_RELOCKING);
   }
 
@@ -133,6 +138,7 @@ void loop() {
   if (WiFi.status() == WL_CONNECTED && currentState != STATE_CONNECTING_WIFI) {
     if (now - lastDeliveryContextFetch >= DELIVERY_CONTEXT_FETCH_MS) {
       bool wasActive = hasActiveDelivery;
+      String oldStatus = lastStatusCommand;
       fetchDeliveryContext();
       lastDeliveryContextFetch = now;
 
@@ -152,10 +158,17 @@ void loop() {
           enterState(STATE_STANDBY);
         }
       }
+      // Status update while already active (e.g. geofence transit/pickup updates)
+      else if (hasActiveDelivery && wasActive && oldStatus != lastStatusCommand) {
+        if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN) {
+           enterState(STATE_IDLE); // Re-render LCD
+        }
+      }
 
       // EC-77: Handle remote lock/unlock commands
       if (lastStatusCommand == "UNLOCKING" && currentState != STATE_UNLOCKING) {
         netLog("[EC-77] Remote UNLOCK (admin override)\n");
+        lastStatusCommand = ""; // Clear immediately to prevent loop on next timeout
         adminOverride.trigger(now);
         reportCommandAckToProxy("UNLOCKING", "accepted", "state_transition_unlocking");
         // Clear any in-progress keypad input
@@ -163,13 +176,27 @@ void loop() {
         inputCode[0] = '\0';
         enterState(STATE_UNLOCKING);
         reportAlertToProxy("ADMIN_OVERRIDE", "remote_unlock");
-      } else if (lastStatusCommand == "LOCKED" && currentState == STATE_UNLOCKING) {
+      } else if (lastStatusCommand == "LOCKED") {
         netLog("[CONTEXT] Remote LOCK commanded\n");
-        reportCommandAckToProxy("LOCKED", "accepted", "state_transition_relocking");
-        enterState(STATE_RELOCKING);
+        lastStatusCommand = ""; // Clear immediately
+        if (currentState == STATE_UNLOCKING) {
+          // Normal remote relock flow
+          LockStatus ls = tryLock(true); // ignore reed for remote lock
+          reportCommandAckToProxy("LOCKED", "accepted", "state_transition_relocking");
+          if (ls != LOCK_OK) {
+             reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
+          }
+          enterState(STATE_RELOCKING);
+        } else {
+          // Already locked or in another state — just actuate and stay in current state or go to relocking
+          LockStatus ls = tryLock(true); // ignore reed for remote lock
+          reportCommandAckToProxy("LOCKED", "executed", "already_locked");
+          // Optionally go to relocking state to show message, or stay in current state
+        }
       } else if (lastStatusCommand.length() > 0) {
         netLog("[EC-77] Remote command '%s' received but not actionable in state=%d\n",
                lastStatusCommand.c_str(), (int)currentState);
+        lastStatusCommand = ""; // Clear invalid command
         char stateDetail[32];
         snprintf(stateDetail, sizeof(stateDetail), "state_%d", (int)currentState);
         reportCommandAckToProxy(lastStatusCommand.c_str(), "rejected_state", stateDetail);
@@ -256,14 +283,31 @@ void handleStateMachine(unsigned long now) {
       } else if (key == '#') {
         if (inputLen > 0) enterState(STATE_VERIFYING_OTP);
       } else if (inputLen < 6) {
-        inputCode[inputLen++] = key;
-        inputCode[inputLen] = '\0';
-        if (currentState == STATE_IDLE) currentState = STATE_ENTERING_PIN;
+        // Enforce geofence lock: no PIN entry unless OTP exists
+        if (currentOtp[0] != '\0') {
+          inputCode[inputLen++] = key;
+          inputCode[inputLen] = '\0';
+          if (currentState == STATE_IDLE) currentState = STATE_ENTERING_PIN;
 
-        if (!isDisplayFailed()) {
-          char display[17];
-          snprintf(display, sizeof(display), "PIN: %s", inputCode);
-          updateDisplay("Enter PIN:", display);
+          if (!isDisplayFailed()) {
+            char display[17];
+            snprintf(display, sizeof(display), "PIN: %s", inputCode);
+            if (lastStatusCommand == "RETURNING") {
+              updateDisplay("Return PIN:", display);
+            } else {
+              updateDisplay("Enter PIN:", display);
+            }
+          }
+        } else {
+          // Keypad pressed but we are in transit/pickup so no OTP is loaded
+          if (!isDisplayFailed()) {
+            updateDisplay("Not at destination", "PIN disabled");
+            messageStartAt = millis();
+            currentState = STATE_SHOW_MESSAGE;
+          } else {
+            fallbackError();
+          }
+          break; // break the while(true) to handle state change
         }
       }
     }
@@ -378,13 +422,15 @@ void handleStateMachine(unsigned long now) {
       bool overrideAttempt = adminOverride.pending;
       suppressTamper(); // Authorized unlock — don't flag lid-open as tamper
       // EC-21: Try unlock with retry logic + EC-96 thermal check
-      LockStatus ls = tryUnlock();
+      LockStatus ls = tryUnlock(overrideAttempt);
 
       if (ls == LOCK_OK) {
         netLog("[LOCK] Solenoid ON (unlock OK)\n");
         if (overrideAttempt) {
           reportCommandAckToProxy("UNLOCKING", "executed", "lock_ok");
           adminOverride.clear();
+          // We intentionally do NOT call enterState(STATE_RELOCKING) yet.
+          // It will stay retracted/unlocked until App sends "LOCKED" or '*' is pressed.
         }
         if (!isDisplayFailed()) {
           updateDisplay("Box Unlocked!", "* = Relock");
@@ -463,9 +509,14 @@ void enterState(TesterState newState) {
     break;
   case STATE_IDLE:
     if (!isDisplayFailed()) {
-      // EC-32: Return protocol hint — show Return PIN prompt when returning.
       if (lastStatusCommand == "RETURNING") {
         updateDisplay("Return PIN:", "PIN: ");
+      } else if (lastStatusCommand == "GEO_TRANSIT_DROP") {
+        updateDisplay("In Transit", "Head to dropoff");
+      } else if (lastStatusCommand == "GEO_TRANSIT_PICK") {
+        updateDisplay("In Transit", "Head to pickup");
+      } else if (lastStatusCommand == "GEO_PICKUP") {
+        updateDisplay("Ongoing Pickup", "Please wait...");
       } else {
         updateDisplay("Enter PIN:", "PIN: ");
       }

@@ -24,7 +24,7 @@ static bool          prevReedStable  = true;  // for edge detection
 
 // ── Internal helpers ──
 static bool readReedRaw() {
-  return digitalRead(REED_SWITCH_PIN) == LOW; // LOW = magnet present = locked
+    return digitalRead(REED_SWITCH_PIN) == HIGH; // HIGH = magnet present = locked
 }
 
 static void energise(unsigned long now) {
@@ -51,7 +51,7 @@ void initLock() {
   lastCoolTick = millis();
 }
 
-LockStatus tryUnlock() {
+LockStatus tryUnlock(bool ignoreReed) {
   // EC-96: Refuse if overheated
   if (coilTempC >= LOCK_THERMAL_MAX_TEMP) {
     Serial.println(F("[LOCK] Blocked — coil overheated"));
@@ -61,37 +61,27 @@ LockStatus tryUnlock() {
   unsigned long now = millis();
   lastRetryCount = 0;
 
-  for (uint8_t attempt = 1; attempt <= LOCK_RETRY_MAX; attempt++) {
-    lastRetryCount = attempt;
-    energise(now);
-
-    // Wait for solenoid to physically move + reed to open
-    delay(LOCK_RETRY_DELAY_MS);
-
-    // EC-95: Read reed switch (after brief settle)
-    bool opened = !readReedRaw();
-    if (opened) {
-      Serial.printf("[LOCK] Unlocked (attempt %u)\n", attempt);
-      return LOCK_OK;
-    }
-
-    // Retry — de-energise briefly before next attempt
-    if (attempt < LOCK_RETRY_MAX) {
-      deEnergise();
-      delay(LOCK_RETRY_DELAY_MS);
-      now = millis();
-    }
+  // Hold energized for user to open
+  energise(now);
+  
+  if (ignoreReed) {
+    Serial.println(F("[LOCK] Unlocked forcefully (admin override, reed ignored, holding)"));
+  } else {
+    Serial.println(F("[LOCK] Unlocked, holding for user to lift lid (10s max)"));
   }
-
-  // EC-21: All retries exhausted — solenoid stuck closed
-  deEnergise();
-  Serial.printf("[LOCK] STUCK CLOSED after %u attempts\n", lastRetryCount);
-  return LOCK_STUCK_CLOSED;
+  
+  return LOCK_OK;
 }
 
-LockStatus tryLock() {
+LockStatus tryLock(bool ignoreReed) {
   deEnergise();
   delay(LOCK_DEBOUNCE_MS);
+
+  if (ignoreReed) {
+    reedStable = true;
+    Serial.println(F("[LOCK] Locked forcefully (admin override, reed ignored)"));
+    return LOCK_OK;
+  }
 
   // EC-22: Verify reed switch shows closed
   bool closed = readReedRaw();
@@ -134,7 +124,7 @@ bool maintainLockSafety(unsigned long now) {
   // ── Hard thermal cutoff ──
   if (solenoidOnAt > 0 && (now - solenoidOnAt >= LOCK_MAX_ACTIVE_MS)) {
     deEnergise();
-    Serial.println(F("[LOCK] THERMAL CUTOFF (5 s limit)"));
+    Serial.println(F("[LOCK] THERMAL CUTOFF (timeout limit)"));
     return true;
   }
 

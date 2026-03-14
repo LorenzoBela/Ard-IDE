@@ -44,7 +44,7 @@ void initHardwareIO() {
 
   Wire.begin(21, 22);
   delay(500);           // LCD Vcc rail settle time
-  lcd.init();
+  lcd.begin();
   lcd.backlight();
   updateDisplay("Parcel-Safe v2", "Connecting WiFi");
 

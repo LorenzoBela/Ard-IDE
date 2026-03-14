@@ -41,7 +41,7 @@ static const byte KP_COLS = 3;
 #define DELIVERY_CONTEXT_FETCH_MS 1000
 
 // ==================== LOCK SAFETY (EC-21/22/95/96) ====================
-#define LOCK_MAX_ACTIVE_MS        5000    // Hard thermal cutoff (Article 2.3)
+#define LOCK_MAX_ACTIVE_MS        10000   // Hard thermal cutoff (10 sec hold)
 #define LOCK_RETRY_MAX            3       // EC-21: Max unlock retry attempts
 #define LOCK_RETRY_DELAY_MS       1000    // Delay between retries (increased from 200 to give user time to open lid)
 #define LOCK_DEBOUNCE_MS          50      // EC-95: Reed switch debounce
