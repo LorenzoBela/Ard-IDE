@@ -240,29 +240,31 @@ void handleStateMachine(unsigned long now) {
 
   case STATE_IDLE:
   case STATE_ENTERING_PIN: {
-    char key = readKeypad();
-    if (!key) break;
+    while(true) {
+      char key = readKeypad();
+      if (!key) break;
 
-    // EC-86: Fallback feedback per keypress if LCD dead
-    if (isDisplayFailed()) {
-      fallbackKeyFeedback();
-    }
+      // EC-86: Fallback feedback per keypress if LCD dead
+      if (isDisplayFailed()) {
+        fallbackKeyFeedback();
+      }
 
-    if (key == '*') {
-      inputLen = 0;
-      inputCode[0] = '\0';
-      enterState(STATE_IDLE);
-    } else if (key == '#') {
-      if (inputLen > 0) enterState(STATE_VERIFYING_OTP);
-    } else if (inputLen < 6) {
-      inputCode[inputLen++] = key;
-      inputCode[inputLen] = '\0';
-      if (currentState == STATE_IDLE) currentState = STATE_ENTERING_PIN;
+      if (key == '*') {
+        inputLen = 0;
+        inputCode[0] = '\0';
+        enterState(STATE_IDLE);
+      } else if (key == '#') {
+        if (inputLen > 0) enterState(STATE_VERIFYING_OTP);
+      } else if (inputLen < 6) {
+        inputCode[inputLen++] = key;
+        inputCode[inputLen] = '\0';
+        if (currentState == STATE_IDLE) currentState = STATE_ENTERING_PIN;
 
-      if (!isDisplayFailed()) {
-        char display[17];
-        snprintf(display, sizeof(display), "PIN: %s", inputCode);
-        updateDisplay("Enter PIN:", display);
+        if (!isDisplayFailed()) {
+          char display[17];
+          snprintf(display, sizeof(display), "PIN: %s", inputCode);
+          updateDisplay("Enter PIN:", display);
+        }
       }
     }
     break;
@@ -452,11 +454,7 @@ void enterState(TesterState newState) {
   switch (newState) {
   case STATE_STANDBY:
     if (!isDisplayFailed()) {
-      if (!proxyReachable) {
-        updateDisplay("Proxy offline", "Reconnecting...");
-      } else {
-        updateDisplay("Box Ready", "No Delivery");
-      }
+      updateDisplay("Box Ready", "No Delivery");
     }
     inputLen = 0;
     inputCode[0] = '\0';
