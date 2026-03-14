@@ -2520,7 +2520,10 @@ void handleCameraClient() {
 
     String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
     client.print(resp);
-    delay(50);
+    client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
     client.stop();
     return;
   }
@@ -2537,8 +2540,11 @@ void handleCameraClient() {
           "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
           String(blocked.length()) + "\r\n\r\n" + blocked;
       client.print(resp);
-      delay(50);
-      client.stop();
+      client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
+    client.stop();
       return;
     }
 
@@ -2552,7 +2558,10 @@ void handleCameraClient() {
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
         String(result.length()) + "\r\n\r\n" + result;
     client.print(resp);
-    delay(50);
+    client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
     client.stop();
     return;
   }
@@ -2581,7 +2590,10 @@ void handleCameraClient() {
 
     String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
     client.print(resp);
-    delay(50);
+    client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
     client.stop();
     return;
   }
@@ -2593,7 +2605,10 @@ void handleCameraClient() {
                   "text/plain\r\nContent-Length: " +
                   String(body.length()) + "\r\n\r\n" + body;
     client.print(resp);
-    delay(50);
+    client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
     client.stop();
     return;
   }
@@ -2661,8 +2676,11 @@ void handleCameraClient() {
                          : "HTTP/1.1 500 Internal Server Error\r\n";
   resp += "Content-Length: " + String(body.length()) + "\r\n\r\n" + body;
   client.print(resp);
-  delay(50);
-  client.stop();
+  client.flush();
+    delay(10);
+    unsigned long _purgeLimit = millis() + 500;
+    while (client.available() && millis() < _purgeLimit) client.read();
+    client.stop();
   Serial.println("[AP] Done: " + body);
 }
 
@@ -2850,39 +2868,10 @@ void setup() {
   esp_task_wdt_add(NULL);                 // Watch the main loop task
   Serial.printf("[WDT] Watchdog armed (%ds timeout)\n", WDT_TIMEOUT_S);
 
-  // Initialize modem with proper power sequence
-  modemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
-  powerModem();
-
-  modemOK = initModem();
-
-  if (!modemOK) {
-    Serial.println("\n*** MODEM FAILED - Cannot proceed without LTE ***");
-    Serial.println("  CHECK: 1) Modem hardware connected properly");
-    Serial.println("         2) Power supply sufficient (>2A)");
-    Serial.println("         3) SIM card inserted");
-    while (1)
-      delay(1000);
-  }
-
-  gpsEnabled = initGPS();
-  Serial.println(gpsEnabled ? "GPS: Ready" : "GPS: Failed (continuing)");
-
-  Serial.println("\nConnecting via LTE...");
-  if (!connectLTE()) {
-    Serial.println("\n*** LTE CONNECTION FAILED ***");
-    Serial.println("  CHECK: 1) SIM has active data plan");
-    Serial.println("         2) LTE antenna connected");
-    Serial.println("         3) Signal coverage in area");
-    while (1)
-      delay(1000);
-  }
-
   // Auto-provision box identity (NVS cache or Firebase registration)
   autoProvision();
 
-  // â”€â”€ Start WiFi hotspot so ESP32-CAM can connect and relay images via
-  // LTE â”€â”€
+  // â”€â”€ Start WiFi hotspot so ESP32-CAM can connect and relay images â”€â”€
   startHotspot();
   if (apStarted) {
     camServer.begin();
@@ -2890,6 +2879,30 @@ void setup() {
                   CAM_SERVER_PORT);
     Serial.printf("[AP] ESP32-CAM should connect to SSID '%s' / '%s'\n",
                   AP_SSID, AP_PASS);
+  }
+
+  // Initialize modem with proper power sequence
+  modemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  powerModem();
+
+  modemOK = initModem();
+
+  if (!modemOK) {
+    Serial.println("\n*** MODEM FAILED - will retry in loop() ***");
+    Serial.println("  CHECK: 1) Modem hardware connected properly");
+    Serial.println("         2) Power supply sufficient (>2A)");
+    Serial.println("         3) SIM card inserted");
+  }
+
+  gpsEnabled = initGPS();
+  Serial.println(gpsEnabled ? "GPS: Ready" : "GPS: Failed (continuing)");
+
+  Serial.println("\nConnecting via LTE...");
+  if (!connectLTE()) {
+    Serial.println("\n*** LTE CONNECTION FAILED - will retry in loop() ***");
+    Serial.println("  CHECK: 1) SIM has active data plan");
+    Serial.println("         2) LTE antenna connected");
+    Serial.println("         3) Signal coverage in area");
   }
 
   // â”€â”€ POST-LTE: Retry AGPS + XTRA now that data is available â”€â”€
@@ -2949,6 +2962,41 @@ void setup() {
 void loop() {
   esp_task_wdt_reset(); // Feed watchdog every loop iteration
   unsigned long now = millis();
+
+  // ── Modem/LTE retry with exponential backoff (keeps HTTP server alive) ──
+  static unsigned long modemRetryAt = 0;
+  static unsigned long modemRetryBackoffMs = 10000; // start at 10s
+  const unsigned long MODEM_RETRY_BACKOFF_MAX_MS = 120000; // cap at 120s
+
+  if ((!modemOK || !lteConnected) && now >= modemRetryAt) {
+    Serial.println("[RETRY] Modem/LTE health check...");
+
+    if (!modemOK) {
+      Serial.println("[RETRY] Reinitializing modem...");
+      powerModem();
+      modemOK = initModem();
+    }
+
+    if (modemOK && !lteConnected) {
+      Serial.println("[RETRY] Reconnecting LTE...");
+      lteConnected = connectLTE();
+      if (lteConnected) {
+        // On first successful LTE after boot or outage, resync time.
+        syncNetworkTime();
+      }
+    }
+
+    if (!modemOK || !lteConnected) {
+      modemRetryBackoffMs *= 2;
+      if (modemRetryBackoffMs > MODEM_RETRY_BACKOFF_MAX_MS) {
+        modemRetryBackoffMs = MODEM_RETRY_BACKOFF_MAX_MS;
+      }
+    } else {
+      modemRetryBackoffMs = 10000;
+    }
+
+    modemRetryAt = now + modemRetryBackoffMs;
+  }
 
   // Handle incoming camera image upload (non-blocking when idle)
   if (apStarted) {

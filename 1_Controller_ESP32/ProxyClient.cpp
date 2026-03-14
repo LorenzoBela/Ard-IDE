@@ -136,7 +136,7 @@ void fetchDeliveryContext() {
   auto doGet = [&](String &bodyOut) -> int {
     WiFiClient client;
     HTTPClient http;
-    http.setTimeout(5000);
+    http.setTimeout(3000);
     http.setReuse(false); // Do not keep-alive; prevents stale connection issues
     // You can optionally pass client: http.begin(client, url);
     char url[64];
@@ -153,8 +153,10 @@ void fetchDeliveryContext() {
   String body = "";
   int code = doGet(body);
   if (code < 0) {
-    netLog("[FETCH] First GET failed (%d), retrying once...\n", code);
-    code = doGet(body);
+    // If it fails, maybe LilyGO is overloaded. Wait briefly before fallback or just return.
+    // By returning early and not retrying immediately, we keep loop() insanely fast.
+    netLog("[FETCH] GET failed (%d)\n", code);
+    return; // Don't block. Try again next time cleanly.
   }
   netLog("[FETCH] HTTP %d\n", code);
 
