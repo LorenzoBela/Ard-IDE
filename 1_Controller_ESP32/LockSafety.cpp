@@ -21,10 +21,15 @@ static unsigned long reedLastChange  = 0;
 static bool          tamperLatch     = false; // latched until cleared
 static bool          tamperSuppressed = false; // true during authorized unlock
 static bool          prevReedStable  = true;  // for edge detection
+static unsigned long tamperLastAt    = 0;     // cooldown: millis() of last trigger
+static unsigned long lockInitAt      = 0;     // millis() at initLock()
+static unsigned long reedOpenSince   = 0;     // millis() when stable OPEN began
+static bool          prevQualifiedOpen = false;
 
 // ── Internal helpers ──
 static bool readReedRaw() {
-    return digitalRead(REED_SWITCH_PIN) == HIGH; // HIGH = magnet present = locked
+  int raw = digitalRead(REED_SWITCH_PIN);
+  return REED_CLOSED_IS_HIGH ? (raw == HIGH) : (raw == LOW);
 }
 
 static void energise(unsigned long now) {
@@ -44,11 +49,24 @@ void initLock() {
   pinMode(LOCK_PIN, OUTPUT);
   digitalWrite(LOCK_PIN, LOW);
 
+#if REED_USE_INTERNAL_PULLUP
+  pinMode(REED_SWITCH_PIN, INPUT_PULLUP);
+#else
   pinMode(REED_SWITCH_PIN, INPUT);
+#endif
 
   reedRaw    = readReedRaw();
   reedStable = reedRaw;
+  prevReedStable = reedRaw;
   lastCoolTick = millis();
+  tamperLastAt = 0;
+  lockInitAt = millis();
+  reedOpenSince = reedStable ? 0 : lockInitAt;
+  prevQualifiedOpen = false;
+
+  Serial.printf("[REED] boot raw=%d interpreted=%s (REED_CLOSED_IS_HIGH=%d)\n",
+                digitalRead(REED_SWITCH_PIN),
+                reedStable ? "CLOSED" : "OPEN", REED_CLOSED_IS_HIGH);
 }
 
 LockStatus tryUnlock(bool ignoreReed) {
@@ -106,11 +124,32 @@ bool maintainLockSafety(unsigned long now) {
     reedStable = reedRaw;
   }
 
-  // ── Tamper detection: lid opened while solenoid is off and not suppressed ──
-  if (prevReedStable && !reedStable && !isSolenoidActive() && !tamperSuppressed) {
+  // Track sustained OPEN duration from debounced reed state.
+  if (!reedStable) {
+    if (reedOpenSince == 0) {
+      reedOpenSince = now;
+    }
+  } else {
+    reedOpenSince = 0;
+  }
+
+  // ── Tamper detection: require sustained OPEN + post-boot grace ──
+  bool cooldownActive =
+      (tamperLastAt > 0) && (now - tamperLastAt < TAMPER_COOLDOWN_MS);
+  bool bootGraceActive = (now - lockInitAt < TAMPER_BOOT_GRACE_MS);
+  bool openConfirmed =
+      (reedOpenSince > 0) && (now - reedOpenSince >= TAMPER_OPEN_CONFIRM_MS);
+  bool qualifiedOpen = openConfirmed && !isSolenoidActive() &&
+                       !tamperSuppressed && !bootGraceActive;
+
+  // Trigger once when entering a qualified-open state.
+  if (!prevQualifiedOpen && qualifiedOpen && !cooldownActive) {
     tamperLatch = true;
+    tamperLastAt = now;
     Serial.println(F("[TAMPER] Reed opened without unlock — TAMPER DETECTED"));
   }
+
+  prevQualifiedOpen = qualifiedOpen;
   prevReedStable = reedStable;
 
   // ── EC-96: Passive cooling ──

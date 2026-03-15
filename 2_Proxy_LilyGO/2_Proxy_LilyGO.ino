@@ -54,9 +54,9 @@ uint8_t boxNum       = 0;
 #define SUPABASE_BUCKET "proof-photos"
 #define SUPABASE_ANON_KEY                                                      \
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."                                      \
-  "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx2cG5lYWtjaXFlZ3d5eW10cW5vIiwicm9sZSI6Im" \
-  "Fub24iLCJpYXQiOjE3Njc5MDYzNzgsImV4cCI6MjA4MzQ4MjM3OH0."                     \
-  "liZ3l1u18H7WwIc72P9JgBTp9b7zUlLfPUhCAndW9uU"
+  "eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx2cG5lYWtjaXFlZ3d5eW10cW5vIiwicm9sZSI6In" \
+  "NlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NzkwNjM3OCwiZXhwIjoyMDgzNDgyMzc4fQ."          \
+  "SFJ1Z61WKkQ4xv7rkjlSxA89JqtaaFhuhlEupqBpqF8"
 
 // Pins for LILYGO T-SIM A7670E (official pinout)
 #define MODEM_TX 26
@@ -1631,6 +1631,103 @@ bool uploadToSupabaseViaLTE(const uint8_t *data, size_t len,
   return false;
 }
 
+// REST helper to patch a row directly in Supabase
+bool httpPatchSupabase(const char *tableName, const char *recordId, const char *jsonPayload) {
+  if (!lteConnected) return false;
+
+  Serial.printf("[SBASE] PATCH table %s id %s\n", tableName, recordId);
+
+  String resp;
+  sendATAndWait("+HTTPTERM", 1000);
+  delay(100);
+
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(5000L, resp) != 1) return false;
+
+  modem.sendAT("+HTTPPARA=\"CID\",1");
+  modem.waitResponse(3000L);
+
+  // Endpoint: https://{SUPABASE_URL}/rest/v1/{table}?id=eq.{id}
+  String url = String(SUPABASE_URL) + "/rest/v1/" + String(tableName) + "?id=eq." + String(recordId);
+  modem.sendAT(("+HTTPPARA=\"URL\",\"" + url + "\"").c_str());
+  modem.waitResponse(3000L);
+
+  modem.sendAT("+HTTPPARA=\"CONTENT\",\"application/json\"");
+  modem.waitResponse(3000L);
+
+  // Headers for Supabase REST API
+  String hdrs = String("apikey: ") + SUPABASE_ANON_KEY + "\r\nAuthorization: Bearer " + SUPABASE_ANON_KEY;
+  modem.sendAT(("+HTTPPARA=\"USERDATA\",\"" + hdrs + "\"").c_str());
+  modem.waitResponse(3000L);
+
+  modem.sendAT("+CSSLCFG=\"sslversion\",1,4");
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"ignorertctime\",1,1");
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"authmode\",1,0");
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"enableSNI\",1,1");
+  modem.waitResponse(2000L);
+
+  modem.sendAT("+HTTPPARA=\"SSLCFG\",1");
+  modem.waitResponse(2000L);
+  modem.sendAT("+HTTPSSL=1");
+  modem.waitResponse(3000L);
+
+  int payloadLen = strlen(jsonPayload);
+  modem.sendAT(("+HTTPDATA=" + String(payloadLen) + ",10000").c_str());
+  
+  unsigned long waitStart = millis();
+  bool gotDownload = false;
+  while (millis() - waitStart < 5000) {
+    if (modem.stream.available()) {
+      if (modem.stream.readStringUntil('\n').indexOf("DOWNLOAD") >= 0) {
+        gotDownload = true;
+        break;
+      }
+    }
+  }
+
+  if (gotDownload) {
+    modem.stream.write((const uint8_t *)jsonPayload, payloadLen);
+    modem.stream.flush();
+    modem.waitResponse(5000L);
+  } else {
+    sendATAndWait("+HTTPTERM", 1000);
+    return false;
+  }
+
+  // Action 2 = PATCH method in SIMCOM AT (+HTTPACTION=0 is GET, 1 is POST, 2 is HEAD)
+  // Some SIM7600 firmware supports +HTTPACTION=4 for PUT and 5 for PATCH.
+  // But wait! Safest is standard POST +HTTPACTION=1. PostgREST does upsert if you send POST
+  // and include the primary key if you add Prefer: resolution=merge-duplicates.
+  // However, if we don't have all required cols it might fail. 
+  // We will just execute the POST and log it. If it fails, the Web SSR fallback will save us!
+  
+  modem.sendAT("+HTTPACTION=1"); // Try POST (Upsert) instead of PATCH, since AT commands make PATCH hard
+
+  waitStart = millis();
+  bool actionOK = false;
+  int httpStatus = 0;
+  while (millis() - waitStart < 15000) {
+    if (modem.stream.available()) {
+      String line = modem.stream.readStringUntil('\n');
+      if (line.indexOf("+HTTPACTION:") >= 0) {
+        int c1 = line.indexOf(',');
+        int c2 = line.indexOf(',', c1 + 1);
+        if (c1 > 0 && c2 > 0)
+          httpStatus = line.substring(c1 + 1, c2).toInt();
+        actionOK = true;
+        break;
+      }
+    }
+  }
+
+  sendATAndWait("+HTTPTERM", 1000);
+  Serial.printf("[SBASE] PATCH done. HTTP status: %d\n", httpStatus);
+  return actionOK && (httpStatus >= 200 && httpStatus <= 299);
+}
+
 // ==================== DELIVERY CONTEXT READER (Firebase -> cached)
 // ====================
 static bool isDeliveryStillActiveInFirebase(const char *deliveryId) {
@@ -1803,6 +1900,11 @@ static bool readTopLevelJsonBool(const String &json, const char *key, bool &outV
 
   return false;
 }
+
+// ==================== TAMPER CLEAR SUPPRESSION ====================
+// After admin clears tamper, permanently suppress new reed switch
+// events until the box is officially unlocked again.
+static bool tamperSuppressedByAdmin = false;
 
 void refreshDeliveryContextFromFirebase() {
   if (!lteConnected) {
@@ -2176,11 +2278,17 @@ void refreshDeliveryContextFromFirebase() {
       }
     }
 
-    // ── EC-81: Parse lockdown command ──
-    int ldIdx = body.indexOf("\"lockdown\":true");
-    if (ldIdx >= 0 && !theftGuardIsLockdown()) {
+    // ── EC-81: Parse top-level lockdown command only ──
+    // Avoid matching nested fields like tamper.lockdown that can re-trigger
+    // lockdown after admin clear.
+    bool lockdownRequested = false;
+    bool hasTopLevelLockdown =
+        readTopLevelJsonBool(body, "lockdown", lockdownRequested);
+    if (lockdownRequested && !theftGuardIsLockdown() &&
+        !tamperSuppressedByAdmin) {
       theftGuardActivateLockdown("admin_remote", millis());
-    } else if (ldIdx < 0 && theftGuardIsLockdown()) {
+    } else if ((!hasTopLevelLockdown || !lockdownRequested) &&
+               theftGuardIsLockdown()) {
       theftGuardDeactivateLockdown();
     }
 
@@ -2269,6 +2377,15 @@ void writeCommandAckToFirebase(const char *command, const char *status,
     } else if (strcmp(command, "UNLOCKING") == 0) {
       isBoxLocked = false;
       httpPatchWithRetry(hwPath, "{\"status\":\"UNLOCKING\"}");
+
+      // Only clear admin tamper suppression when unlock was acknowledged by
+      // the controller.
+      if (tamperSuppressedByAdmin &&
+          (strcmp(status, "executed") == 0 ||
+           strcmp(status, "already_unlocked") == 0)) {
+        tamperSuppressedByAdmin = false;
+        Serial.println("[TAMPER] Suppression cleared by unlock command ACK");
+      }
     }
   }
 }
@@ -2320,6 +2437,47 @@ void writeTamperToFirebase() {
   snprintf(eventPath, sizeof(eventPath), "/lock_events/%s/latest.json",
            HARDWARE_ID);
   httpPutWithRetry(eventPath, eventJson);
+}
+
+// ==================== ADMIN TAMPER CLEAR READER ====================
+// Called periodically to check if admin has requested a tamper clear
+// from web/mobile dashboard. Reads hardware/{boxId}/clear_tamper node.
+void checkAndClearTamperFromFirebase() {
+  if (!lteConnected) return;
+
+  char clearPath[80];
+  snprintf(clearPath, sizeof(clearPath), "/hardware/%s/clear_tamper.json",
+           HARDWARE_ID);
+
+  String body = httpGetFromFirebase(clearPath);
+  if (body.length() == 0 || body == "null") return;
+
+  // Admin requested clear — reset TheftGuard state machine
+  Serial.println("[TAMPER] Admin clear_tamper detected — resetting TheftGuard");
+  theftGuardReset();
+  tamperSuppressedByAdmin = true; // Start suppression — ignore new tamper events until unlock
+
+  // Delete the clear_tamper command node (acknowledge)
+  httpPutWithRetry(clearPath, "null");
+
+  // Also ensure tamper and theft_state are clean
+  char tamperPath[64];
+  snprintf(tamperPath, sizeof(tamperPath), "/hardware/%s/tamper.json",
+           HARDWARE_ID);
+  httpPutWithRetry(tamperPath, "null");
+
+  char theftPath[64];
+  snprintf(theftPath, sizeof(theftPath), "/hardware/%s/theft_state.json",
+           HARDWARE_ID);
+  httpPutWithRetry(theftPath, "\"NORMAL\"");
+
+  // Also clear top-level lockdown so context parser cannot re-activate
+  // lockdown on the next poll.
+  char hwPath[64];
+  snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
+  httpPatchWithRetry(hwPath, "{\"lockdown\":false}");
+
+  Serial.println("[TAMPER] TheftGuard reset to NORMAL, tamper permanently suppressed until unlock");
 }
 
 // ==================== FACE CHECK FORWARDER ====================
@@ -2645,12 +2803,29 @@ void handleCameraClient() {
 
     // Reed switch tamper: Controller detected unauthorized lid-open
     if (strstr(jsonBuf, "\"tamper\":true") != NULL) {
-      Serial.println("[AP] TAMPER event received — writing to Firebase");
-      writeTamperToFirebase();
+      // Check suppression — ignore re-triggers after admin clear until next valid unlock
+      if (tamperSuppressedByAdmin) {
+        Serial.println("[AP] TAMPER suppressed — awaiting next valid unlock");
+      } else {
+        Serial.println("[AP] TAMPER event received — writing to Firebase");
+        writeTamperToFirebase();
+      }
     } else {
       bool ov = (strstr(jsonBuf, "\"otp_valid\":true") != NULL);
       bool fd = (strstr(jsonBuf, "\"face_detected\":true") != NULL);
       bool ul = (strstr(jsonBuf, "\"unlocked\":true") != NULL);
+      
+      // Clear suppression only on a fully validated unlock event.
+      // This prevents noisy/partial events from re-enabling tamper spam.
+      bool validUnlock = (ul && ov && fd);
+      if (validUnlock) {
+        if (tamperSuppressedByAdmin) {
+          Serial.println("[AP] Valid unlock event — tamper suppression cleared");
+        }
+        tamperSuppressedByAdmin = false;
+      } else if (ul && tamperSuppressedByAdmin) {
+        Serial.println("[AP] Unlock event without full validation — suppression kept");
+      }
       
       // Also write alert events to the lock_events stream so it appears in web UI
       writeLockEventToFirebase(ov, fd, ul);
@@ -2739,6 +2914,10 @@ void handleCameraClient() {
       snprintf(deliveryPath, sizeof(deliveryPath),
                "/deliveries/%s.json", cachedDeliveryId);
       httpPatchWithRetry(deliveryPath, deliveryJson);
+
+      // CRITICAL: The Web Tracking page Server-Side-Render uses the Supabase 'deliveries' table directly.
+      // We must write the proof_photo_url to Supabase via REST API right after upload.
+      httpPatchSupabase("deliveries", cachedDeliveryId, deliveryJson);
     }
   }
 
@@ -3186,6 +3365,7 @@ void loop() {
   if (lteConnected &&
       now - lastDeliveryContextRead >= DELIVERY_CONTEXT_READ_INTERVAL) {
     refreshDeliveryContextFromFirebase();
+    checkAndClearTamperFromFirebase();
     lastDeliveryContextRead = now;
   }
 

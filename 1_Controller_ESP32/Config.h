@@ -29,6 +29,13 @@ extern char HARDWARE_ID[12];
 #define LOCK_PIN          32    // MOSFET gate for solenoid
 #define REED_SWITCH_PIN   4     // Lock position sensor (input-only GPIO)
 
+// Reed polarity/config:
+// - If magnet-closed reads HIGH, set REED_CLOSED_IS_HIGH to 1.
+// - If magnet-closed reads LOW, set REED_CLOSED_IS_HIGH to 0.
+#define REED_CLOSED_IS_HIGH      1
+// For NO reed wired pin->switch->GND, use INPUT_PULLUP to avoid floating input.
+#define REED_USE_INTERNAL_PULLUP 1
+
 // ==================== KEYPAD ====================
 static const byte KP_ROWS = 4;
 static const byte KP_COLS = 3;
@@ -45,6 +52,9 @@ static const byte KP_COLS = 3;
 #define LOCK_RETRY_MAX            3       // EC-21: Max unlock retry attempts
 #define LOCK_RETRY_DELAY_MS       1000    // Delay between retries (increased from 200 to give user time to open lid)
 #define LOCK_DEBOUNCE_MS          50      // EC-95: Reed switch debounce
+#define TAMPER_COOLDOWN_MS        60000   // Suppress repeat tamper reports for 60 s
+#define TAMPER_BOOT_GRACE_MS      8000    // Ignore tamper briefly after boot/reset (sensor settle)
+#define TAMPER_OPEN_CONFIRM_MS    1500    // Reed must stay OPEN this long before tamper latches
 #define LOCK_THERMAL_MAX_TEMP     80.0f   // EC-96: Modeled coil temp ceiling (C)
 #define LOCK_HEAT_PER_ACTUATION   15.0f   // C added per actuation
 #define LOCK_COOLING_RATE         0.05f   // C per ms of cooling
