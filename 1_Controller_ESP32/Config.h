@@ -45,6 +45,8 @@ static const byte KP_COLS = 3;
 #define WIFI_RETRY_MAX_MS         32000
 #define LCD_MESSAGE_DURATION      2000
 #define FACE_CHECK_TIMEOUT        15000
+#define FACE_CHECK_MAX_ATTEMPTS   3
+#define FACE_RETRY_DELAY_MS       1500
 #define DELIVERY_CONTEXT_FETCH_MS 1000
 
 // ==================== LOCK SAFETY (EC-21/22/95/96) ====================

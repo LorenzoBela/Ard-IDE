@@ -225,7 +225,14 @@ void fetchDeliveryContext() {
 }
 
 // ==================== REPORT EVENT ====================
-bool reportEventToProxy(bool otpValid, bool faceDetected, bool unlocked, bool thermalCutoff) {
+bool reportEventToProxy(bool otpValid,
+                        bool faceDetected,
+                        bool unlocked,
+                        bool thermalCutoff,
+                        uint8_t faceAttempts,
+                        bool faceRetryExhausted,
+                        bool fallbackRequired,
+                        const char *failureReason) {
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
@@ -233,13 +240,20 @@ bool reportEventToProxy(bool otpValid, bool faceDetected, bool unlocked, bool th
   char url[64];
   snprintf(url, sizeof(url), "http://%s:%d/event", PROXY_HOST, PROXY_PORT);
 
-  char json[256];
+  const char *safeReason =
+      (failureReason != NULL && failureReason[0] != '\0') ? failureReason : "";
+
+  char json[384];
   snprintf(json, sizeof(json),
            "{\"otp_valid\":%s,\"face_detected\":%s,\"unlocked\":%s,\"box_id\":"
-           "\"%s\",\"delivery_id\":\"%s\",\"thermal_cutoff\":%s}",
+           "\"%s\",\"delivery_id\":\"%s\",\"thermal_cutoff\":%s,"
+           "\"face_attempts\":%u,\"face_retry_exhausted\":%s,"
+           "\"fallback_required\":%s,\"failure_reason\":\"%s\"}",
            otpValid ? "true" : "false", faceDetected ? "true" : "false",
            unlocked ? "true" : "false", HARDWARE_ID, activeDeliveryId,
-           thermalCutoff ? "true" : "false");
+           thermalCutoff ? "true" : "false", (unsigned int)faceAttempts,
+           faceRetryExhausted ? "true" : "false",
+           fallbackRequired ? "true" : "false", safeReason);
 
   http.setTimeout(5000);
   http.begin(url);

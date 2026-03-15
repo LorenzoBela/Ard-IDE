@@ -44,7 +44,14 @@ void fetchDeliveryContext();
 
 /** Report lock event to proxy POST /event → Firebase.
  *  Returns true on HTTP 200/201. */
-bool reportEventToProxy(bool otpValid, bool faceDetected, bool unlocked, bool thermalCutoff = false);
+bool reportEventToProxy(bool otpValid,
+						bool faceDetected,
+						bool unlocked,
+						bool thermalCutoff = false,
+						uint8_t faceAttempts = 0,
+						bool faceRetryExhausted = false,
+						bool fallbackRequired = false,
+						const char *failureReason = "");
 
 /**
  * Report a safety/health alert to proxy POST /event → Firebase.

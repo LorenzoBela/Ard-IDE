@@ -1901,6 +1901,68 @@ static bool readTopLevelJsonBool(const String &json, const char *key, bool &outV
   return false;
 }
 
+static bool readTopLevelJsonInt(const String &json, const char *key, int &outVal) {
+  String token = "\"" + String(key) + "\":";
+  int depth = 0;
+  bool inString = false;
+  bool escaped = false;
+
+  for (int i = 0; i < json.length(); i++) {
+    char c = json[i];
+
+    if (!inString && c == '{') {
+      depth++;
+    } else if (!inString && c == '}') {
+      depth--;
+    }
+
+    if (!inString && depth == 1 && c == '"' && json.startsWith(token, i)) {
+      int v = i + token.length();
+      while (v < json.length() &&
+             (json[v] == ' ' || json[v] == '\t' || json[v] == '\r' ||
+              json[v] == '\n')) {
+        v++;
+      }
+
+      int sign = 1;
+      if (v < json.length() && json[v] == '-') {
+        sign = -1;
+        v++;
+      }
+
+      if (v >= json.length() || !isDigit(json[v])) {
+        return false;
+      }
+
+      long value = 0;
+      while (v < json.length() && isDigit(json[v])) {
+        value = (value * 10) + (json[v] - '0');
+        v++;
+      }
+      outVal = (int)(value * sign);
+      return true;
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (c == '"') {
+      inString = true;
+      continue;
+    }
+  }
+
+  return false;
+}
+
 // ==================== TAMPER CLEAR SUPPRESSION ====================
 // After admin clears tamper, permanently suppress new reed switch
 // events until the box is officially unlocked again.
@@ -2310,7 +2372,11 @@ void refreshDeliveryContextFromFirebase() {
 }
 
 // ==================== LOCK EVENT WRITER ====================
-void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked) {
+void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked,
+                              int faceAttempts = 0,
+                              bool faceRetryExhausted = false,
+                              bool fallbackRequired = false,
+                              const char *failureReason = "") {
   if (!lteConnected) {
     Serial.println("[EVENT] LTE not connected");
     return;
@@ -2322,13 +2388,19 @@ void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked) {
   strncpy(tsBuf, tsStr.c_str(), sizeof(tsBuf) - 1);
   tsBuf[sizeof(tsBuf) - 1] = '\0';
 
-  char eventJson[256];
+  char eventJson[384];
+  const char *safeReason =
+      (failureReason != NULL && failureReason[0] != '\0') ? failureReason : "";
   snprintf(eventJson, sizeof(eventJson),
            "{\"otp_valid\":%s,\"face_detected\":%s,\"unlocked\":%s,"
            "\"timestamp\":{\".sv\":\"timestamp\"},\"device_epoch\":%lu,"
-           "\"timestamp_str\":\"%s\"}",
+           "\"timestamp_str\":\"%s\",\"face_attempts\":%d,"
+           "\"face_retry_exhausted\":%s,\"fallback_required\":%s,"
+           "\"failure_reason\":\"%s\"}",
            otpValid ? "true" : "false", faceDetected ? "true" : "false",
-           unlocked ? "true" : "false", now_epoch, tsBuf);
+           unlocked ? "true" : "false", now_epoch, tsBuf, faceAttempts,
+           faceRetryExhausted ? "true" : "false",
+           fallbackRequired ? "true" : "false", safeReason);
 
   char eventPath[64];
   snprintf(eventPath, sizeof(eventPath), "/lock_events/%s/latest.json",
@@ -2786,7 +2858,7 @@ void handleCameraClient() {
   // â”€â”€ POST /event â”€â”€
   if (strcmp(method, "POST") == 0 && strcmp(reqPath, "/event") == 0) {
     Serial.println("[AP] -> POST /event");
-    char jsonBuf[256] = "";
+    char jsonBuf[384] = "";
     if (contentLength > 0 && contentLength < sizeof(jsonBuf)) {
       client.setTimeout(5000);
       size_t rd = client.readBytes(jsonBuf, contentLength);
@@ -2811,9 +2883,20 @@ void handleCameraClient() {
         writeTamperToFirebase();
       }
     } else {
+      String jsonStr = String(jsonBuf);
       bool ov = (strstr(jsonBuf, "\"otp_valid\":true") != NULL);
       bool fd = (strstr(jsonBuf, "\"face_detected\":true") != NULL);
       bool ul = (strstr(jsonBuf, "\"unlocked\":true") != NULL);
+      int faceAttempts = 0;
+      bool faceRetryExhausted = false;
+      bool fallbackRequired = false;
+      char failureReason[24] = "";
+
+      readTopLevelJsonInt(jsonStr, "face_attempts", faceAttempts);
+      readTopLevelJsonBool(jsonStr, "face_retry_exhausted", faceRetryExhausted);
+      readTopLevelJsonBool(jsonStr, "fallback_required", fallbackRequired);
+      readTopLevelJsonString(jsonStr, "failure_reason", failureReason,
+                             sizeof(failureReason));
       
       // Clear suppression only on a fully validated unlock event.
       // This prevents noisy/partial events from re-enabling tamper spam.
@@ -2828,7 +2911,8 @@ void handleCameraClient() {
       }
       
       // Also write alert events to the lock_events stream so it appears in web UI
-      writeLockEventToFirebase(ov, fd, ul);
+      writeLockEventToFirebase(ov, fd, ul, faceAttempts, faceRetryExhausted,
+                               fallbackRequired, failureReason);
     }
     
     return;

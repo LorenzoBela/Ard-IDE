@@ -64,6 +64,8 @@ static unsigned long lastDisplayCheck         = 0;
 
 // ── Face check ──
 static bool faceCheckPending = false;
+static uint8_t faceAttemptCount = 0;
+static unsigned long nextFaceAttemptAt = 0;
 
 // ── Safety modules ──
 static AdminOverride adminOverride;
@@ -72,6 +74,7 @@ static KeypadHealth  keypadHealth;
 // ── Forward declarations ──
 void enterState(TesterState newState);
 void handleStateMachine(unsigned long now);
+void resetFaceSession();
 
 // ==================== SETUP ====================
 void setup() {
@@ -234,6 +237,12 @@ void loop() {
   handleStateMachine(now);
 }
 
+void resetFaceSession() {
+  faceCheckPending = false;
+  faceAttemptCount = 0;
+  nextFaceAttemptAt = 0;
+}
+
 // ==================== STATE MACHINE ====================
 void handleStateMachine(unsigned long now) {
   switch (currentState) {
@@ -347,6 +356,7 @@ void handleStateMachine(unsigned long now) {
     if (strcmp(inputCode, currentOtp) == 0) {
       netLog("[OTP] CORRECT! Requesting face check...\n");
       resetOtpAttempts();
+      resetFaceSession();
 
       if (!isDisplayFailed()) {
         updateDisplay("PIN Correct!", "Face check...");
@@ -384,7 +394,20 @@ void handleStateMachine(unsigned long now) {
 
   case STATE_REQUESTING_FACE:
     if (!faceCheckPending) {
+      if (faceAttemptCount > 0 && now < nextFaceAttemptAt) {
+        break;
+      }
+
       faceCheckPending = true;
+      faceAttemptCount++;
+      netLog("[FACE] Attempt %u/%u\n", faceAttemptCount,
+             (unsigned int)FACE_CHECK_MAX_ATTEMPTS);
+      if (!isDisplayFailed()) {
+        char attemptLine[17];
+        snprintf(attemptLine, sizeof(attemptLine), "Attempt %u/%u", faceAttemptCount,
+                 (unsigned int)FACE_CHECK_MAX_ATTEMPTS);
+        updateDisplay("Face scanning...", attemptLine);
+      }
 
       int result = requestFaceCheck();
       faceCheckPending = false;
@@ -392,25 +415,42 @@ void handleStateMachine(unsigned long now) {
       if (result == 1) {
         netLog("[FACE] DETECTED! Unlocking solenoid...\n");
         enterState(STATE_UNLOCKING);
-        reportEventToProxy(true, true, true, false);
-      } else if (result == 0) {
-        netLog("[FACE] NOT DETECTED! Box stays locked.\n");
-        if (!isDisplayFailed()) {
-          updateDisplay("No face found!", "Box stays locked");
-        } else {
-          fallbackError();
-        }
-        reportEventToProxy(true, false, false, false);
-        messageStartAt = millis();
-        currentState = STATE_SHOW_MESSAGE;
+        reportEventToProxy(true, true, true, false, faceAttemptCount, false,
+                           false, "");
       } else {
-        netLog("[FACE] Check failed (camera offline?)\n");
+        bool noFace = (result == 0);
+        const char *reason = noFace ? "NO_FACE" : "CAMERA_ERROR";
+        bool exhausted = (faceAttemptCount >= FACE_CHECK_MAX_ATTEMPTS);
+
+        if (!exhausted) {
+          nextFaceAttemptAt = millis() + FACE_RETRY_DELAY_MS;
+          netLog("[FACE] %s — retrying in %ums (%u/%u)\n", reason,
+                 (unsigned int)FACE_RETRY_DELAY_MS, faceAttemptCount,
+                 (unsigned int)FACE_CHECK_MAX_ATTEMPTS);
+          if (!isDisplayFailed()) {
+            char retryLine[17];
+            snprintf(retryLine, sizeof(retryLine), "Retry %u/%u", faceAttemptCount + 1,
+                     (unsigned int)FACE_CHECK_MAX_ATTEMPTS);
+            updateDisplay(noFace ? "No face found" : "Camera error", retryLine);
+          } else {
+            fallbackError();
+          }
+          reportEventToProxy(true, false, false, false, faceAttemptCount,
+                             false, false, reason);
+          break;
+        }
+
+        netLog("[FACE] %s after %u attempts — fallback required\n", reason,
+               faceAttemptCount);
         if (!isDisplayFailed()) {
-          updateDisplay("Camera offline!", "Box stays locked");
+          updateDisplay("Face check failed", "Use rider fallback");
         } else {
           fallbackError();
         }
-        reportEventToProxy(true, false, false, false);
+        reportEventToProxy(true, false, false, false, faceAttemptCount, true,
+                           true, reason);
+        inputLen = 0;
+        inputCode[0] = '\0';
         messageStartAt = millis();
         currentState = STATE_SHOW_MESSAGE;
       }
@@ -504,7 +544,7 @@ void enterState(TesterState newState) {
     }
     inputLen = 0;
     inputCode[0] = '\0';
-    faceCheckPending = false;
+    resetFaceSession();
     adminOverride.clear();
     break;
   case STATE_IDLE:
@@ -523,7 +563,7 @@ void enterState(TesterState newState) {
     }
     inputLen = 0;
     inputCode[0] = '\0';
-    faceCheckPending = false;
+    resetFaceSession();
     break;
   case STATE_CONNECTING_WIFI:
     if (!isDisplayFailed()) {
