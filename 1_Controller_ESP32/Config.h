@@ -49,6 +49,16 @@ static const byte KP_COLS = 3;
 #define FACE_RETRY_DELAY_MS       1500
 #define DELIVERY_CONTEXT_FETCH_MS 1000
 
+// ==================== UTILITY DIAGNOSTICS MODE ====================
+#define CONTROLLER_DIAG_UTILITY_TIMEOUT_MS 5000
+#define CONTROLLER_DIAG_STANDBY_REFRESH_MS 30000
+#define CONTROLLER_DIAG_IDLE_REFRESH_MS 10000
+#define CONTROLLER_DIAG_UTILITY_REFRESH_MS 1000
+#define CONTROLLER_DIAG_STALE_MS 15000
+#define CONTROLLER_DIAG_HTTP_TIMEOUT_MS 300
+#define CONTROLLER_DIAG_RETRY_BASE_MS 1000
+#define CONTROLLER_DIAG_RETRY_MAX_MS 8000
+
 // ==================== LOCK SAFETY (EC-21/22/95/96) ====================
 #define LOCK_MAX_ACTIVE_MS        10000   // Hard thermal cutoff (10 sec hold)
 #define LOCK_RETRY_MAX            3       // EC-21: Max unlock retry attempts
@@ -70,6 +80,7 @@ static const byte KP_COLS = 3;
 #define DISPLAY_HEALTH_CHECK_MS   10000   // Check LCD I2C every 10 s
 #define DISPLAY_I2C_ADDR          0x27    // PCF8574 backpack
 #define DISPLAY_MAX_FAILURES      3       // Consecutive I2C fails -> FAILED
+#define CONTROLLER_CAM_POWER_CMD_COOLDOWN_MS 15000 // Avoid command spam
 
 // ==================== KEYPAD HEALTH (EC-82) ====================
 #define KEYPAD_STUCK_THRESHOLD_MS 30000   // 30 s continuous hold = stuck

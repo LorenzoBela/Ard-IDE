@@ -71,6 +71,8 @@ uint8_t boxNum       = 0;
 #define GPS_INTERVAL_LOCKED 2000   // Normal polling once fix acquired
 #define FIREBASE_INTERVAL 3000
 #define SIGNAL_INTERVAL 10000
+#define IDLE_POLL_MULTIPLIER 2
+#define IDLE_GPS_POLL_MULTIPLIER 3
 #define TIME_SYNC_INTERVAL 1800000 // Re-sync time every 30 minutes
 
 // Reliability
@@ -98,6 +100,8 @@ double gpsLat = 0, gpsLon = 0;
 double gpsHdop = 99.9; // Horizontal Dilution of Precision (99.9 = unknown)
 float  gpsSpeed = 0.0f; // Speed in knots from CGNSSINFO, converted to m/s
 bool gpsFix = false;
+int cachedSignalRssi = -999;
+int cachedSignalCsq = -1;
 unsigned long dataBytesOut = 0; // Total bytes sent to Firebase
 
 // Hotspot / camera proxy
@@ -1380,6 +1384,8 @@ void sendToFirebase() {
   // Read signal/operator once (avoid multiple AT round-trips)
   int rssi = getSignal();
   int csq = modem.getSignalQuality();
+  cachedSignalRssi = rssi;
+  cachedSignalCsq = csq;
   String opStr = modem.getOperator();
   char opBuf[32];
   strncpy(opBuf, opStr.c_str(), sizeof(opBuf) - 1);
@@ -2603,6 +2609,50 @@ String forwardFaceCheck(String deliveryId) {
   return result;
 }
 
+String forwardCameraPowerCommand(const String &mode) {
+  if (!camClientKnown) {
+    camClientIP = IPAddress(192, 168, 4, 10);
+  }
+
+  WiFiClient camClient;
+  if (!camClient.connect(camClientIP, CAM_FACE_PORT)) {
+    Serial.println("[CAM] Cannot connect to ESP32-CAM for power command");
+    return "ERROR:cam_unreachable";
+  }
+
+  camClient.print("GET /cam-power?mode=");
+  camClient.print(mode);
+  camClient.print(" HTTP/1.1\r\nHost: ");
+  camClient.print(camClientIP.toString());
+  camClient.print("\r\nConnection: close\r\n\r\n");
+
+  unsigned long waitStart = millis();
+  String result = "";
+  bool headersEnded = false;
+  while (millis() - waitStart < 4000) {
+    if (camClient.available()) {
+      String line = camClient.readStringUntil('\n');
+      line.trim();
+      if (!headersEnded) {
+        if (line.length() == 0) {
+          headersEnded = true;
+        }
+      } else {
+        result = line;
+        break;
+      }
+    } else {
+      delay(10);
+    }
+    esp_task_wdt_reset();
+  }
+
+  camClient.stop();
+  Serial.printf("[CAM] Power mode=%s response: %s\n", mode.c_str(),
+                result.c_str());
+  return result.length() > 0 ? result : "ERROR:cam_timeout";
+}
+
 // ==================== HOTSPOT HTTP ROUTER ====================
 void handleCameraClient() {
   WiFiClient client = camServer.available();
@@ -2705,13 +2755,17 @@ void handleCameraClient() {
                       geoProxy.snap.distanceM, geoOverride.c_str());
       }
     } else {
-      // Fallback
-      if (returnActive) {
-        otpPart = returnOtpCacheValid ? String(cachedReturnOtp) : "NO_OTP";
-      } else {
-        otpPart = otpCacheValid ? String(cachedOtp) : "NO_OTP";
-      }
+      // Fail closed when geofence cannot be evaluated (no GPS fix / invalid coords).
+      // This keeps OTP/PIN strictly gated by location verification.
+      otpPart = "NO_OTP";
       delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
+      if (String(cachedDeliveryStatus) == "PICKED_UP" || String(cachedDeliveryStatus) == "IN_TRANSIT" || String(cachedDeliveryStatus) == "\"PICKED_UP\"") {
+        geoOverride = "GEO_TRANSIT_DROP";
+      } else {
+        geoOverride = "GEO_TRANSIT_PICK";
+      }
+      Serial.printf("[AP] OTP suppressed — geofence unavailable (gpsFix=%d destValid=%d) Status: %s\n",
+                    gpsFix ? 1 : 0, destCoordsValid ? 1 : 0, geoOverride.c_str());
     }
 
     String body = otpPart + "," + delPart;
@@ -2855,6 +2909,39 @@ void handleCameraClient() {
     return;
   }
 
+  // â”€â”€ GET /cam-power?mode=sleep|wake â”€â”€
+  if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/cam-power")) {
+    String mode = "";
+    int qIdx = reqPathStr.indexOf("?mode=");
+    if (qIdx >= 0) {
+      mode = reqPathStr.substring(qIdx + 6);
+    }
+    mode.toLowerCase();
+
+    if (mode != "sleep" && mode != "wake") {
+      String body = "ERROR:invalid_mode";
+      String resp =
+          "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\n"
+          "Content-Length: " +
+          String(body.length()) + "\r\n\r\n" + body;
+      client.print(resp);
+      client.flush();
+      delay(10);
+      client.stop();
+      return;
+    }
+
+    String result = forwardCameraPowerCommand(mode);
+    String resp =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+        String(result.length()) + "\r\n\r\n" + result;
+    client.print(resp);
+    client.flush();
+    delay(10);
+    client.stop();
+    return;
+  }
+
   // â”€â”€ POST /event â”€â”€
   if (strcmp(method, "POST") == 0 && strcmp(reqPath, "/event") == 0) {
     Serial.println("[AP] -> POST /event");
@@ -2915,6 +3002,30 @@ void handleCameraClient() {
                                fallbackRequired, failureReason);
     }
     
+    return;
+  }
+
+  // â”€â”€ GET /diag â”€â”€
+  if (strcmp(method, "GET") == 0 && strcmp(reqPath, "/diag") == 0) {
+    char body[192];
+    snprintf(body, sizeof(body),
+             "batt_pct=%d,batt_v=%.2f,rssi=%d,csq=%d,gps_fix=%d,lte=%d,modem=%d,time=%d,fb_fail=%u,uptime=%lu",
+             batteryGetPercentage(), batteryGetVoltage(),
+             cachedSignalRssi, cachedSignalCsq,
+             gpsFix ? 1 : 0,
+             lteConnected ? 1 : 0,
+             modemOK ? 1 : 0,
+             timeSynced ? 1 : 0,
+             (unsigned int)firebaseFailures,
+             (unsigned long)millis());
+
+    String resp =
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n"
+        "Content-Length: " + String(strlen(body)) + "\r\n\r\n" + String(body);
+    client.print(resp);
+    client.flush();
+    delay(10);
+    client.stop();
     return;
   }
 
@@ -3334,6 +3445,17 @@ void loop() {
     modemRetryAt = now + modemRetryBackoffMs;
   }
 
+    bool hasActiveDelivery = deliveryIdCacheValid && cachedDeliveryId[0] != '\0';
+    bool idlePowerMode = !hasActiveDelivery;
+    unsigned long signalInterval =
+      idlePowerMode ? (SIGNAL_INTERVAL * IDLE_POLL_MULTIPLIER) : SIGNAL_INTERVAL;
+    unsigned long firebaseInterval = idlePowerMode
+                       ? (FIREBASE_INTERVAL * IDLE_POLL_MULTIPLIER)
+                       : FIREBASE_INTERVAL;
+    unsigned long deliveryReadInterval =
+      idlePowerMode ? (DELIVERY_CONTEXT_READ_INTERVAL * IDLE_POLL_MULTIPLIER)
+            : DELIVERY_CONTEXT_READ_INTERVAL;
+
   // Handle incoming camera image upload (non-blocking when idle)
   if (apStarted) {
     handleCameraClient();
@@ -3352,8 +3474,12 @@ void loop() {
   }
 
   // Check LTE connection periodically
-  if (now - lastSig >= SIGNAL_INTERVAL) {
+  if (now - lastSig >= signalInterval) {
     if (lteConnected && modemOK) {
+      cachedSignalCsq = modem.getSignalQuality();
+      cachedSignalRssi = (cachedSignalCsq == 99 || cachedSignalCsq == 0)
+                             ? -999
+                             : -113 + (2 * cachedSignalCsq);
       if (!modem.isGprsConnected()) {
         Serial.println("LTE: Connection lost, reconnecting...");
         lteConnected = false;
@@ -3376,8 +3502,10 @@ void loop() {
   }
 
   // Read GPS (poll faster while acquiring fix, slower once locked)
-  unsigned long gpsInterval =
-      gpsFix ? GPS_INTERVAL_LOCKED : GPS_INTERVAL_ACQUIRING;
+  unsigned long gpsInterval = gpsFix ? GPS_INTERVAL_LOCKED : GPS_INTERVAL_ACQUIRING;
+  if (idlePowerMode) {
+    gpsInterval *= IDLE_GPS_POLL_MULTIPLIER;
+  }
   if (modemOK && gpsEnabled && now - lastGps >= gpsInterval) {
     readGPS();
     lastGps = now;
@@ -3439,15 +3567,14 @@ void loop() {
   }
 
   // Send to Firebase
-  if (lteConnected && now - lastFB >= FIREBASE_INTERVAL) {
+  if (lteConnected && now - lastFB >= firebaseInterval) {
     sendToFirebase();
     lastFB = now;
   }
 
   // Refresh cached Delivery Context from Firebase (for Tester ESP32 /otp
   // endpoint)
-  if (lteConnected &&
-      now - lastDeliveryContextRead >= DELIVERY_CONTEXT_READ_INTERVAL) {
+  if (lteConnected && now - lastDeliveryContextRead >= deliveryReadInterval) {
     refreshDeliveryContextFromFirebase();
     checkAndClearTamperFromFirebase();
     lastDeliveryContextRead = now;

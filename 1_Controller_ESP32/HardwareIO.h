@@ -20,6 +20,12 @@ void initHardwareIO();
 /** Update LCD without flicker (space-padded overwrite). */
 void updateDisplay(const char *line0, const char *line1);
 
+/** Enable LCD backlight if it is currently off. */
+void displayBacklightOn();
+
+/** Disable LCD backlight to reduce idle power draw. */
+void displayBacklightOff();
+
 /** Read one keypad character (non-blocking). Returns '\0' if nothing pressed. */
 char readKeypad();
 

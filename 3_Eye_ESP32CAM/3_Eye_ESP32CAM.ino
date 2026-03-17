@@ -94,6 +94,7 @@ static unsigned long lastUploadAt = 0;
 static unsigned long scanCount = 0;
 static unsigned long personCount = 0;
 static bool cameraInDetectMode = true;
+static bool cameraSleepMode = false;
 
 // Deferred upload flag — set by face-check handlers, executed in loop()
 static bool pendingUpload = false;
@@ -761,6 +762,32 @@ void setup() {
   Serial.println(F("Face detection active. Waiting for faces..."));
 }
 
+bool setCameraSleepMode(bool sleepMode) {
+  if (sleepMode == cameraSleepMode) {
+    return true;
+  }
+
+  if (sleepMode) {
+    esp_camera_deinit();
+    pinMode(PWDN_GPIO_NUM, OUTPUT);
+    digitalWrite(PWDN_GPIO_NUM, HIGH);
+    pendingUpload = false;
+    uploadInProgress = false;
+    cameraSleepMode = true;
+    cameraInDetectMode = false;
+    netLog("[POWER] Camera sleep mode enabled\n");
+    return true;
+  }
+
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, LOW);
+  delay(20);
+  bool ok = initCamera();
+  cameraSleepMode = !ok;
+  netLog("[POWER] Camera wake %s\n", ok ? "OK" : "FAIL");
+  return ok;
+}
+
 // ===================== FACE-STATUS HTTP HANDLER =====================
 // Responds to GET /face-status from the GPS/LTE proxy board.
 // Runs face detection on demand. Responds IMMEDIATELY, then defers upload
@@ -784,6 +811,47 @@ void handleFaceStatusClient() {
 
   String requestLine = client.readStringUntil('\n');
   requestLine.trim();
+
+  if (requestLine.startsWith("GET /cam-power")) {
+    int qIdx = requestLine.indexOf("?mode=");
+    String mode = "";
+    if (qIdx >= 0) {
+      int spIdx = requestLine.indexOf(' ', qIdx);
+      if (spIdx > qIdx) {
+        mode = requestLine.substring(qIdx + 6, spIdx);
+      }
+    }
+    mode.toLowerCase();
+
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) {
+        break;
+      }
+    }
+
+    String result = "CAM_MODE_INVALID";
+    if (mode == "sleep") {
+      result = setCameraSleepMode(true) ? "CAM_SLEEP_OK" : "CAM_SLEEP_FAIL";
+    } else if (mode == "wake") {
+      result = setCameraSleepMode(false) ? "CAM_WAKE_OK" : "CAM_WAKE_FAIL";
+    }
+
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+             "HTTP/1.1 200 OK\r\n"
+             "Content-Type: text/plain\r\n"
+             "Content-Length: %d\r\n"
+             "Connection: close\r\n\r\n"
+             "%s",
+             (int)result.length(), result.c_str());
+    client.print(resp);
+    client.flush();
+    delay(20);
+    client.stop();
+    return;
+  }
 
   if (!requestLine.startsWith("GET /face-status")) {
     netLog("[HTTP] Ignoring request: %s\n", requestLine.c_str());
@@ -826,7 +894,10 @@ void handleFaceStatusClient() {
   }
 
   // Run repeated face detection in a window (old working logic style)
-  bool faceFound = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS);
+  bool faceFound = false;
+  if (!cameraSleepMode) {
+    faceFound = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS);
+  }
 
   const char *result;
   if (faceFound) {
@@ -914,6 +985,11 @@ void handleUartFaceCommand() {
   }
 
   netLog("[UART] Face check requested from Tester board\n");
+
+  if (cameraSleepMode) {
+    Serial2.println("NO_FACE");
+    return;
+  }
 
   // Run repeated face detection in a window (old working logic style)
   bool detected = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS);

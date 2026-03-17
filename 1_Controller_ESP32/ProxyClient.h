@@ -23,6 +23,19 @@ extern bool  hasActiveDelivery;
 // ── Last parsed status command from proxy ("UNLOCKING" / "LOCKED" / "") ──
 extern String lastStatusCommand;
 
+struct ControllerDiagData {
+	int battPct;
+	float battVoltage;
+	int rssi;
+	int csq;
+	bool gpsFix;
+	bool lteConnected;
+	bool modemOk;
+	bool timeSynced;
+	int firebaseFailures;
+	unsigned long proxyUptimeMs;
+};
+
 // ── Public API ──
 
 /** printf-style logging to Serial + UDP broadcast. */
@@ -41,6 +54,9 @@ void startWiFiConnection();
 /** Fetch OTP + delivery_id + optional status from proxy GET /otp.
  *  Updates currentOtp, activeDeliveryId, hasActiveDelivery, lastStatusCommand. */
 void fetchDeliveryContext();
+
+/** Fetch cached diagnostics from proxy GET /diag (non-blocking budget). */
+bool fetchDiagnostics(ControllerDiagData &out);
 
 /** Report lock event to proxy POST /event → Firebase.
  *  Returns true on HTTP 200/201. */
@@ -66,6 +82,12 @@ bool reportAlertToProxy(const char *alertType, const char *details);
 /** Request face check via proxy GET /face-check, with UART Serial2 fallback.
  *  Returns: 1 = face detected, 0 = no face, -1 = error/timeout. */
 int requestFaceCheck();
+
+/**
+ * Request camera power mode via proxy GET /cam-power?mode=<sleep|wake>.
+ * Returns true when proxy confirms command delivery.
+ */
+bool requestCameraPowerMode(bool wakeMode);
 
 /** Report reed switch tamper (unauthorized lid-open) to Proxy.
  *  Proxy writes tamper state to Firebase, triggering push notifications. */

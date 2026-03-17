@@ -25,6 +25,11 @@ static unsigned long tamperLastAt    = 0;     // cooldown: millis() of last trig
 static unsigned long lockInitAt      = 0;     // millis() at initLock()
 static unsigned long reedOpenSince   = 0;     // millis() when stable OPEN began
 static bool          prevQualifiedOpen = false;
+static volatile bool reedEdgeSeen = false;
+
+static void IRAM_ATTR reedSwitchISR() {
+  reedEdgeSeen = true;
+}
 
 // ── Internal helpers ──
 static bool readReedRaw() {
@@ -63,6 +68,10 @@ void initLock() {
   lockInitAt = millis();
   reedOpenSince = reedStable ? 0 : lockInitAt;
   prevQualifiedOpen = false;
+
+  // Keep reed interrupt active in every firmware state.
+  attachInterrupt(digitalPinToInterrupt(REED_SWITCH_PIN), reedSwitchISR,
+                  CHANGE);
 
   Serial.printf("[REED] boot raw=%d interpreted=%s (REED_CLOSED_IS_HIGH=%d)\n",
                 digitalRead(REED_SWITCH_PIN),
@@ -114,6 +123,11 @@ LockStatus tryLock(bool ignoreReed) {
 }
 
 bool maintainLockSafety(unsigned long now) {
+  if (reedEdgeSeen) {
+    // ISR only marks that an edge occurred; filtering remains here.
+    reedEdgeSeen = false;
+  }
+
   // ── EC-95: Debounce reed switch ──
   bool raw = readReedRaw();
   if (raw != reedRaw) {

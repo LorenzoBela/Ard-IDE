@@ -70,11 +70,249 @@ static unsigned long nextFaceAttemptAt = 0;
 // ── Safety modules ──
 static AdminOverride adminOverride;
 static KeypadHealth  keypadHealth;
+enum ControllerPowerPolicy {
+  POWER_POLICY_ACTIVE,
+  POWER_POLICY_IDLE
+};
+
+static ControllerPowerPolicy powerPolicy = POWER_POLICY_ACTIVE;
+static unsigned long lastCamPowerCmdAt = 0;
+static bool cameraSleepExpected = false;
+
+static ControllerDiagData diagCache = {
+  0,
+  0.0f,
+  -999,
+  -1,
+  false,
+  false,
+  false,
+  false,
+  0,
+  0
+};
+static bool diagCacheValid = false;
+static unsigned long diagLastSuccessAt = 0;
+static unsigned long diagNextPollAt = 0;
+static unsigned long diagRetryBackoffMs = CONTROLLER_DIAG_RETRY_BASE_MS;
+static uint32_t diagSuccessCount = 0;
+static uint32_t diagFailCount = 0;
+static uint32_t diagStaleDisplayCount = 0;
+
+static bool utilityModeActive = false;
+static char utilityModeKey = '\0';
+static unsigned long utilityModeExpiresAt = 0;
 
 // ── Forward declarations ──
 void enterState(TesterState newState);
 void handleStateMachine(unsigned long now);
 void resetFaceSession();
+void applyIdlePowerPolicy(unsigned long now);
+void applyActivePowerPolicy(unsigned long now);
+void pollDiagnosticsIfDue(unsigned long now);
+void startUtilityMode(char utilityKey, unsigned long now);
+void renderUtilityMode(unsigned long now);
+void stopUtilityMode(unsigned long now);
+
+static bool hasLoadedOtp() {
+  return currentOtp[0] != '\0';
+}
+
+static bool isGeoTransitStatus() {
+  return lastStatusCommand == "GEO_TRANSIT_DROP" ||
+         lastStatusCommand == "GEO_TRANSIT_PICK";
+}
+
+static bool isGeoPickupStatus() {
+  return lastStatusCommand == "GEO_PICKUP";
+}
+
+static bool isPinEligibleNow() {
+  if (!hasActiveDelivery || !hasLoadedOtp()) {
+    return false;
+  }
+  // GEO transit/pickup statuses are never PIN-eligible.
+  if (isGeoTransitStatus() || isGeoPickupStatus()) {
+    return false;
+  }
+  // Dropoff-arrived and return mode remain PIN-eligible.
+  return true;
+}
+
+static void renderIdleJourneyStatus() {
+  if (!hasActiveDelivery) {
+    updateDisplay("Box Ready", "No Delivery");
+    return;
+  }
+
+  if (lastStatusCommand == "GEO_TRANSIT_DROP") {
+    updateDisplay("In Transit", "Head to Dropoff");
+    return;
+  }
+
+  if (lastStatusCommand == "GEO_PICKUP") {
+    updateDisplay("Ongoing Pickup", "Please wait...");
+    return;
+  }
+
+  if (lastStatusCommand == "GEO_TRANSIT_PICK") {
+    updateDisplay("In Transit", "Head to Pickup");
+    return;
+  }
+
+  if (isPinEligibleNow()) {
+    if (lastStatusCommand == "RETURNING") {
+      updateDisplay("Return PIN:", "PIN: ");
+    } else {
+      updateDisplay("Enter PIN:", "PIN: ");
+    }
+    return;
+  }
+
+  // Newly assigned or status-missing phase defaults to pickup guidance.
+  updateDisplay("Head to Pickup", "Await geofence");
+}
+
+static bool isUtilityKey(char key) {
+  return key == '1' || key == '2' || key == '3';
+}
+
+static bool isDiagnosticsFresh(unsigned long now) {
+  return diagCacheValid && (now - diagLastSuccessAt <= CONTROLLER_DIAG_STALE_MS);
+}
+
+static unsigned long getDiagRefreshInterval() {
+  if (utilityModeActive) {
+    return CONTROLLER_DIAG_UTILITY_REFRESH_MS;
+  }
+  if (currentState == STATE_STANDBY) {
+    return CONTROLLER_DIAG_STANDBY_REFRESH_MS;
+  }
+  if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN) {
+    return CONTROLLER_DIAG_IDLE_REFRESH_MS;
+  }
+  return CONTROLLER_DIAG_STANDBY_REFRESH_MS;
+}
+
+void renderUtilityMode(unsigned long now) {
+  if (isDisplayFailed()) {
+    fallbackKeyFeedback();
+    return;
+  }
+
+  char line0[17] = "";
+  char line1[17] = "";
+  bool fresh = isDiagnosticsFresh(now);
+
+  if (utilityModeKey == '1') {
+    snprintf(line0, sizeof(line0), "Battery %3d%%", diagCache.battPct);
+    snprintf(line1, sizeof(line1), "%0.2fV %s", diagCache.battVoltage,
+             fresh ? "LIVE" : (diagCacheValid ? "STALE" : "NO DATA"));
+  } else if (utilityModeKey == '2') {
+    if (diagCache.rssi <= -998) {
+      snprintf(line0, sizeof(line0), "LTE signal N/A");
+    } else {
+      snprintf(line0, sizeof(line0), "LTE %d dBm", diagCache.rssi);
+    }
+    snprintf(line1, sizeof(line1), "GPS:%s %s", diagCache.gpsFix ? "LOCK" : "WAIT",
+             fresh ? "LIVE" : (diagCacheValid ? "STALE" : "NO DATA"));
+  } else {
+    const char *backend = "OK";
+    if (!diagCache.lteConnected || !diagCache.modemOk) {
+      backend = "OFF";
+    } else if (!diagCache.timeSynced || diagCache.firebaseFailures > 0) {
+      backend = "DEGR";
+    }
+    snprintf(line0, sizeof(line0), "Backend: %s", backend);
+    snprintf(line1, sizeof(line1), "LTE:%d FB:%d", diagCache.lteConnected ? 1 : 0,
+             diagCache.firebaseFailures);
+  }
+
+  updateDisplay(line0, line1);
+  if (!fresh && diagCacheValid) {
+    diagStaleDisplayCount++;
+  }
+}
+
+void startUtilityMode(char utilityKey, unsigned long now) {
+  utilityModeActive = true;
+  utilityModeKey = utilityKey;
+  utilityModeExpiresAt = now + CONTROLLER_DIAG_UTILITY_TIMEOUT_MS;
+  displayBacklightOn();
+  renderUtilityMode(now);
+  if (diagNextPollAt > now) {
+    diagNextPollAt = now;
+  }
+}
+
+void stopUtilityMode(unsigned long now) {
+  if (!utilityModeActive) {
+    return;
+  }
+
+  utilityModeActive = false;
+  utilityModeKey = '\0';
+  utilityModeExpiresAt = 0;
+
+  if (currentState == STATE_STANDBY) {
+    displayBacklightOff();
+  } else if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN) {
+    renderIdleJourneyStatus();
+  }
+
+  diagNextPollAt = now + getDiagRefreshInterval();
+}
+
+void pollDiagnosticsIfDue(unsigned long now) {
+  if (WiFi.status() != WL_CONNECTED || currentState == STATE_CONNECTING_WIFI) {
+    return;
+  }
+
+  if (!(currentState == STATE_STANDBY || currentState == STATE_IDLE ||
+        currentState == STATE_ENTERING_PIN)) {
+    return;
+  }
+
+  if (now < diagNextPollAt) {
+    return;
+  }
+
+  unsigned long interval = getDiagRefreshInterval();
+  ControllerDiagData data = diagCache;
+  bool ok = fetchDiagnostics(data);
+  if (ok) {
+    diagCache = data;
+    diagCacheValid = true;
+    diagLastSuccessAt = now;
+    diagRetryBackoffMs = CONTROLLER_DIAG_RETRY_BASE_MS;
+    diagNextPollAt = now + interval;
+    diagSuccessCount++;
+
+    if (utilityModeActive) {
+      renderUtilityMode(now);
+    }
+  } else {
+    diagFailCount++;
+    if (diagRetryBackoffMs < CONTROLLER_DIAG_RETRY_MAX_MS) {
+      diagRetryBackoffMs *= 2;
+      if (diagRetryBackoffMs > CONTROLLER_DIAG_RETRY_MAX_MS) {
+        diagRetryBackoffMs = CONTROLLER_DIAG_RETRY_MAX_MS;
+      }
+    }
+    unsigned long retryDelay = diagRetryBackoffMs;
+    if (retryDelay > interval) {
+      retryDelay = interval;
+    }
+    diagNextPollAt = now + retryDelay;
+  }
+
+  if ((diagSuccessCount + diagFailCount) % 20 == 0) {
+    netLog("[DIAG] success=%lu fail=%lu stale=%lu\n",
+           (unsigned long)diagSuccessCount,
+           (unsigned long)diagFailCount,
+           (unsigned long)diagStaleDisplayCount);
+  }
+}
 
 // ==================== SETUP ====================
 void setup() {
@@ -196,13 +434,6 @@ void loop() {
           reportCommandAckToProxy("LOCKED", "executed", "already_locked");
           // Optionally go to relocking state to show message, or stay in current state
         }
-      } else if (lastStatusCommand.length() > 0) {
-        netLog("[EC-77] Remote command '%s' received but not actionable in state=%d\n",
-               lastStatusCommand.c_str(), (int)currentState);
-        lastStatusCommand = ""; // Clear invalid command
-        char stateDetail[32];
-        snprintf(stateDetail, sizeof(stateDetail), "state_%d", (int)currentState);
-        reportCommandAckToProxy(lastStatusCommand.c_str(), "rejected_state", stateDetail);
       }
     }
   }
@@ -214,6 +445,12 @@ void loop() {
                          isDisplayFailed() ? "lcd_dead" : "lcd_degraded");
     }
     lastDisplayCheck = now;
+  }
+
+  // ── 4b. Utility diagnostics refresh and timeout handling ──
+  pollDiagnosticsIfDue(now);
+  if (utilityModeActive && now >= utilityModeExpiresAt) {
+    stopUtilityMode(now);
   }
 
   // ── 5. EC-82: Keypad stuck detection ──
@@ -243,6 +480,39 @@ void resetFaceSession() {
   nextFaceAttemptAt = 0;
 }
 
+void applyIdlePowerPolicy(unsigned long now) {
+  if (powerPolicy == POWER_POLICY_IDLE) {
+    displayBacklightOff();
+    return;
+  }
+
+  powerPolicy = POWER_POLICY_IDLE;
+  displayBacklightOff();
+
+  if (lastCamPowerCmdAt == 0 ||
+      now - lastCamPowerCmdAt >= CONTROLLER_CAM_POWER_CMD_COOLDOWN_MS) {
+    requestCameraPowerMode(false);
+    lastCamPowerCmdAt = now;
+  }
+
+  cameraSleepExpected = true;
+  netLog("[POWER] Idle policy active: LCD off, CAM sleep requested\n");
+}
+
+void applyActivePowerPolicy(unsigned long now) {
+  if (powerPolicy != POWER_POLICY_ACTIVE) {
+    powerPolicy = POWER_POLICY_ACTIVE;
+    displayBacklightOn();
+  }
+
+  if (cameraSleepExpected) {
+    if (requestCameraPowerMode(true)) {
+      cameraSleepExpected = false;
+    }
+    lastCamPowerCmdAt = now;
+  }
+}
+
 // ==================== STATE MACHINE ====================
 void handleStateMachine(unsigned long now) {
   switch (currentState) {
@@ -262,7 +532,12 @@ void handleStateMachine(unsigned long now) {
       break;
     }
     char standbyKey = readKeypad();
+    if (standbyKey && isUtilityKey(standbyKey)) {
+      startUtilityMode(standbyKey, now);
+      break;
+    }
     if (standbyKey && standbyKey != '*') {
+      displayBacklightOn();
       if (!isDisplayFailed()) {
         updateDisplay("No active order", "Please wait...");
       } else {
@@ -286,14 +561,19 @@ void handleStateMachine(unsigned long now) {
       }
 
       if (key == '*') {
+        stopUtilityMode(now);
         inputLen = 0;
         inputCode[0] = '\0';
         enterState(STATE_IDLE);
       } else if (key == '#') {
+        stopUtilityMode(now);
         if (inputLen > 0) enterState(STATE_VERIFYING_OTP);
+      } else if (isUtilityKey(key) && ((currentState == STATE_IDLE && inputLen == 0) || utilityModeActive || !isPinEligibleNow())) {
+        startUtilityMode(key, now);
       } else if (inputLen < 6) {
-        // Enforce geofence lock: no PIN entry unless OTP exists
-        if (currentOtp[0] != '\0') {
+        // Enforce geofence lock: no PIN entry unless journey phase is PIN-eligible.
+        if (isPinEligibleNow()) {
+          stopUtilityMode(now);
           inputCode[inputLen++] = key;
           inputCode[inputLen] = '\0';
           if (currentState == STATE_IDLE) currentState = STATE_ENTERING_PIN;
@@ -535,7 +815,18 @@ void handleStateMachine(unsigned long now) {
 
 // ==================== STATE HELPER ====================
 void enterState(TesterState newState) {
+  if (utilityModeActive && newState != STATE_STANDBY && newState != STATE_IDLE &&
+      newState != STATE_ENTERING_PIN) {
+    stopUtilityMode(millis());
+  }
+
   currentState = newState;
+
+  if (newState == STATE_STANDBY) {
+    applyIdlePowerPolicy(millis());
+  } else {
+    applyActivePowerPolicy(millis());
+  }
 
   switch (newState) {
   case STATE_STANDBY:
@@ -549,17 +840,7 @@ void enterState(TesterState newState) {
     break;
   case STATE_IDLE:
     if (!isDisplayFailed()) {
-      if (lastStatusCommand == "RETURNING") {
-        updateDisplay("Return PIN:", "PIN: ");
-      } else if (lastStatusCommand == "GEO_TRANSIT_DROP") {
-        updateDisplay("In Transit", "Head to dropoff");
-      } else if (lastStatusCommand == "GEO_TRANSIT_PICK") {
-        updateDisplay("In Transit", "Head to pickup");
-      } else if (lastStatusCommand == "GEO_PICKUP") {
-        updateDisplay("Ongoing Pickup", "Please wait...");
-      } else {
-        updateDisplay("Enter PIN:", "PIN: ");
-      }
+      renderIdleJourneyStatus();
     }
     inputLen = 0;
     inputCode[0] = '\0';

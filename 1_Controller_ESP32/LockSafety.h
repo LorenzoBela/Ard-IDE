@@ -7,6 +7,7 @@
  *   EC-21: Retry unlock up to 3x, report STUCK_CLOSED
  *   EC-22: Verify lock engaged via reed switch, report STUCK_OPEN
  *   EC-95: Reed switch debounce (50 ms)
+ *   Reed ISR edge capture always armed for tamper invariance
  *   EC-96: Modeled coil temperature — blocks actuation if overheated
  *
  * Hardware:

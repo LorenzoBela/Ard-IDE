@@ -44,6 +44,7 @@ Primary role:
 Responsibilities:
 - Connect to Proxy SoftAP (SmartTopBox_AP_*).
 - Poll delivery context (OTP, delivery_id, status).
+- Support utility diagnostics mode on keypad keys 1/2/3 while in standby and idle states.
 - Gate keypad flow based on delivery state/status.
 - Enforce OTP lockout policy and cooldown.
 - Request face check through Proxy.
@@ -72,6 +73,7 @@ Responsibilities:
 - Host local AP used by Controller and Eye.
 - Serve board-to-board endpoints for Controller and Eye.
 - Cache delivery context for fast local reads.
+- Serve cached diagnostics endpoint for Controller utility mode.
 - Forward face-check requests to Eye.
 - Relay camera JPEG uploads to Supabase via LTE.
 - Maintain command token/ack workflows.
@@ -226,21 +228,31 @@ Bring-up checklist:
 
 - Non-blocking loop for WiFi maintenance, state transitions, and safety ticks.
 - Periodic context refresh from Proxy.
+- Utility diagnostics mode wakes LCD on keys 1/2/3 and auto-closes after 5 seconds.
+- Utility screens render immediately from cached diagnostics (no blocking keypress path).
+- Diagnostics polling is dynamic by power state:
+  - Standby (backlight off): slow polling to save battery.
+  - Idle (active delivery): medium polling.
+  - Utility active window: burst polling for live updates.
 - OTP + face verification gates unlock attempt.
 - LockSafety keeps thermal/reed/tamper protections active continuously.
+- Idle policy keeps command listening active while forcing LCD backlight off and requesting camera sleep.
 
 ### 8.2) Proxy loop model
 
 - Maintains AP and local HTTP serving.
 - Manages LTE modem health and backend writes.
 - Keeps context cache refreshed for low-latency /otp responses.
+- Keeps battery/network/backend diagnostics cached for low-latency /diag responses.
 - Routes face-check and upload traffic between Controller/Eye and backend.
+- Applies idle-safe polling throttles while keeping LTE command-serving path online.
 
 ### 8.3) Eye loop model
 
 - Maintains AP connection.
 - Serves face-check status endpoint.
 - Decouples detection response from heavier image upload work.
+- Supports software camera power states via proxy-triggered sleep/wake commands.
 
 ## 9) Production Endpoint Interface
 
@@ -270,7 +282,24 @@ Typical response values:
 - NO_FACE
 - error/timeout text if camera route fails
 
-### 9.3) POST /event (Controller -> Proxy)
+### 9.3) GET /diag (Controller -> Proxy)
+
+Purpose:
+- Retrieve fast cached diagnostics for utility mode without triggering expensive modem/GPS operations in request path.
+
+Typical response shape (comma-separated key/value):
+- batt_pct=<0..100>
+- batt_v=<smoothed_voltage>
+- rssi=<dBm_or_-999>
+- csq=<0..31_or_-1>
+- gps_fix=<0|1>
+- lte=<0|1>
+- modem=<0|1>
+- time=<0|1>
+- fb_fail=<count>
+- uptime=<proxy_millis>
+
+### 9.4) POST /event (Controller -> Proxy)
 
 Purpose:
 - Report unlock outcome, safety flags, failure reasons, and alert classes.
@@ -290,7 +319,7 @@ Representative payload fields:
 - details
 - tamper
 
-### 9.4) POST /command-ack (Controller -> Proxy)
+### 9.5) POST /command-ack (Controller -> Proxy)
 
 Purpose:
 - Acknowledge remote lock/unlock command handling status.
@@ -302,7 +331,7 @@ Representative fields:
 - box_id
 - delivery_id
 
-### 9.5) POST /upload (Eye -> Proxy)
+### 9.6) POST /upload (Eye -> Proxy)
 
 Purpose:
 - Send JPEG image bytes from Eye to Proxy for LTE relay.
@@ -311,6 +340,16 @@ Expected behavior:
 - Content-Type image/jpeg
 - Header X-Object-Path used as destination key/path
 - Proxy validates payload and performs backend relay/writeback
+
+### 9.7) GET /cam-power?mode=sleep|wake (Controller -> Proxy -> Eye)
+
+Purpose:
+- Apply software camera power policy from Controller state transitions.
+
+Typical response values:
+- CAM_SLEEP_OK
+- CAM_WAKE_OK
+- ERROR:cam_unreachable / ERROR:cam_timeout
 
 ## 10) Safety and Edge-Case Feature Coverage
 
@@ -327,6 +366,11 @@ The production code explicitly covers the following IDs:
 - EC-94: Geofence hysteresis with confirmation samples.
 - EC-95: Reed switch debounce reliability.
 - EC-96: Thermal model and hard solenoid cutoff protection.
+
+Utility diagnostics behavior:
+- Keys 1/2/3 in standby and idle states temporarily wake LCD to show diagnostics.
+- Display auto-times out to low-power behavior after 5 seconds.
+- Proxy battery values are smoothed with EMA before display/export to reduce LTE sag spikes.
 
 ## 11) Operations Checklist (Per Deployment)
 

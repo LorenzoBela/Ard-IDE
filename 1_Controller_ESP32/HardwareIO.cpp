@@ -10,6 +10,7 @@
 
 // ── LCD ──
 static LiquidCrystal_I2C lcd(DISPLAY_I2C_ADDR, 16, 2);
+static bool lcdBacklightEnabled = true;
 
 // ── Keypad ──
 static char keys[KP_ROWS][KP_COLS] = {
@@ -46,6 +47,7 @@ void initHardwareIO() {
   delay(500);           // LCD Vcc rail settle time
   lcd.begin();
   lcd.backlight();
+  lcdBacklightEnabled = true;
   updateDisplay("Parcel-Safe v2", "Connecting WiFi");
 
   Serial2.begin(CAM_UART_BAUD, SERIAL_8N1, CAM_UART_RX, CAM_UART_TX);
@@ -61,6 +63,20 @@ void updateDisplay(const char *line0, const char *line1) {
   lcd.setCursor(0, 1);
   snprintf(buf, sizeof(buf), "%-16s", line1);
   lcd.print(buf);
+}
+
+void displayBacklightOn() {
+  if (!lcdBacklightEnabled) {
+    lcd.backlight();
+    lcdBacklightEnabled = true;
+  }
+}
+
+void displayBacklightOff() {
+  if (lcdBacklightEnabled) {
+    lcd.noBacklight();
+    lcdBacklightEnabled = false;
+  }
 }
 
 // ==================== KEYPAD ====================

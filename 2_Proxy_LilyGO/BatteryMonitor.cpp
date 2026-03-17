@@ -4,29 +4,31 @@
 
 #include "BatteryMonitor.h"
 
-static float samples[BATT_SAMPLES];
-static int   sampleIdx  = 0;
-static float voltage    = 0.0f;
+static float voltage = 0.0f;
+static bool emaInitialized = false;
 
 void batteryBegin() {
   pinMode(BATT_PIN, INPUT);
   analogReadResolution(12);
 
   float initial = (analogRead(BATT_PIN) / 4095.0f) * BATT_ADC_REF * BATT_DIVIDER_RATIO;
-  for (int i = 0; i < BATT_SAMPLES; i++) samples[i] = initial;
   voltage = initial;
+  emaInitialized = true;
 }
 
 float batteryUpdate() {
   int raw = analogRead(BATT_PIN);
   float v = (raw / 4095.0f) * BATT_ADC_REF * BATT_DIVIDER_RATIO;
 
-  samples[sampleIdx] = v;
-  sampleIdx = (sampleIdx + 1) % BATT_SAMPLES;
+  if (!emaInitialized) {
+    voltage = v;
+    emaInitialized = true;
+  } else {
+    voltage = (BATT_EMA_ALPHA * v) + ((1.0f - BATT_EMA_ALPHA) * voltage);
+  }
 
-  float sum = 0;
-  for (int i = 0; i < BATT_SAMPLES; i++) sum += samples[i];
-  voltage = sum / BATT_SAMPLES;
+  if (voltage < BATT_MIN_VOLTAGE) voltage = BATT_MIN_VOLTAGE;
+  if (voltage > BATT_MAX_VOLTAGE) voltage = BATT_MAX_VOLTAGE;
   return voltage;
 }
 

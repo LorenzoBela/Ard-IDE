@@ -29,6 +29,37 @@ String lastStatusCommand     = "";
 static unsigned long wifiRetryAt    = 0;
 static unsigned long wifiBackoffMs  = WIFI_RETRY_BASE_MS;
 
+static String normalizeStatusToken(const String &rawToken) {
+  String token = rawToken;
+  token.trim();
+
+  // Some upstream paths may include JSON quotes around text values.
+  if (token.length() >= 2 && token[0] == '"' && token[token.length() - 1] == '"') {
+    token = token.substring(1, token.length() - 1);
+    token.trim();
+  }
+
+  return token;
+}
+
+static bool parseDiagField(const String &body, const char *key, String &out) {
+  String token = String(key) + "=";
+  int start = body.indexOf(token);
+  if (start < 0) {
+    return false;
+  }
+
+  start += token.length();
+  int end = body.indexOf(',', start);
+  if (end < 0) {
+    end = body.length();
+  }
+
+  out = body.substring(start, end);
+  out.trim();
+  return out.length() > 0;
+}
+
 // ==================== LOGGING ====================
 void netLog(const char *format, ...) {
   char buf[256];
@@ -177,7 +208,7 @@ void fetchDeliveryContext() {
       if (secondComma > 0) {
         otpPart = body.substring(0, firstComma);
         delPart = body.substring(firstComma + 1, secondComma);
-        lastStatusCommand = body.substring(secondComma + 1);
+        lastStatusCommand = normalizeStatusToken(body.substring(secondComma + 1));
       } else {
         otpPart = body.substring(0, firstComma);
         delPart = body.substring(firstComma + 1);
@@ -222,6 +253,90 @@ void fetchDeliveryContext() {
   // Drive state transitions based on delivery availability
   // (State machine transitions are handled in the main .ino — this function
   //  only updates the shared globals.)
+}
+
+bool fetchDiagnostics(ControllerDiagData &out) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  WiFiClient client;
+  HTTPClient http;
+  char url[64];
+  snprintf(url, sizeof(url), "http://%s:%d/diag", PROXY_HOST, PROXY_PORT);
+
+  http.setTimeout(CONTROLLER_DIAG_HTTP_TIMEOUT_MS);
+  http.setReuse(false);
+  http.begin(client, url);
+
+  int code = http.GET();
+  if (code != 200) {
+    netLog("[DIAG] GET /diag HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  String field;
+  ControllerDiagData parsed = out;
+  bool parsedAny = false;
+
+  if (parseDiagField(body, "batt_pct", field)) {
+    parsed.battPct = field.toInt();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "batt_v", field)) {
+    parsed.battVoltage = field.toFloat();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "rssi", field)) {
+    parsed.rssi = field.toInt();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "csq", field)) {
+    parsed.csq = field.toInt();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "gps_fix", field)) {
+    parsed.gpsFix = (field.toInt() != 0);
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "lte", field)) {
+    parsed.lteConnected = (field.toInt() != 0);
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "modem", field)) {
+    parsed.modemOk = (field.toInt() != 0);
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "time", field)) {
+    parsed.timeSynced = (field.toInt() != 0);
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "fb_fail", field)) {
+    parsed.firebaseFailures = field.toInt();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "uptime", field)) {
+    parsed.proxyUptimeMs = (unsigned long)field.toInt();
+    parsedAny = true;
+  }
+
+  if (!parsedAny) {
+    netLog("[DIAG] GET /diag parse miss: '%s'\n", body.c_str());
+    return false;
+  }
+
+  if (parsed.battPct < 0) parsed.battPct = 0;
+  if (parsed.battPct > 100) parsed.battPct = 100;
+  if (parsed.csq < -1) parsed.csq = -1;
+  if (parsed.csq > 31) parsed.csq = 31;
+  if (parsed.firebaseFailures < 0) parsed.firebaseFailures = 0;
+
+  out = parsed;
+  return true;
 }
 
 // ==================== REPORT EVENT ====================
@@ -343,6 +458,35 @@ bool reportCommandAckToProxy(const char *command, const char *status, const char
   http.end();
 
   return (code == 200 || code == 201);
+}
+
+bool requestCameraPowerMode(bool wakeMode) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  HTTPClient http;
+  char url[96];
+  snprintf(url, sizeof(url), "http://%s:%d/cam-power?mode=%s", PROXY_HOST,
+           PROXY_PORT, wakeMode ? "wake" : "sleep");
+
+  http.setTimeout(2500);
+  http.begin(url);
+  int code = http.GET();
+
+  bool ok = false;
+  if (code == 200) {
+    String body = http.getString();
+    body.trim();
+    ok = body.indexOf("CAM_") >= 0 || body.indexOf("OK") >= 0;
+    netLog("[CAM] mode=%s proxy=%s\n", wakeMode ? "wake" : "sleep",
+           body.c_str());
+  } else {
+    netLog("[CAM] mode=%s HTTP %d\n", wakeMode ? "wake" : "sleep", code);
+  }
+
+  http.end();
+  return ok;
 }
 
 // ==================== FACE CHECK ====================

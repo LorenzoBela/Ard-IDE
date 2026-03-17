@@ -18,6 +18,7 @@
 #define BATT_MAX_VOLTAGE      4.2f    // full 18650
 #define BATT_SAMPLES          10
 #define BATT_ADC_REF          3.3f
+#define BATT_EMA_ALPHA        0.20f
 #define BATT_LOW_PCT          20
 #define BATT_CRITICAL_PCT     10
 
