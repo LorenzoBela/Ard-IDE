@@ -1,280 +1,375 @@
-# GPS & LTE Signal to Firebase Test
+﻿# Ard IDE Firmware (Production Reference)
 
-Simple Arduino IDE test sketch for LILYGO T-SIM A7670E that reads GPS and LTE signal strength and sends to Firebase.
+## 1) Production Scope
 
-## 📋 Features
+This document defines the production firmware set for Smart Top Box in this folder.
 
-- ✅ Reads GPS data from A7670E internal modem
-- ✅ Connects via LTE/4G (no WiFi needed)
-- ✅ Measures cellular signal strength (RSSI & CSQ)
-- ✅ Sends data to Firebase Realtime Database
-- ✅ Updates every 5 seconds
-- ✅ Serial monitor output for debugging
+Production folders:
+- 1_Controller_ESP32
+- 2_Proxy_LilyGO
+- 3_Eye_ESP32CAM
 
-## 🔧 Required Hardware
+Non-production folders in this directory are test/prototype/legacy only and are not release firmware.
 
-- LILYGO T-SIM A7670E (GPS Version)
-- Nano SIM card with data plan (4G/LTE enabled)
-- USB-C cable for programming
-- GPS antenna (usually included with board)
-- LTE antenna (usually included with board)
+Current non-production folders:
+- ESP32CAM_OV3660_Supabase_R3_Test
+- GPS_LTE_Firebase_Test
+- Tester
+- .git
 
-## 📚 Required Libraries
+## 2) System Overview
 
-Install these libraries via Arduino IDE Library Manager (`Tools > Manage Libraries...`):
+Smart Top Box production firmware runs on 3 boards with clear separation of concerns:
 
-1. **TinyGSM** by Volodymyr Shymanskyy
-   - Search: "TinyGSM"
-   - Version: 0.11.7 or higher
+- Controller (ESP32 DevKit): user interaction, OTP validation, lock actuation, local safety enforcement.
+- Proxy (LilyGO T-SIM A7670E): LTE/GPS/backend bridge, local AP host, local HTTP routing.
+- Eye (AI-Thinker ESP32-CAM): face detection service and capture/upload producer.
 
-2. **TinyGPSPlus** by Mikal Hart
-   - Search: "TinyGPSPlus"
-   - Version: 1.0.3 or higher
+High-level unlock flow:
+1. Controller pulls delivery context and OTP from Proxy.
+2. Rider enters OTP on Controller keypad.
+3. Controller asks Proxy for face verification.
+4. Proxy forwards to Eye and returns FACE_OK or NO_FACE.
+5. Controller unlocks with lock safety logic.
+6. Controller posts event data to Proxy.
+7. Proxy writes backend records and relays photo uploads.
 
-3. **Firebase ESP Client** by Mobizt
-   - Search: "Firebase ESP Client"
-   - Version: 4.3.0 or higher
+## 3) Firmware Responsibilities by Board
 
-## ⚙️ Setup Instructions
-Insert SIM Card
+### 3.1) 1_Controller_ESP32
 
-Insert your nano SIM card with data plan into the SIM slot on the board.
+Primary role:
+- Main state machine for lock-box experience.
 
-### 2. Configure APN Settings
+Responsibilities:
+- Connect to Proxy SoftAP (SmartTopBox_AP_*).
+- Poll delivery context (OTP, delivery_id, status).
+- Gate keypad flow based on delivery state/status.
+- Enforce OTP lockout policy and cooldown.
+- Request face check through Proxy.
+- Control solenoid and reed-verified lock/relock.
+- Detect tamper, keypad issues, and display health failures.
+- Report event, alert, tamper, and command-ack payloads to Proxy.
 
-Open `GPS_WiFi_Firebase_Test.ino` and update your carrier's APN:
+Key states implemented:
+- STATE_CONNECTING_WIFI
+- STATE_STANDBY
+- STATE_IDLE
+- STATE_ENTERING_PIN
+- STATE_VERIFYING_OTP
+- STATE_REQUESTING_FACE
+- STATE_UNLOCKING
+- STATE_RELOCKING
+- STATE_SHOW_MESSAGE
 
-```cpp
-#define GPRS_APN "internet"     // Common APNs: "internet", "web.globe.com.ph"
-#define GPRS_USER ""            // Usually empty
-#define GPRS_PASS ""            // Usually empty
-```
+### 3.2) 2_Proxy_LilyGO
 
-**Common Philippine APNs:**
-- Globe: `internet.globe.com.ph` or `http.globe.com.ph`
-- Smart: `internet` or `smartlte`
-- DITO: `internet`
+Primary role:
+- Communication and integration backbone.
 
-### 3. Firebase Already Configured ✅
+Responsibilities:
+- Own LTE modem and data path to backend.
+- Host local AP used by Controller and Eye.
+- Serve board-to-board endpoints for Controller and Eye.
+- Cache delivery context for fast local reads.
+- Forward face-check requests to Eye.
+- Relay camera JPEG uploads to Supabase via LTE.
+- Maintain command token/ack workflows.
+- Run geofence/theft/battery/persistence support modules.
 
-Firebase credentials are already set:
-- API Key: Already configured
-- Database URL: Already configured
-### 3. Set Hardware ID
+### 3.3) 3_Eye_ESP32CAM
 
-Optionally change the device identifier:
+Primary role:
+- Face-gate unlock authorization and capture evidence.
 
-```cpp
-#define HARDWARE_ID "TEST_BOX_001"
-```
+Responsibilities:
+- Connect to Proxy AP.
+- Run person/face detection window on request.
+- Return face status quickly to avoid blocking unlock flow.
+- Queue high-resolution capture and POST JPEG bytes to Proxy.
+- Offer UART fallback path for face query.
 
-### 4. Configure Arduino IDE
+## 4) Production Source Map
 
-### 4. Set Hardware ID
+Only production files present in these folders are listed.
 
-Optionally change the device identifier:
+### 4.1) 1_Controller_ESP32
 
-```cpp
-#define HARDWARE_ID "TEST_BOX_001"
-```
+- 1_Controller_ESP32.ino
+  Main non-blocking state machine and orchestration layer.
 
-### 5artition Scheme**: Default 4MB with spiffs
-- **Core Debug Level**: None
-- **Port**: Select your COM port
+- Config.h
+  Central constants for pins, timing, retries, thresholds, and feature tuning.
 
-### 5. Upload
+- HardwareIO.h / HardwareIO.cpp
+  LCD and keypad implementation, display update behavior, input handling.
 
-1. Connect LILYGO T-SIM A7670E via USB-C
-2. Click **Upload** button
-3. Wait for upload to complete
+- ProxyClient.h / ProxyClient.cpp
+  WiFi scan/reconnect, endpoint calls, context parsing, UDP logging, face-check fallback.
 
-### 6. Upload
+- LockSafety.h / LockSafety.cpp
+  Solenoid control, retry logic, reed debounce, tamper detection, thermal model/cutoff.
 
-1. Connect LILYGO T-SIM A7670E via USB-C
-2. Click **Upload** button
-3. WaLTE network connection
-   - GPS status
-### 7GPS status
-   - WiFi connection
-   - Firebase uploads
+- OTPLockout.h / OTPLockout.cpp
+  OTP attempt counting, lockout timing, cooldown handling.
 
-## 📊 Firebase Data Structure
+- DisplayHealth.h / DisplayHealth.cpp
+  LCD I2C health checks and fallback signaling behaviors.
 
-Data is stored at: `/test_devices/{HARDWARE_ID}/`
+- AdminOverride.h
+  Remote unlock override handling with timeout-safe semantics.
 
-```json
-{
-  "testlte_rssi": -71,
-      "lte_csq": 21,
-      "lte_quality": "Good",
-      "network_operator": "Globe Telecom",
-      "gps_latitude": 14.5995,
-      "gps_longitude": 120.9842,
-      "gps_status": "Fixed",
-      "last_update": 1707494400000
-    }
-  }
-}
-```
+- KeypadHealth.h
+  Held-key/stuck-key detection logic.
 
-### Fields:
-- `lte_rssi`: LTE signal strength in dBm (-999 = no signal)
-- `lte_csq`: Signal quality indicator (0-31, higher is better)
-- `lte_quality`: Human-readable quality (Excellent/Good/Fair/Weak/Very Weak)
-- `network_operator`: Carrier name (e.g., "Globe Telecom", "Smart Communications")
-- `gps_latitude`: GPS latitude (only when GPS has fix)
-- `gps_longitude`: GPS longitude (only when GPS has fix)
-- `gps_status`: "Fixed" or "No Fix"
-- `last_update`: Firebase server timestamp
+### 4.2) 2_Proxy_LilyGO
 
-## 📡 Signal Quality Reference
+- 2_Proxy_LilyGO.ino
+  LTE/AP/main integration sketch for routing, caching, relay, and backend writes.
 
-### LTE Signal (RSSI in dBm):
-- **-65 or better**: Excellent signal
-- **-65 to -75**: Good signal
-- **-75 to -85**: Fair signal
-- **-85 to -95**: Weak signal
-- **Below -95**: Very weak signal
+- BatteryMonitor.h / BatteryMonitor.cpp
+  Battery voltage sampling, smoothing, threshold checks.
 
-### SIM Card Not Detected:
-- Ensure SIM card is properly inserted
-- Check if SIM has a PIN - disable it or add to `GSM_PIN`
-- Try reinserting the SIM card
+- DeliveryPersist.h / DeliveryPersist.cpp
+  NVS persistence for OTP and delivery ID context.
 
-### LTE Connection Failed:
-- Verify APN settings for your carrier
-- Check if SIM has data plan enabled
-- Ensure good cellular coverage
-- Try moving to area with better signal
+- DeliveryReassignment.h
+  Rider reassignment handling and auto-ack mechanics.
 
-### GPS Not Getting Fix:
-- Ensure GPS antenna is connected
-- Place device near window or outdoors
-- Wait 1-2 minutes for initial fix (cold start)
-- Check Serial Monitor for GPS messages
+- GeofenceProxy.h
+  Header-only geofence stability model and hysteresis policy.
 
-### Firebase Upload Failed:
-- Verify LTE connection is active
-- Check Firebase credentials
-- Place device near window or outdoors
-- Wait 1-2 minutes for initial fix (cold start)
-- Check Serial Monitor for GPS messages
+- TheftGuard.h / TheftGuard.cpp
+  Theft state machine, lockdown/recovery helpers.
 
-### WiFi Connection Failed:
-- Double-check SSID and password
-- Ensure 2.4GHz WiFi (ESP32 doesn't support 5GHz)
-- Move closer to router
+### 4.3) 3_Eye_ESP32CAM
 
-### Firebase Upload Failed:
-- Verify API key and database URL
-- Check Firebase Realtime Database rules:
-  ```json
-  {LTE Signal to Firebase Test
-LILYGO T-SIM A7670E
-========================================
+- 3_Eye_ESP32CAM.ino
+  Face detection service endpoint, deferred capture queue, upload-to-proxy logic.
 
-Powering on A7670E modem...
-Modem power sequence complete
-Testing modem communication...
-Modem Info: SIMCOM_A7670E
-Initializing GPS...
-GPS initialized successfully
-Connecting to cellular network...
-Waiting for network... registered!
-SIM card OK
-Connecting to APN: internet
-LTE Connected!
-SIM CCID: 8963...
-Operator: Globe Telecom
-Local IP: 10.123.45.67
-Initializing Firebase...
-Firebase initialized with LTE
+## 5) Build and Toolchain Requirements
 
-========================================
-Setup complete - starting main loop
-========================================
+### 5.1) Arduino and core
 
---- Reading GPS ---
-GPS: No fix yet
+- Arduino IDE 2.x recommended.
+- ESP32 Arduino core 2.0.x baseline across production boards.
+- Eye sketch enforces 2.0.x and explicitly references 2.0.17 compatibility.
 
---- Sending to Firebase ---
-LTE Signal: -71 dBm (CSQ: 21, Good)
-Sending data to Firebase...
-✓ LTE RSSI sent
-✓ LTE CSQ sent
-✓ LTE quality sent
-✓ Network operator sent
-✓ Timestamp sent
-✓ GPS status sent (No Fix)
-Data upload complete!
+### 5.2) Board-level dependencies from includes
 
---- Reading GPS ---
-GPS Fix - Lat: 14.5995, Lon: 120.9842
+Controller:
+- WiFi, HTTPClient, WiFiUdp, Wire
+- Keypad
+- LiquidCrystal_I2C
 
---- Sending to Firebase ---
-LTE Signal: -69 dBm (CSQ: 22, Good)
-Sending data to Firebase...
-✓ LTE RSSI sent
-✓ LTE CSQ sent
-✓ LTE quality sent
-✓ Network operatort
+Proxy:
+- TinyGsmClient (A7672X profile)
+- Preferences
+- WiFi, WiFiUdp
 
---- Sending to Firebase ---
-WiFi Signal: -45 dBm (Excellent)
-Sending data to Firebase...
-- **Signal Check**: Every 10 seconds
+Eye:
+- esp_camera, img_converters
+- HTTPClient, WiFi, WiFiUdp
+- human_face_detect_msr01.hpp
 
-You can adjust in the code:
-```cpp
-#define GPS_UPDATE_INTERVAL 2000      // milliseconds
-#define FIREBASE_UPDATE_INTERVAL 5000 // milliseconds
-#define SIGNAL_CHECK_INTERVAL 10000   // milliseconds
-```
+### 5.3) Hardware assumptions
 
-## 📞 Support
+- Controller: ESP32 DevKit + keypad + I2C LCD + lock driver + reed sensor.
+- Proxy: LilyGO T-SIM A7670E with valid SIM/data and LTE/GPS antennas.
+- Eye: AI-Thinker ESP32-CAM with PSRAM and stable camera module.
 
-For issues or questions about this test sketch, check:
-- Serial Monitor output for error messages
-- Firebase Console for received data
-- SIM card has active data plan
-- Cellular coverage in your area
-- LILYGO documentation for hardware issues
+## 6) Arduino IDE Board Settings
 
-## ⚡ Next Steps
+### 6.1) Controller (1_Controller_ESP32)
 
-Once this test works:
-1. ✅ GPS and LTE are working
-2. ✅ Firebase connection is established
-3. 🚀 Ready to integrate into full Smart Top Box firmware
+- Board: ESP32 Dev Module
+- PSRAM: Not required
+- Partition: Any stable option with enough app space
 
----
+### 6.2) Proxy (2_Proxy_LilyGO)
 
-**Hardware**: LILYGO T-SIM A7670E (GPS Version)  
-**Connectivity**: LTE/4G (No WiFi needed)  
-**Project**: Parcel-Safe Smart Top Box  
-**Test Version**: 2.0 (LTE)
-You can adjust in the code:
-```cpp
-#define GPS_UPDATE_INTERVAL 2000      // milliseconds
-#define FIREBASE_UPDATE_INTERVAL 5000 // milliseconds
-```
+- Board: ESP32 Dev Module (LilyGO-compatible target workflow)
+- PSRAM: Not required
+- Partition: Default is typically sufficient
 
-## 📞 Support
+### 6.3) Eye (3_Eye_ESP32CAM)
 
-For issues or questions about this test sketch, check:
-- Serial Monitor output for error messages
-- Firebase Console for received data
-- LILYGO documentation for hardware issues
+- Board: AI Thinker ESP32-CAM
+- ESP32 Core: 2.0.x
+- PSRAM: Enabled
+- Partition Scheme: Huge APP (3MB No OTA / 1MB SPIFFS)
 
-## ⚡ Next Steps
+## 7) Flashing Order and Bring-Up
 
-Once this test works:
-1. ✅ GPS and WiFi are working
-2. ✅ Firebase connection is established
-3. 🚀 Ready to integrate into full Smart Top Box firmware
+Recommended flashing order:
+1. 2_Proxy_LilyGO
+2. 3_Eye_ESP32CAM
+3. 1_Controller_ESP32
 
----
+Why this order:
+- Proxy must be online first because it provides AP and routing endpoints.
+- Eye depends on Proxy AP and upload target.
+- Controller depends on /otp and /face-check provided by Proxy.
 
-**Hardware**: LILYGO T-SIM A7670E (GPS Version)  
-**Project**: Parcel-Safe Smart Top Box  
-**Test Version**: 1.0
+Bring-up checklist:
+1. Boot Proxy and verify AP SmartTopBox_AP_* is visible.
+2. Verify Proxy serial logs show modem init and network progress.
+3. Boot Eye and verify AP join and face service readiness.
+4. Boot Controller and verify recurring context fetch.
+5. Run controlled OTP+face unlock cycle.
+6. Verify event and command-ack traffic reaches Proxy.
+7. Verify image upload relay path through Proxy.
+
+## 8) Runtime Contract and Data Flow
+
+### 8.1) Controller loop model
+
+- Non-blocking loop for WiFi maintenance, state transitions, and safety ticks.
+- Periodic context refresh from Proxy.
+- OTP + face verification gates unlock attempt.
+- LockSafety keeps thermal/reed/tamper protections active continuously.
+
+### 8.2) Proxy loop model
+
+- Maintains AP and local HTTP serving.
+- Manages LTE modem health and backend writes.
+- Keeps context cache refreshed for low-latency /otp responses.
+- Routes face-check and upload traffic between Controller/Eye and backend.
+
+### 8.3) Eye loop model
+
+- Maintains AP connection.
+- Serves face-check status endpoint.
+- Decouples detection response from heavier image upload work.
+
+## 9) Production Endpoint Interface
+
+### 9.1) GET /otp (Controller -> Proxy)
+
+Purpose:
+- Retrieve OTP and delivery context for local keypad validation.
+
+Typical response shape:
+- otp_or_NO_OTP,delivery_id_or_NO_DELIVERY[,status]
+
+Status tokens observed in runtime logic:
+- UNLOCKING
+- LOCKED
+- GEO_PICKUP
+- GEO_TRANSIT_DROP
+- GEO_TRANSIT_PICK
+- RETURNING
+
+### 9.2) GET /face-check (Controller -> Proxy)
+
+Purpose:
+- Trigger face verification through Proxy forwarding to Eye.
+
+Typical response values:
+- FACE_OK
+- NO_FACE
+- error/timeout text if camera route fails
+
+### 9.3) POST /event (Controller -> Proxy)
+
+Purpose:
+- Report unlock outcome, safety flags, failure reasons, and alert classes.
+
+Representative payload fields:
+- otp_valid
+- face_detected
+- unlocked
+- box_id
+- delivery_id
+- thermal_cutoff
+- face_attempts
+- face_retry_exhausted
+- fallback_required
+- failure_reason
+- alert_type
+- details
+- tamper
+
+### 9.4) POST /command-ack (Controller -> Proxy)
+
+Purpose:
+- Acknowledge remote lock/unlock command handling status.
+
+Representative fields:
+- command
+- status
+- details
+- box_id
+- delivery_id
+
+### 9.5) POST /upload (Eye -> Proxy)
+
+Purpose:
+- Send JPEG image bytes from Eye to Proxy for LTE relay.
+
+Expected behavior:
+- Content-Type image/jpeg
+- Header X-Object-Path used as destination key/path
+- Proxy validates payload and performs backend relay/writeback
+
+## 10) Safety and Edge-Case Feature Coverage
+
+The production code explicitly covers the following IDs:
+
+- EC-04: OTP lockout after failed attempts with timed lockout window.
+- EC-21: Unlock retry policy when lock appears stuck closed.
+- EC-22: Relock verification and stuck-open detection.
+- EC-77: Admin remote unlock override with timeout controls.
+- EC-82: Keypad stuck-key detection.
+- EC-86: LCD health checks and degraded operation fallback.
+- EC-92: Geofence behavior under degraded GPS quality (urban canyon).
+- EC-93: Warehouse return timing logic.
+- EC-94: Geofence hysteresis with confirmation samples.
+- EC-95: Reed switch debounce reliability.
+- EC-96: Thermal model and hard solenoid cutoff protection.
+
+## 11) Operations Checklist (Per Deployment)
+
+1. Confirm all 3 boards are flashed from production folders only.
+2. Verify Proxy AP naming and identity are correct.
+3. Verify Eye face service is reachable.
+4. Verify Controller receives context from /otp.
+5. Validate OTP + face + unlock + relock end-to-end.
+6. Validate /event payload writes are visible in backend traces.
+7. Validate remote command path and /command-ack lifecycle.
+8. Validate /upload relay and resulting photo URL/data updates.
+9. Capture serial logs from all boards for run evidence.
+
+## 12) Troubleshooting Matrix
+
+| Symptom | Likely side | Most likely cause | First checks |
+|---|---|---|---|
+| Controller keeps reconnecting | Controller/Proxy | Proxy AP unavailable or unstable | AP broadcast, credentials, distance/interference |
+| No OTP context | Proxy/backend | Cache not populated or backend read issue | Proxy context refresh logs, delivery node values |
+| OTP accepted but no unlock | Controller/Eye | Face check failed/timeouts | Face endpoint response, Eye connectivity, retries |
+| Remote command not reflected | Proxy/Controller | Command token/ack mismatch | Cached status token, /command-ack request logs |
+| Frequent tamper alerts | Controller | Reed noise or wiring instability | Reed debounce config, wiring, magnetic alignment |
+| Lock cuts off unexpectedly | Controller | Thermal/timeout safety path triggered | LOCK_MAX_ACTIVE_MS, thermal logs, repeated attempts |
+| Camera upload fails | Eye/Proxy/LTE | Relay rejection or LTE degradation | /upload diagnostics, payload headers, modem status |
+| Missing backend events | Proxy | LTE transient/write failure | LTE attach/APN health, retry counters, HTTP status |
+
+## 13) Release Checklist
+
+1. Verify release includes only 1_Controller_ESP32, 2_Proxy_LilyGO, 3_Eye_ESP32CAM.
+2. Freeze toolchain versions used for build.
+3. Build and flash all 3 boards with documented settings.
+4. Run full integration test for all local endpoints.
+5. Run targeted edge-case validation for EC-04/21/22/77/82/86/92/93/94/95/96.
+6. Record firmware revision identifiers for each board.
+7. Archive test logs and release notes.
+8. Mark deployment date, operator, and environment.
+
+## 14) Important Boundary Reminder
+
+For production operations, always treat the three folders below as the single source of truth:
+
+- 1_Controller_ESP32
+- 2_Proxy_LilyGO
+- 3_Eye_ESP32CAM
+
+All other Ard IDE sketches are out of scope for production unless explicitly promoted in a future controlled release.
