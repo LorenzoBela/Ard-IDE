@@ -11,6 +11,7 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include "mbedtls/sha256.h"
 
 // TinyGSM - MUST define modem BEFORE include
 #define TINY_GSM_MODEM_A7672X
@@ -122,6 +123,10 @@ bool lastReturnActive = false;
 char cachedDeliveryId[64] = "";
 bool deliveryIdCacheValid = false;
 char cachedDeliveryStatus[32] = ""; // To track "ASSIGNED", "PICKED_UP", "IN_TRANSIT" etc.
+char cachedPersonalPinHashMcu[65] = "";
+char cachedPersonalPinSalt[33] = "";
+char cachedPersonalPinRiderId[64] = "";
+bool personalPinEnabled = false;
 // EC-FIX: Remote lock/unlock status command from Firebase (UNLOCKING/LOCKED)
 char cachedStatus[16] = "";
 unsigned long cachedStatusSetAt = 0;
@@ -174,6 +179,9 @@ static bool extractJsonStringValue(const char *json, const char *key,
 }
 bool camClientKnown = false;
 #define CAM_FACE_PORT 80 // ESP32-CAM runs a tiny HTTP server on port 80
+
+unsigned long lastPersonalPinFlushAt = 0;
+#define PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS 5000
 
 // Reliability counters
 uint8_t consecutiveModemFailures = 0;
@@ -1969,6 +1977,120 @@ static bool readTopLevelJsonInt(const String &json, const char *key, int &outVal
   return false;
 }
 
+static bool constantTimeEquals(const char *a, const char *b) {
+  if (!a || !b) return false;
+  size_t lenA = strlen(a);
+  size_t lenB = strlen(b);
+  if (lenA != lenB) return false;
+
+  unsigned char diff = 0;
+  for (size_t i = 0; i < lenA; i++) {
+    diff |= (unsigned char)(a[i] ^ b[i]);
+  }
+  return diff == 0;
+}
+
+static void sha256Hex(const char *input, char *outHex, size_t outLen) {
+  if (!input || !outHex || outLen < 65) {
+    if (outHex && outLen > 0) outHex[0] = '\0';
+    return;
+  }
+
+  unsigned char hash[32];
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, (const unsigned char *)input, strlen(input));
+  mbedtls_sha256_finish(&ctx, hash);
+  mbedtls_sha256_free(&ctx);
+
+  for (int i = 0; i < 32; i++) {
+    snprintf(outHex + (i * 2), outLen - (i * 2), "%02x", hash[i]);
+  }
+  outHex[64] = '\0';
+}
+
+static bool verifyPersonalPinLocal(const char *pin) {
+  if (!personalPinEnabled || !pin || pin[0] == '\0') return false;
+  if (cachedPersonalPinHashMcu[0] == '\0' || cachedPersonalPinSalt[0] == '\0') {
+    return false;
+  }
+
+  char salted[96];
+  snprintf(salted, sizeof(salted), "%s%s", cachedPersonalPinSalt, pin);
+
+  char computed[65];
+  sha256Hex(salted, computed, sizeof(computed));
+  return constantTimeEquals(computed, cachedPersonalPinHashMcu);
+}
+
+static bool writePersonalPinAuditNow(const char *eventJson) {
+  if (!lteConnected || !eventJson || eventJson[0] == '\0') {
+    return false;
+  }
+
+  char path[96];
+  snprintf(path, sizeof(path), "/hardware/%s/personal_pin_audit/%lu.json",
+           HARDWARE_ID, (unsigned long)millis());
+  bool ok = httpPutWithRetry(path, eventJson);
+  if (!ok) {
+    return false;
+  }
+
+  char latestPatch[384];
+  snprintf(latestPatch, sizeof(latestPatch),
+           "{\"manual_pin_event\":true,\"source\":\"proxy_personal_pin\","
+           "\"last_manual_pin_event\":%s}",
+           eventJson);
+
+  char lockPath[64];
+  snprintf(lockPath, sizeof(lockPath), "/lock_events/%s/latest.json", HARDWARE_ID);
+  httpPatchWithRetry(lockPath, latestPatch);
+  return true;
+}
+
+static void queuePersonalPinAudit(const char *eventJson) {
+  if (!eventJson || eventJson[0] == '\0') return;
+  if (dpEnqueueAuditEvent(eventJson)) {
+    Serial.println("[PIN] Audit event queued offline");
+  }
+}
+
+static void flushQueuedPersonalPinAudits() {
+  if (!lteConnected) return;
+
+  char queued[384];
+  while (dpAuditQueueCount() > 0) {
+    if (!dpDequeueAuditEvent(queued, sizeof(queued))) {
+      return;
+    }
+    if (!writePersonalPinAuditNow(queued)) {
+      dpEnqueueAuditEvent(queued);
+      return;
+    }
+  }
+}
+
+static void writePersonalPinAudit(const char *action,
+                                  const char *result,
+                                  bool currentlyLocked,
+                                  bool offlineQueued) {
+  unsigned long nowEpoch = getCurrentEpoch();
+  char eventJson[384];
+  snprintf(eventJson, sizeof(eventJson),
+           "{\"action\":\"%s\",\"result\":\"%s\",\"currently_locked\":%s,"
+           "\"offline_queued\":%s,\"rider_id\":\"%s\","
+           "\"timestamp\":{\".sv\":\"timestamp\"},\"device_epoch\":%lu}",
+           action ? action : "RIDER_MANUAL_PIN_ATTEMPT",
+           result ? result : "unknown", currentlyLocked ? "true" : "false",
+           offlineQueued ? "true" : "false", cachedPersonalPinRiderId,
+           nowEpoch);
+
+  if (!writePersonalPinAuditNow(eventJson)) {
+    queuePersonalPinAudit(eventJson);
+  }
+}
+
 // ==================== TAMPER CLEAR SUPPRESSION ====================
 // After admin clears tamper, permanently suppress new reed switch
 // events until the box is officially unlocked again.
@@ -2159,6 +2281,43 @@ void refreshDeliveryContextFromFirebase() {
       } else {
         cachedDeliveryId[0] = '\0';
         deliveryIdCacheValid = false;
+      }
+    }
+
+    // Parse Personal PIN runtime metadata (top-level only).
+    {
+      bool parsedEnabled = false;
+      bool enabledVal = false;
+      parsedEnabled = readTopLevelJsonBool(body, "personal_pin_enabled", enabledVal);
+      if (parsedEnabled) {
+        personalPinEnabled = enabledVal;
+        dpSavePersonalPinEnabled(personalPinEnabled);
+      }
+
+      char parsedHash[65] = "";
+      if (readTopLevelJsonString(body, "personal_pin_hash_mcu", parsedHash,
+                                 sizeof(parsedHash)) && strlen(parsedHash) == 64) {
+        strncpy(cachedPersonalPinHashMcu, parsedHash,
+                sizeof(cachedPersonalPinHashMcu) - 1);
+        cachedPersonalPinHashMcu[sizeof(cachedPersonalPinHashMcu) - 1] = '\0';
+        dpSavePersonalPinHash(cachedPersonalPinHashMcu);
+      }
+
+      char parsedSalt[33] = "";
+      if (readTopLevelJsonString(body, "personal_pin_salt", parsedSalt,
+                                 sizeof(parsedSalt)) && strlen(parsedSalt) > 0) {
+        strncpy(cachedPersonalPinSalt, parsedSalt, sizeof(cachedPersonalPinSalt) - 1);
+        cachedPersonalPinSalt[sizeof(cachedPersonalPinSalt) - 1] = '\0';
+        dpSavePersonalPinSalt(cachedPersonalPinSalt);
+      }
+
+      char parsedRider[64] = "";
+      if (readTopLevelJsonString(body, "current_rider_id", parsedRider,
+                                 sizeof(parsedRider)) && strlen(parsedRider) > 0) {
+        strncpy(cachedPersonalPinRiderId, parsedRider,
+                sizeof(cachedPersonalPinRiderId) - 1);
+        cachedPersonalPinRiderId[sizeof(cachedPersonalPinRiderId) - 1] = '\0';
+        dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
       }
     }
 
@@ -2942,6 +3101,55 @@ void handleCameraClient() {
     return;
   }
 
+  // â”€â”€ POST /personal-pin-verify â”€â”€
+  if (strcmp(method, "POST") == 0 && strcmp(reqPath, "/personal-pin-verify") == 0) {
+    Serial.println("[AP] -> POST /personal-pin-verify");
+    char jsonBuf[320] = "";
+    if (contentLength > 0 && contentLength < sizeof(jsonBuf)) {
+      client.setTimeout(5000);
+      size_t rd = client.readBytes(jsonBuf, contentLength);
+      jsonBuf[rd] = '\0';
+    }
+
+    char pin[12] = "";
+    extractJsonStringValue(jsonBuf, "pin", pin, sizeof(pin));
+    bool currentlyLocked = (strstr(jsonBuf, "\"currently_locked\":true") != NULL);
+
+    const char *resultBody = "DENY:invalid";
+    bool verified = false;
+
+    if (!personalPinEnabled) {
+      resultBody = "DENY:disabled";
+    } else if (pin[0] == '\0') {
+      resultBody = "DENY:missing_pin";
+    } else {
+      verified = verifyPersonalPinLocal(pin);
+      if (verified) {
+        resultBody = currentlyLocked ? "ALLOW_UNLOCK" : "ALLOW_RELOCK";
+      } else {
+        resultBody = "DENY:mismatch";
+      }
+    }
+
+    String resp =
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+        String(strlen(resultBody)) + "\r\n\r\n" + resultBody;
+    client.print(resp);
+    client.flush();
+    delay(10);
+    client.stop();
+
+    writePersonalPinAudit("RIDER_MANUAL_PIN_ATTEMPT",
+                          verified ? "success" : "denied", currentlyLocked,
+                          false);
+    if (verified) {
+      writePersonalPinAudit("RIDER_MANUAL_PIN_TOGGLE",
+                            currentlyLocked ? "unlock" : "relock",
+                            currentlyLocked, false);
+    }
+    return;
+  }
+
   // â”€â”€ POST /event â”€â”€
   if (strcmp(method, "POST") == 0 && strcmp(reqPath, "/event") == 0) {
     Serial.println("[AP] -> POST /event");
@@ -3399,6 +3607,19 @@ void setup() {
     deliveryIdCacheValid = true;
     Serial.printf("[DP] Restored DeliveryID from NVS: %s\n", cachedDeliveryId);
   }
+  if (dpLoadPersonalPinHash(cachedPersonalPinHashMcu,
+                            sizeof(cachedPersonalPinHashMcu))) {
+    Serial.println("[DP] Restored personal PIN hash from NVS");
+  }
+  if (dpLoadPersonalPinSalt(cachedPersonalPinSalt, sizeof(cachedPersonalPinSalt))) {
+    Serial.println("[DP] Restored personal PIN salt from NVS");
+  }
+  if (dpLoadPersonalPinRiderId(cachedPersonalPinRiderId,
+                               sizeof(cachedPersonalPinRiderId))) {
+    Serial.printf("[DP] Restored personal PIN rider binding: %s\n",
+                  cachedPersonalPinRiderId);
+  }
+  personalPinEnabled = dpLoadPersonalPinEnabled();
 
   Serial.println("\n=== Ready (LTE Only - AT+HTTP) ===\n");
 
@@ -3578,6 +3799,11 @@ void loop() {
     refreshDeliveryContextFromFirebase();
     checkAndClearTamperFromFirebase();
     lastDeliveryContextRead = now;
+  }
+
+  if (lteConnected && now - lastPersonalPinFlushAt >= PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS) {
+    flushQueuedPersonalPinAudits();
+    lastPersonalPinFlushAt = now;
   }
 
   delay(100);

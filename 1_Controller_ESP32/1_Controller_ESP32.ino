@@ -44,9 +44,11 @@ enum TesterState {
   STATE_STANDBY,
   STATE_IDLE,
   STATE_ENTERING_PIN,
+  STATE_PERSONAL_PIN_ENTRY,
   STATE_VERIFYING_OTP,
   STATE_REQUESTING_FACE,
   STATE_UNLOCKING,
+  STATE_OWNER_UNLOCKED,
   STATE_RELOCKING,
   STATE_SHOW_MESSAGE
 };
@@ -56,11 +58,14 @@ static TesterState currentState = STATE_CONNECTING_WIFI;
 // ── Input buffers ──
 static char    inputCode[8];
 static uint8_t inputLen = 0;
+static char    personalPinCode[8];
+static uint8_t personalPinLen = 0;
 
 // ── Timing trackers ──
 static unsigned long lastDeliveryContextFetch = 0;
 static unsigned long messageStartAt           = 0;
 static unsigned long lastDisplayCheck         = 0;
+static unsigned long personalPinExpiresAt     = 0;
 
 // ── Face check ──
 static bool faceCheckPending = false;
@@ -102,6 +107,8 @@ static uint32_t diagStaleDisplayCount = 0;
 static bool utilityModeActive = false;
 static char utilityModeKey = '\0';
 static unsigned long utilityModeExpiresAt = 0;
+static bool ownerSessionActive = false;
+static bool deferredContextTransition = false;
 
 // ── Forward declarations ──
 void enterState(TesterState newState);
@@ -188,7 +195,8 @@ static unsigned long getDiagRefreshInterval() {
   if (currentState == STATE_STANDBY) {
     return CONTROLLER_DIAG_STANDBY_REFRESH_MS;
   }
-  if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN) {
+  if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN ||
+      currentState == STATE_PERSONAL_PIN_ENTRY) {
     return CONTROLLER_DIAG_IDLE_REFRESH_MS;
   }
   return CONTROLLER_DIAG_STANDBY_REFRESH_MS;
@@ -268,8 +276,9 @@ void pollDiagnosticsIfDue(unsigned long now) {
     return;
   }
 
-  if (!(currentState == STATE_STANDBY || currentState == STATE_IDLE ||
-        currentState == STATE_ENTERING_PIN)) {
+    if (!(currentState == STATE_STANDBY || currentState == STATE_IDLE ||
+      currentState == STATE_ENTERING_PIN ||
+      currentState == STATE_PERSONAL_PIN_ENTRY)) {
     return;
   }
 
@@ -383,56 +392,64 @@ void loop() {
       fetchDeliveryContext();
       lastDeliveryContextFetch = now;
 
-      // Delivery became active
-      if (hasActiveDelivery && !wasActive) {
-        netLog("[CONTEXT] Delivery active! OTP: %s | ID: %s\n", currentOtp, activeDeliveryId);
-        resetOtpAttempts();
-        if (currentState == STATE_STANDBY || currentState == STATE_SHOW_MESSAGE) {
-          enterState(STATE_IDLE);
+      if (currentState == STATE_OWNER_UNLOCKED) {
+        if ((hasActiveDelivery != wasActive) || (oldStatus != lastStatusCommand)) {
+          deferredContextTransition = true;
+          netLog("[OWNER] Deferred delivery transition while owner session active\n");
         }
-      }
-      // Delivery cleared
-      else if (!hasActiveDelivery && wasActive) {
-        netLog("[CONTEXT] Delivery cleared — returning to standby\n");
-        resetOtpAttempts();
-        if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN) {
-          enterState(STATE_STANDBY);
-        }
-      }
-      // Status update while already active (e.g. geofence transit/pickup updates)
-      else if (hasActiveDelivery && wasActive && oldStatus != lastStatusCommand) {
-        if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN) {
-           enterState(STATE_IDLE); // Re-render LCD
-        }
-      }
-
-      // EC-77: Handle remote lock/unlock commands
-      if (lastStatusCommand == "UNLOCKING" && currentState != STATE_UNLOCKING) {
-        netLog("[EC-77] Remote UNLOCK (admin override)\n");
-        lastStatusCommand = ""; // Clear immediately to prevent loop on next timeout
-        adminOverride.trigger(now);
-        reportCommandAckToProxy("UNLOCKING", "accepted", "state_transition_unlocking");
-        // Clear any in-progress keypad input
-        inputLen = 0;
-        inputCode[0] = '\0';
-        enterState(STATE_UNLOCKING);
-        reportAlertToProxy("ADMIN_OVERRIDE", "remote_unlock");
-      } else if (lastStatusCommand == "LOCKED") {
-        netLog("[CONTEXT] Remote LOCK commanded\n");
-        lastStatusCommand = ""; // Clear immediately
-        if (currentState == STATE_UNLOCKING) {
-          // Normal remote relock flow
-          LockStatus ls = tryLock(true); // ignore reed for remote lock
-          reportCommandAckToProxy("LOCKED", "accepted", "state_transition_relocking");
-          if (ls != LOCK_OK) {
-             reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
+      } else {
+        // Delivery became active
+        if (hasActiveDelivery && !wasActive) {
+          netLog("[CONTEXT] Delivery active! OTP: %s | ID: %s\n", currentOtp, activeDeliveryId);
+          resetOtpAttempts();
+          if (currentState == STATE_STANDBY || currentState == STATE_SHOW_MESSAGE) {
+            enterState(STATE_IDLE);
           }
-          enterState(STATE_RELOCKING);
-        } else {
-          // Already locked or in another state — just actuate and stay in current state or go to relocking
-          LockStatus ls = tryLock(true); // ignore reed for remote lock
-          reportCommandAckToProxy("LOCKED", "executed", "already_locked");
-          // Optionally go to relocking state to show message, or stay in current state
+        }
+        // Delivery cleared
+        else if (!hasActiveDelivery && wasActive) {
+          netLog("[CONTEXT] Delivery cleared — returning to standby\n");
+          resetOtpAttempts();
+          if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN ||
+              currentState == STATE_PERSONAL_PIN_ENTRY) {
+            enterState(STATE_STANDBY);
+          }
+        }
+        // Status update while already active (e.g. geofence transit/pickup updates)
+        else if (hasActiveDelivery && wasActive && oldStatus != lastStatusCommand) {
+          if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN ||
+              currentState == STATE_PERSONAL_PIN_ENTRY) {
+             enterState(STATE_IDLE); // Re-render LCD
+          }
+        }
+
+        // EC-77: Handle remote lock/unlock commands
+        if (lastStatusCommand == "UNLOCKING" && currentState != STATE_UNLOCKING) {
+          netLog("[EC-77] Remote UNLOCK (admin override)\n");
+          lastStatusCommand = ""; // Clear immediately to prevent loop on next timeout
+          adminOverride.trigger(now);
+          reportCommandAckToProxy("UNLOCKING", "accepted", "state_transition_unlocking");
+          // Clear any in-progress keypad input
+          inputLen = 0;
+          inputCode[0] = '\0';
+          enterState(STATE_UNLOCKING);
+          reportAlertToProxy("ADMIN_OVERRIDE", "remote_unlock");
+        } else if (lastStatusCommand == "LOCKED") {
+          netLog("[CONTEXT] Remote LOCK commanded\n");
+          lastStatusCommand = ""; // Clear immediately
+          if (currentState == STATE_UNLOCKING) {
+            // Normal remote relock flow
+            LockStatus ls = tryLock(true); // ignore reed for remote lock
+            reportCommandAckToProxy("LOCKED", "accepted", "state_transition_relocking");
+            if (ls != LOCK_OK) {
+               reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
+            }
+            enterState(STATE_RELOCKING);
+          } else {
+            // Already locked or in another state — just actuate and stay in current state or go to relocking
+            LockStatus ls = tryLock(true); // ignore reed for remote lock
+            reportCommandAckToProxy("LOCKED", "executed", "already_locked");
+          }
         }
       }
     }
@@ -451,6 +468,15 @@ void loop() {
   pollDiagnosticsIfDue(now);
   if (utilityModeActive && now >= utilityModeExpiresAt) {
     stopUtilityMode(now);
+  }
+  if (currentState == STATE_PERSONAL_PIN_ENTRY && personalPinExpiresAt > 0 &&
+      now >= personalPinExpiresAt) {
+    netLog("[PIN] Personal PIN mode timeout\n");
+    inputLen = 0;
+    inputCode[0] = '\0';
+    personalPinLen = 0;
+    personalPinCode[0] = '\0';
+    enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
   }
 
   // ── 5. EC-82: Keypad stuck detection ──
@@ -532,6 +558,13 @@ void handleStateMachine(unsigned long now) {
       break;
     }
     char standbyKey = readKeypad();
+    if (standbyKey == '4') {
+      personalPinLen = 0;
+      personalPinCode[0] = '\0';
+      personalPinExpiresAt = now + PERSONAL_PIN_TIMEOUT_MS;
+      enterState(STATE_PERSONAL_PIN_ENTRY);
+      break;
+    }
     if (standbyKey && isUtilityKey(standbyKey)) {
       startUtilityMode(standbyKey, now);
       break;
@@ -554,6 +587,15 @@ void handleStateMachine(unsigned long now) {
     while(true) {
       char key = readKeypad();
       if (!key) break;
+
+      if (currentState == STATE_IDLE && inputLen == 0 && key == '4') {
+        stopUtilityMode(now);
+        personalPinLen = 0;
+        personalPinCode[0] = '\0';
+        personalPinExpiresAt = now + PERSONAL_PIN_TIMEOUT_MS;
+        enterState(STATE_PERSONAL_PIN_ENTRY);
+        break;
+      }
 
       // EC-86: Fallback feedback per keypress if LCD dead
       if (isDisplayFailed()) {
@@ -597,6 +639,76 @@ void handleStateMachine(unsigned long now) {
             fallbackError();
           }
           break; // break the while(true) to handle state change
+        }
+      }
+    }
+    break;
+  }
+
+  case STATE_PERSONAL_PIN_ENTRY: {
+    while (true) {
+      char key = readKeypad();
+      if (!key) break;
+
+      personalPinExpiresAt = now + PERSONAL_PIN_TIMEOUT_MS;
+
+      if (key == '*') {
+        personalPinLen = 0;
+        personalPinCode[0] = '\0';
+        enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
+        break;
+      }
+
+      if (key == '#') {
+        if (personalPinLen == 0) {
+          break;
+        }
+
+        int decision = requestPersonalPinToggle(personalPinCode, isBoxLocked());
+        personalPinLen = 0;
+        personalPinCode[0] = '\0';
+
+        if (decision == 1) {
+          ownerSessionActive = true;
+          enterState(STATE_UNLOCKING);
+        } else if (decision == 2) {
+          LockStatus ls = tryLock(true);
+          ownerSessionActive = false;
+          if (ls == LOCK_OK) {
+            reportEventToProxy(false, false, false, false);
+            enterState(STATE_RELOCKING);
+          } else {
+            reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
+            if (!isDisplayFailed()) {
+              updateDisplay("Lock jammed!", "Contact support");
+            }
+            messageStartAt = now;
+            currentState = STATE_SHOW_MESSAGE;
+          }
+        } else {
+          recordFailedAttempt(now);
+          if (!isDisplayFailed()) {
+            char line1[17];
+            snprintf(line1, sizeof(line1), "%d tries left", getAttemptsRemaining());
+            updateDisplay("Wrong PIN!", line1);
+          }
+          messageStartAt = now;
+          currentState = STATE_SHOW_MESSAGE;
+        }
+        break;
+      }
+
+      if (key >= '0' && key <= '9' && personalPinLen < PERSONAL_PIN_MAX_LEN) {
+        personalPinCode[personalPinLen++] = key;
+        personalPinCode[personalPinLen] = '\0';
+        if (!isDisplayFailed()) {
+          char masked[17] = "";
+          uint8_t i;
+          for (i = 0; i < personalPinLen && i < 15; i++) {
+            masked[i] = '*';
+          }
+          masked[i] = '\0';
+          updateDisplay("Personal PIN:", masked);
         }
       }
     }
@@ -757,6 +869,11 @@ void handleStateMachine(unsigned long now) {
         } else {
           fallbackSuccess();
         }
+
+        if (ownerSessionActive) {
+          enterState(STATE_OWNER_UNLOCKED);
+          break;
+        }
       } else {
         // EC-21/22/96: Solenoid failure
         netLog("[LOCK] Unlock FAILED: %s\n", lockStatusStr(ls));
@@ -795,7 +912,23 @@ void handleStateMachine(unsigned long now) {
     break;
   }
 
+  case STATE_OWNER_UNLOCKED: {
+    char key = readKeypad();
+    if (key == '*') {
+      LockStatus ls = tryLock(true);
+      netLog("[OWNER] Relock from owner session: %s\n", lockStatusStr(ls));
+      ownerSessionActive = false;
+      if (ls != LOCK_OK) {
+        reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
+      }
+      enterState(STATE_RELOCKING);
+    }
+    break;
+  }
+
   case STATE_RELOCKING:
+    ownerSessionActive = false;
+    deferredContextTransition = false;
     armTamper(); // Re-enable tamper detection after authorized unlock completes
     if (!isDisplayFailed()) {
       updateDisplay("Box Locked", "Ready");
@@ -816,7 +949,7 @@ void handleStateMachine(unsigned long now) {
 // ==================== STATE HELPER ====================
 void enterState(TesterState newState) {
   if (utilityModeActive && newState != STATE_STANDBY && newState != STATE_IDLE &&
-      newState != STATE_ENTERING_PIN) {
+      newState != STATE_ENTERING_PIN && newState != STATE_PERSONAL_PIN_ENTRY) {
     stopUtilityMode(millis());
   }
 
@@ -845,6 +978,19 @@ void enterState(TesterState newState) {
     inputLen = 0;
     inputCode[0] = '\0';
     resetFaceSession();
+    break;
+  case STATE_PERSONAL_PIN_ENTRY:
+    personalPinLen = 0;
+    personalPinCode[0] = '\0';
+    personalPinExpiresAt = millis() + PERSONAL_PIN_TIMEOUT_MS;
+    if (!isDisplayFailed()) {
+      updateDisplay("Personal PIN:", "");
+    }
+    break;
+  case STATE_OWNER_UNLOCKED:
+    if (!isDisplayFailed()) {
+      updateDisplay("Owner Access", "* = Relock");
+    }
     break;
   case STATE_CONNECTING_WIFI:
     if (!isDisplayFailed()) {

@@ -489,6 +489,45 @@ bool requestCameraPowerMode(bool wakeMode) {
   return ok;
 }
 
+int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
+  if (WiFi.status() != WL_CONNECTED || !pin || pin[0] == '\0') {
+    return 0;
+  }
+
+  HTTPClient http;
+  char url[96];
+  snprintf(url, sizeof(url), "http://%s:%d/personal-pin-verify", PROXY_HOST,
+           PROXY_PORT);
+
+  char json[256];
+  snprintf(json, sizeof(json),
+           "{\"pin\":\"%s\",\"box_id\":\"%s\",\"delivery_id\":\"%s\","
+           "\"currently_locked\":%s,\"source\":\"controller_keypad\"}",
+           pin, HARDWARE_ID, activeDeliveryId, currentlyLocked ? "true" : "false");
+
+  http.setTimeout(4000);
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST((uint8_t *)json, strlen(json));
+  if (code != 200) {
+    Serial.printf("[PIN] verify HTTP %d\n", code);
+    http.end();
+    return 0;
+  }
+
+  String body = http.getString();
+  body.trim();
+  http.end();
+
+  if (body.indexOf("ALLOW_UNLOCK") >= 0) {
+    return 1;
+  }
+  if (body.indexOf("ALLOW_RELOCK") >= 0) {
+    return 2;
+  }
+  return 0;
+}
+
 // ==================== FACE CHECK ====================
 int requestFaceCheck() {
   // ── Primary: WiFi via proxy ──

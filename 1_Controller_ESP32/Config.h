@@ -48,6 +48,8 @@ static const byte KP_COLS = 3;
 #define FACE_CHECK_MAX_ATTEMPTS   3
 #define FACE_RETRY_DELAY_MS       1500
 #define DELIVERY_CONTEXT_FETCH_MS 1000
+#define PERSONAL_PIN_TIMEOUT_MS   15000
+#define PERSONAL_PIN_MAX_LEN      6
 
 // ==================== UTILITY DIAGNOSTICS MODE ====================
 #define CONTROLLER_DIAG_UTILITY_TIMEOUT_MS 5000
