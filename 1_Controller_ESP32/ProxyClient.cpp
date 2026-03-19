@@ -39,7 +39,13 @@ static String normalizeStatusToken(const String &rawToken) {
     token.trim();
   }
 
-  return token;
+  if (token == "UNLOCKING" || token == "LOCKED" || token == "REBOOT_ALL" ||
+      token == "GEO_PICKUP" || token == "GEO_TRANSIT_PICK" ||
+      token == "GEO_TRANSIT_DROP" || token == "RETURNING") {
+    return token;
+  }
+
+  return "";
 }
 
 static bool parseDiagField(const String &body, const char *key, String &out) {

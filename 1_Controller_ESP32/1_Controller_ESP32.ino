@@ -49,6 +49,7 @@ enum TesterState {
   STATE_REQUESTING_FACE,
   STATE_UNLOCKING,
   STATE_OWNER_UNLOCKED,
+  STATE_AWAITING_CLOSE,
   STATE_RELOCKING,
   STATE_SHOW_MESSAGE
 };
@@ -109,6 +110,10 @@ static char utilityModeKey = '\0';
 static unsigned long utilityModeExpiresAt = 0;
 static bool ownerSessionActive = false;
 static bool deferredContextTransition = false;
+static unsigned long closeAssistUntil = 0;
+static unsigned long awaitingCloseSince = 0;
+static uint8_t closeAssistAttempts = 0;
+static bool awaitingCloseWarnSent = false;
 
 // ── Forward declarations ──
 void enterState(TesterState newState);
@@ -355,21 +360,28 @@ void loop() {
   maintainWiFiConnection(now);
 
   // ── 2. LockSafety tick (thermal model, reed debounce, cutoff) ──
-  if (maintainLockSafety(now) && currentState == STATE_UNLOCKING) {
+  bool lockTimedOut = maintainLockSafety(now);
+  if (lockTimedOut && currentState == STATE_UNLOCKING) {
     netLog("[LOCK] Solenoid CUT OFF (Thermal Safety or Auto-Relock Timeout)\n");
     if (!isDisplayFailed()) {
-      updateDisplay("Lock timeout!", "Relocking...");
+      updateDisplay("Unlock timeout", "#=Close assist");
     } else {
       fallbackError();
     }
     reportEventToProxy(false, false, false, true);
     reportAlertToProxy("THERMAL_CUTOFF", "10s_safety_limit");
-    
-    // Auto-update the mobile app UI back to 'Lock Box' since the mechanical 
-    // hold has ended to prevent burnout.
-    reportCommandAckToProxy("LOCKED", "executed", "auto_relock_timeout");
-    
-    enterState(STATE_RELOCKING);
+
+    // Solenoid hold ended; do not report LOCKED until reed confirms CLOSED.
+    reportCommandAckToProxy("UNLOCKING", "timeout_waiting_close",
+                            "awaiting_physical_close");
+
+    enterState(STATE_AWAITING_CLOSE);
+  }
+
+  if (lockTimedOut && currentState == STATE_AWAITING_CLOSE) {
+    if (!isDisplayFailed()) {
+      updateDisplay("Assist timeout", "# to retry");
+    }
   }
 
   // ── 2b. Reed switch tamper detection ──
@@ -424,7 +436,13 @@ void loop() {
         }
 
         // EC-77: Handle remote lock/unlock commands
-        if (lastStatusCommand == "UNLOCKING" && currentState != STATE_UNLOCKING) {
+        if (lastStatusCommand == "REBOOT_ALL") {
+          netLog("[REMOTE] REBOOT_ALL received. Controller restarting...\n");
+          lastStatusCommand = "";
+          reportCommandAckToProxy("REBOOT_ALL", "accepted", "controller_restarting");
+          delay(150);
+          ESP.restart();
+        } else if (lastStatusCommand == "UNLOCKING" && currentState != STATE_UNLOCKING) {
           netLog("[EC-77] Remote UNLOCK (admin override)\n");
           lastStatusCommand = ""; // Clear immediately to prevent loop on next timeout
           adminOverride.trigger(now);
@@ -439,16 +457,29 @@ void loop() {
           lastStatusCommand = ""; // Clear immediately
           if (currentState == STATE_UNLOCKING) {
             // Normal remote relock flow
-            LockStatus ls = tryLock(true); // ignore reed for remote lock
-            reportCommandAckToProxy("LOCKED", "accepted", "state_transition_relocking");
-            if (ls != LOCK_OK) {
-               reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
+            LockStatus ls = tryLock();
+            if (ls == LOCK_OK) {
+              reportCommandAckToProxy("LOCKED", "accepted", "state_transition_relocking");
+              enterState(STATE_RELOCKING);
+            } else if (ls == LOCK_STUCK_OPEN) {
+              reportCommandAckToProxy("LOCKED", "waiting_close", "reed_open");
+              enterState(STATE_AWAITING_CLOSE);
+            } else {
+              reportCommandAckToProxy("LOCKED", "failed_lock", lockStatusStr(ls));
+              reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
             }
-            enterState(STATE_RELOCKING);
           } else {
             // Already locked or in another state — just actuate and stay in current state or go to relocking
-            LockStatus ls = tryLock(true); // ignore reed for remote lock
-            reportCommandAckToProxy("LOCKED", "executed", "already_locked");
+            LockStatus ls = tryLock();
+            if (ls == LOCK_OK) {
+              reportCommandAckToProxy("LOCKED", "executed", "already_locked");
+            } else if (ls == LOCK_STUCK_OPEN) {
+              reportCommandAckToProxy("LOCKED", "waiting_close", "reed_open");
+              enterState(STATE_AWAITING_CLOSE);
+            } else {
+              reportCommandAckToProxy("LOCKED", "failed_lock", lockStatusStr(ls));
+              reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
+            }
           }
         }
       }
@@ -672,11 +703,16 @@ void handleStateMachine(unsigned long now) {
           ownerSessionActive = true;
           enterState(STATE_UNLOCKING);
         } else if (decision == 2) {
-          LockStatus ls = tryLock(true);
+          LockStatus ls = tryLock();
           ownerSessionActive = false;
           if (ls == LOCK_OK) {
             reportEventToProxy(false, false, false, false);
             enterState(STATE_RELOCKING);
+          } else if (ls == LOCK_STUCK_OPEN) {
+            if (!isDisplayFailed()) {
+              updateDisplay("Close lid first", "#=Close assist");
+            }
+            enterState(STATE_AWAITING_CLOSE);
           } else {
             reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
             if (!isDisplayFailed()) {
@@ -904,10 +940,19 @@ void handleStateMachine(unsigned long now) {
       netLog("[LOCK] Manual relock: %s\n", lockStatusStr(ls));
       reportEventToProxy(false, false, false, false);
 
-      if (ls != LOCK_OK) {
+      if (ls == LOCK_OK) {
+        enterState(STATE_RELOCKING);
+      } else {
         reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
+        if (ls == LOCK_STUCK_OPEN) {
+          if (!isDisplayFailed()) {
+            updateDisplay("Close lid first", "#=Close assist");
+          }
+          enterState(STATE_AWAITING_CLOSE);
+        } else {
+          enterState(STATE_RELOCKING);
+        }
       }
-      enterState(STATE_RELOCKING);
     }
     break;
   }
@@ -915,13 +960,79 @@ void handleStateMachine(unsigned long now) {
   case STATE_OWNER_UNLOCKED: {
     char key = readKeypad();
     if (key == '*') {
-      LockStatus ls = tryLock(true);
+      LockStatus ls = tryLock();
       netLog("[OWNER] Relock from owner session: %s\n", lockStatusStr(ls));
-      ownerSessionActive = false;
-      if (ls != LOCK_OK) {
+      if (ls == LOCK_OK) {
+        ownerSessionActive = false;
+        enterState(STATE_RELOCKING);
+      } else {
+        reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
+        if (ls == LOCK_STUCK_OPEN) {
+          if (!isDisplayFailed()) {
+            updateDisplay("Close lid first", "#=Close assist");
+          }
+          enterState(STATE_AWAITING_CLOSE);
+        }
+      }
+    }
+    break;
+  }
+
+  case STATE_AWAITING_CLOSE: {
+    // Finalize lock only when physical close is confirmed.
+    if (!isSolenoidActive() && isBoxLocked()) {
+      reportCommandAckToProxy("LOCKED", "executed", "reed_closed_confirmed");
+      enterState(STATE_RELOCKING);
+      break;
+    }
+
+    if (!awaitingCloseWarnSent && awaitingCloseSince > 0 &&
+        now - awaitingCloseSince >= LOCK_AWAIT_CLOSE_WARN_MS) {
+      awaitingCloseWarnSent = true;
+      reportAlertToProxy("SOLENOID_STUCK", "awaiting_close_timeout");
+    }
+
+    char key = readKeypad();
+    if (key == '#' && !isSolenoidActive()) {
+      if (closeAssistAttempts >= LOCK_CLOSE_ASSIST_MAX_ATTEMPTS) {
+        if (!isDisplayFailed()) {
+          updateDisplay("Assist limit hit", "Check alignment");
+        }
+        reportAlertToProxy("SOLENOID_STUCK", "close_assist_limit");
+        break;
+      }
+
+      LockStatus ls = tryUnlock(true);
+      if (ls == LOCK_OK) {
+        closeAssistAttempts++;
+        closeAssistUntil = now + LOCK_CLOSE_ASSIST_HOLD_MS;
+        if (!isDisplayFailed()) {
+          updateDisplay("Push lid closed", "Assist active");
+        }
+      } else {
         reportAlertToProxy("SOLENOID_STUCK", lockStatusStr(ls));
       }
-      enterState(STATE_RELOCKING);
+    }
+
+    if (isSolenoidActive()) {
+      // If lid closes during assist, lock immediately.
+      if (isBoxLocked()) {
+        LockStatus ls = tryLock();
+        if (ls == LOCK_OK) {
+          reportCommandAckToProxy("LOCKED", "executed", "reed_closed_confirmed");
+          enterState(STATE_RELOCKING);
+          break;
+        }
+      }
+
+      // End assist window and return to waiting state if still open.
+      if (closeAssistUntil > 0 && now >= closeAssistUntil) {
+        LockStatus ls = tryLock();
+        closeAssistUntil = 0;
+        if (ls != LOCK_OK && !isDisplayFailed()) {
+          updateDisplay("Still open", "# to retry");
+        }
+      }
     }
     break;
   }
@@ -990,6 +1101,16 @@ void enterState(TesterState newState) {
   case STATE_OWNER_UNLOCKED:
     if (!isDisplayFailed()) {
       updateDisplay("Owner Access", "* = Relock");
+    }
+    break;
+  case STATE_AWAITING_CLOSE:
+    suppressTamper();
+    closeAssistUntil = 0;
+    awaitingCloseSince = millis();
+    closeAssistAttempts = 0;
+    awaitingCloseWarnSent = false;
+    if (!isDisplayFailed()) {
+      updateDisplay("Close lid first", "#=Close assist");
     }
     break;
   case STATE_CONNECTING_WIFI:

@@ -72,6 +72,9 @@ static const byte KP_COLS = 3;
 #define LOCK_THERMAL_MAX_TEMP     80.0f   // EC-96: Modeled coil temp ceiling (C)
 #define LOCK_HEAT_PER_ACTUATION   15.0f   // C added per actuation
 #define LOCK_COOLING_RATE         0.05f   // C per ms of cooling
+#define LOCK_CLOSE_ASSIST_HOLD_MS 5000    // '#' close-assist retract window (5 s)
+#define LOCK_CLOSE_ASSIST_MAX_ATTEMPTS 3  // Max close-assist retries before alert
+#define LOCK_AWAIT_CLOSE_WARN_MS   60000  // Warn if lid remains open for too long
 
 // ==================== OTP LOCKOUT (EC-04) ====================
 #define MAX_OTP_ATTEMPTS          5

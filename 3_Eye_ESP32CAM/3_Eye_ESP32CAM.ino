@@ -95,6 +95,8 @@ static unsigned long scanCount = 0;
 static unsigned long personCount = 0;
 static bool cameraInDetectMode = true;
 static bool cameraSleepMode = false;
+static bool camRebootPending = false;
+static unsigned long camRebootAtMs = 0;
 
 // Deferred upload flag — set by face-check handlers, executed in loop()
 static bool pendingUpload = false;
@@ -836,6 +838,10 @@ void handleFaceStatusClient() {
       result = setCameraSleepMode(true) ? "CAM_SLEEP_OK" : "CAM_SLEEP_FAIL";
     } else if (mode == "wake") {
       result = setCameraSleepMode(false) ? "CAM_WAKE_OK" : "CAM_WAKE_FAIL";
+    } else if (mode == "reboot") {
+      result = "CAM_REBOOTING";
+      camRebootPending = true;
+      camRebootAtMs = millis() + 200;
     }
 
     char resp[160];
@@ -942,6 +948,12 @@ void loop() {
     captureHighResAndUpload();
     netLog("[UPLOAD] Done. One photo captured.\n");
     uploadInProgress = false;
+  }
+
+  if (camRebootPending && millis() >= camRebootAtMs) {
+    netLog("[POWER] Remote reboot requested. Restarting CAM...\n");
+    delay(50);
+    ESP.restart();
   }
 
   // A tiny yield so the ESP32 doesn't trigger FreeRTOS watchdogs

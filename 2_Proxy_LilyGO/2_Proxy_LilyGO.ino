@@ -133,6 +133,10 @@ unsigned long cachedStatusSetAt = 0;
 uint8_t cachedStatusServesRemaining = 0;
 #define STATUS_COMMAND_MAX_SERVES 60
 #define STATUS_COMMAND_RETRY_WINDOW_MS 60000
+bool rebootAllPending = false;
+bool rebootCamDispatchDone = false;
+unsigned long rebootAllAtMs = 0;
+#define REBOOT_ALL_GRACE_MS 5000
 
 // Internal proxy state to prevent telemetry from overwriting physical lock state on Firebase
 bool isBoxLocked = true;
@@ -2010,6 +2014,20 @@ static void sha256Hex(const char *input, char *outHex, size_t outLen) {
   outHex[64] = '\0';
 }
 
+static void clearPersonalPinRuntimeCache(bool clearPersisted) {
+  personalPinEnabled = false;
+  cachedPersonalPinHashMcu[0] = '\0';
+  cachedPersonalPinSalt[0] = '\0';
+  cachedPersonalPinRiderId[0] = '\0';
+
+  if (clearPersisted) {
+    dpSavePersonalPinEnabled(false);
+    dpSavePersonalPinHash("");
+    dpSavePersonalPinSalt("");
+    dpSavePersonalPinRiderId("");
+  }
+}
+
 static bool verifyPersonalPinLocal(const char *pin) {
   if (!personalPinEnabled || !pin || pin[0] == '\0') return false;
   if (cachedPersonalPinHashMcu[0] == '\0' || cachedPersonalPinSalt[0] == '\0') {
@@ -2285,35 +2303,79 @@ void refreshDeliveryContextFromFirebase() {
     }
 
     // Parse Personal PIN runtime metadata (top-level only).
+    // Fail-closed: if payload is incomplete during rider swaps, clear stale cache.
     {
-      bool parsedEnabled = false;
       bool enabledVal = false;
-      parsedEnabled = readTopLevelJsonBool(body, "personal_pin_enabled", enabledVal);
-      if (parsedEnabled) {
-        personalPinEnabled = enabledVal;
-        dpSavePersonalPinEnabled(personalPinEnabled);
-      }
+      bool parsedEnabled = readTopLevelJsonBool(body, "personal_pin_enabled", enabledVal);
+      bool hasEnabledField = body.indexOf("\"personal_pin_enabled\":") >= 0;
+      bool hasHashField = body.indexOf("\"personal_pin_hash_mcu\":") >= 0;
+      bool hasSaltField = body.indexOf("\"personal_pin_salt\":") >= 0;
+      bool hasRiderField = body.indexOf("\"current_rider_id\":") >= 0;
+      bool hasAnyPersonalPinRuntimeField =
+          hasEnabledField || hasHashField || hasSaltField || hasRiderField;
 
       char parsedHash[65] = "";
-      if (readTopLevelJsonString(body, "personal_pin_hash_mcu", parsedHash,
-                                 sizeof(parsedHash)) && strlen(parsedHash) == 64) {
+      bool parsedHashOk = readTopLevelJsonString(body, "personal_pin_hash_mcu", parsedHash,
+                     sizeof(parsedHash));
+      bool hashValid = parsedHashOk && strlen(parsedHash) == 64;
+
+      char parsedSalt[33] = "";
+      bool parsedSaltOk = readTopLevelJsonString(body, "personal_pin_salt", parsedSalt,
+                     sizeof(parsedSalt));
+      bool saltValid = parsedSaltOk && strlen(parsedSalt) > 0;
+
+      char parsedRider[64] = "";
+      bool parsedRiderOk = readTopLevelJsonString(body, "current_rider_id", parsedRider,
+                      sizeof(parsedRider));
+      bool riderValid = parsedRiderOk && strlen(parsedRider) > 0;
+
+      char previousRider[64] = "";
+      strncpy(previousRider, cachedPersonalPinRiderId, sizeof(previousRider) - 1);
+      previousRider[sizeof(previousRider) - 1] = '\0';
+      bool riderChanged = riderValid && previousRider[0] != '\0' &&
+                          strcmp(previousRider, parsedRider) != 0;
+
+      if (!hasAnyPersonalPinRuntimeField) {
+        if (personalPinEnabled || cachedPersonalPinHashMcu[0] ||
+            cachedPersonalPinSalt[0] || cachedPersonalPinRiderId[0]) {
+          Serial.println("[PIN] Personal PIN runtime fields missing; clearing stale cache");
+          clearPersonalPinRuntimeCache(true);
+        }
+      } else if (!riderValid) {
+        Serial.println("[PIN] Missing current_rider_id; clearing Personal PIN cache");
+        clearPersonalPinRuntimeCache(true);
+      } else if (!parsedEnabled || !enabledVal) {
+        clearPersonalPinRuntimeCache(true);
+        strncpy(cachedPersonalPinRiderId, parsedRider,
+                sizeof(cachedPersonalPinRiderId) - 1);
+        cachedPersonalPinRiderId[sizeof(cachedPersonalPinRiderId) - 1] = '\0';
+        dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+      } else if (!hashValid || !saltValid) {
+        Serial.println("[PIN] Incomplete Personal PIN runtime payload; clearing cache");
+        clearPersonalPinRuntimeCache(true);
+        strncpy(cachedPersonalPinRiderId, parsedRider,
+                sizeof(cachedPersonalPinRiderId) - 1);
+        cachedPersonalPinRiderId[sizeof(cachedPersonalPinRiderId) - 1] = '\0';
+        dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+      } else {
+        if (riderChanged) {
+          Serial.printf("[PIN] Rider changed (%s -> %s); replacing Personal PIN cache\n",
+                        previousRider, parsedRider);
+        }
+
+        personalPinEnabled = true;
+        dpSavePersonalPinEnabled(true);
+
         strncpy(cachedPersonalPinHashMcu, parsedHash,
                 sizeof(cachedPersonalPinHashMcu) - 1);
         cachedPersonalPinHashMcu[sizeof(cachedPersonalPinHashMcu) - 1] = '\0';
         dpSavePersonalPinHash(cachedPersonalPinHashMcu);
-      }
 
-      char parsedSalt[33] = "";
-      if (readTopLevelJsonString(body, "personal_pin_salt", parsedSalt,
-                                 sizeof(parsedSalt)) && strlen(parsedSalt) > 0) {
-        strncpy(cachedPersonalPinSalt, parsedSalt, sizeof(cachedPersonalPinSalt) - 1);
+        strncpy(cachedPersonalPinSalt, parsedSalt,
+                sizeof(cachedPersonalPinSalt) - 1);
         cachedPersonalPinSalt[sizeof(cachedPersonalPinSalt) - 1] = '\0';
         dpSavePersonalPinSalt(cachedPersonalPinSalt);
-      }
 
-      char parsedRider[64] = "";
-      if (readTopLevelJsonString(body, "current_rider_id", parsedRider,
-                                 sizeof(parsedRider)) && strlen(parsedRider) > 0) {
         strncpy(cachedPersonalPinRiderId, parsedRider,
                 sizeof(cachedPersonalPinRiderId) - 1);
         cachedPersonalPinRiderId[sizeof(cachedPersonalPinRiderId) - 1] = '\0';
@@ -2335,6 +2397,7 @@ void refreshDeliveryContextFromFirebase() {
         returnActive = false;
 
         dpClear();
+        clearPersonalPinRuntimeCache(false);
 
         char hwPath[64];
         snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
@@ -2495,6 +2558,14 @@ void refreshDeliveryContextFromFirebase() {
             cachedStatusServesRemaining = STATUS_COMMAND_MAX_SERVES;
             Serial.printf("[CONTEXT] Remote command parsed: '%s' (retry window armed)\n",
                           cachedStatus);
+
+            if (strcmp(cachedStatus, "REBOOT_ALL") == 0) {
+              rebootAllPending = true;
+              rebootCamDispatchDone = false;
+              rebootAllAtMs = millis() + REBOOT_ALL_GRACE_MS;
+              Serial.printf("[REBOOT_ALL] Grace window started (%lums)\n",
+                            (unsigned long)REBOOT_ALL_GRACE_MS);
+            }
 
             // Clear command from Firebase after caching locally.
             char hwPath[64];
@@ -2810,6 +2881,32 @@ String forwardCameraPowerCommand(const String &mode) {
   Serial.printf("[CAM] Power mode=%s response: %s\n", mode.c_str(),
                 result.c_str());
   return result.length() > 0 ? result : "ERROR:cam_timeout";
+}
+
+void triggerRebootAllIfScheduled(unsigned long now) {
+  if (!rebootAllPending) {
+    return;
+  }
+
+  if (!rebootCamDispatchDone) {
+    String camResult = forwardCameraPowerCommand("reboot");
+    Serial.printf("[REBOOT_ALL] CAM dispatch result: %s\n", camResult.c_str());
+    rebootCamDispatchDone = true;
+  }
+
+  if (now < rebootAllAtMs) {
+    return;
+  }
+
+  char rebootPath[64];
+  snprintf(rebootPath, sizeof(rebootPath), "/hardware/%s/reboot.json", HARDWARE_ID);
+  httpPatchWithRetry(
+      rebootPath,
+      "{\"rebooted\":true,\"source\":\"reboot_all\",\"scope\":\"proxy_controller_cam\",\"timestamp\":{\".sv\":\"timestamp\"}}");
+
+  Serial.println("[REBOOT_ALL] Proxy restarting now");
+  delay(150);
+  ESP.restart();
 }
 
 // ==================== HOTSPOT HTTP ROUTER ====================
@@ -3620,6 +3717,12 @@ void setup() {
                   cachedPersonalPinRiderId);
   }
   personalPinEnabled = dpLoadPersonalPinEnabled();
+  if (personalPinEnabled &&
+      (cachedPersonalPinHashMcu[0] == '\0' || cachedPersonalPinSalt[0] == '\0' ||
+       cachedPersonalPinRiderId[0] == '\0')) {
+    Serial.println("[PIN] Incomplete persisted Personal PIN cache; forcing disable");
+    clearPersonalPinRuntimeCache(true);
+  }
 
   Serial.println("\n=== Ready (LTE Only - AT+HTTP) ===\n");
 
@@ -3693,6 +3796,8 @@ void loop() {
       }
     }
   }
+
+  triggerRebootAllIfScheduled(now);
 
   // Check LTE connection periodically
   if (now - lastSig >= signalInterval) {
