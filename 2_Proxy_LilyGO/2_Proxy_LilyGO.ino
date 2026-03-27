@@ -3582,6 +3582,14 @@ uint8_t registerWithFirebase(const char *macHex) {
 void autoProvision() {
   Preferences prefs;
   prefs.begin("smartbox", false);
+
+  // ── ONE-TIME NVS WIPE: Uncomment the #define to force re-provisioning ──
+// #define FORCE_REPROVISION
+#ifdef FORCE_REPROVISION
+  prefs.remove("box_num");
+  Serial.println("[PROV] FORCE_REPROVISION: cleared NVS cache");
+#endif
+
   boxNum = prefs.getUChar("box_num", 0);
 
   if (boxNum > 0) {
@@ -3620,19 +3628,6 @@ void setup() {
   esp_task_wdt_add(NULL);                 // Watch the main loop task
   Serial.printf("[WDT] Watchdog armed (%ds timeout)\n", WDT_TIMEOUT_S);
 
-  // Auto-provision box identity (NVS cache or Firebase registration)
-  autoProvision();
-
-  // â”€â”€ Start WiFi hotspot so ESP32-CAM can connect and relay images â”€â”€
-  startHotspot();
-  if (apStarted) {
-    camServer.begin();
-    Serial.printf("[AP] Camera proxy server listening on port %d\n",
-                  CAM_SERVER_PORT);
-    Serial.printf("[AP] ESP32-CAM should connect to SSID '%s' / '%s'\n",
-                  AP_SSID, AP_PASS);
-  }
-
   // Initialize modem with proper power sequence
   modemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
   powerModem();
@@ -3649,12 +3644,28 @@ void setup() {
   gpsEnabled = initGPS();
   Serial.println(gpsEnabled ? "GPS: Ready" : "GPS: Failed (continuing)");
 
+  // ── Connect LTE FIRST (Firebase provisioning needs HTTP) ──
   Serial.println("\nConnecting via LTE...");
   if (!connectLTE()) {
     Serial.println("\n*** LTE CONNECTION FAILED - will retry in loop() ***");
     Serial.println("  CHECK: 1) SIM has active data plan");
     Serial.println("         2) LTE antenna connected");
     Serial.println("         3) Signal coverage in area");
+  }
+
+  // Auto-provision box identity (NVS cache or Firebase registration)
+  // MUST be after LTE is connected so first-boot Firebase lookup works
+  autoProvision();
+
+  // ── Start WiFi hotspot so ESP32-CAM can connect and relay images ──
+  // (after provisioning so AP_SSID has the correct box number)
+  startHotspot();
+  if (apStarted) {
+    camServer.begin();
+    Serial.printf("[AP] Camera proxy server listening on port %d\n",
+                  CAM_SERVER_PORT);
+    Serial.printf("[AP] ESP32-CAM should connect to SSID '%s' / '%s'\n",
+                  AP_SSID, AP_PASS);
   }
 
   // â”€â”€ POST-LTE: Retry AGPS + XTRA now that data is available â”€â”€
