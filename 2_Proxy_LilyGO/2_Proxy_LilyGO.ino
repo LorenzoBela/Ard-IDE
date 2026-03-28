@@ -100,6 +100,7 @@ unsigned long lastModemHealth = 0, lastMemReport = 0;
 double gpsLat = 0, gpsLon = 0;
 double gpsHdop = 99.9; // Horizontal Dilution of Precision (99.9 = unknown)
 float  gpsSpeed = 0.0f; // Speed in knots from CGNSSINFO, converted to m/s
+float  gpsCourse = -1.0f; // Course over ground in degrees (0-360), -1 = invalid/stationary
 bool gpsFix = false;
 int cachedSignalRssi = -999;
 int cachedSignalCsq = -1;
@@ -542,6 +543,21 @@ void readGPS() {
       if (spdStr.length() > 0) {
         float knots = spdStr.toFloat();
         gpsSpeed = knots * 0.514444f; // knots -> m/s
+      }
+    }
+
+    // Extract course/heading (field 13): between commas[12] and commas[13]
+    // Course Over Ground (COG) in degrees — only reliable when moving
+    if (commaCount >= 14) {
+      String courseStr = data.substring(commas[12] + 1, commas[13]);
+      courseStr.trim();
+      if (courseStr.length() > 0) {
+        float c = courseStr.toFloat();
+        // COG is only reliable when moving (speed > ~5.4 km/h)
+        if (gpsSpeed > 1.5f && c >= 0.0f && c < 360.0f) {
+          gpsCourse = c;
+        }
+        // If stationary, keep last known course (don't reset to -1)
       }
     }
 
@@ -1452,15 +1468,20 @@ void sendToFirebase() {
 
   // â”€â”€ Build location JSON with snprintf â”€â”€
   if (gpsFix) {
-    char locationJson[320];
+    char locationJson[384];
     snprintf(locationJson, sizeof(locationJson),
              "{\"latitude\":%.6f,"
              "\"longitude\":%.6f,"
+             "\"heading\":%.1f,"
+             "\"speed\":%.2f,"
              "\"hdop\":%.2f,"
              "\"timestamp\":%lu,"
              "\"timestamp_str\":\"%s\","
              "\"source\":\"box\"}",
-             gpsLat, gpsLon, gpsHdop, now_epoch, tsBuf);
+             gpsLat, gpsLon,
+             gpsCourse >= 0.0f ? gpsCourse : -1.0f,
+             gpsSpeed,
+             gpsHdop, now_epoch, tsBuf);
 
     char locPath[64];
     snprintf(locPath, sizeof(locPath), "/locations/%s/box.json", HARDWARE_ID);
