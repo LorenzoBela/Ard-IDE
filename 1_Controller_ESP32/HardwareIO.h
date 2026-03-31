@@ -10,7 +10,7 @@
 #ifndef HARDWARE_IO_H
 #define HARDWARE_IO_H
 
-#include <Keypad.h>
+#include <Arduino.h>
 #include <LiquidCrystal_I2C.h>
 #include "Config.h"
 
@@ -29,7 +29,7 @@ void displayBacklightOff();
 /** Read one keypad character (non-blocking). Returns '\0' if nothing pressed. */
 char readKeypad();
 
-/** Access the global Keypad instance (for getState() etc.). */
-Keypad& getKeypad();
+/** Get the currently held key (thread-safe, for EC-82 stuck detection). */
+char getHeldKey();
 
 #endif // HARDWARE_IO_H

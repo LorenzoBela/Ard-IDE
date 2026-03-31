@@ -252,10 +252,22 @@ void startUtilityMode(char utilityKey, unsigned long now) {
   utilityModeKey = utilityKey;
   utilityModeExpiresAt = now + CONTROLLER_DIAG_UTILITY_TIMEOUT_MS;
   displayBacklightOn();
-  renderUtilityMode(now);
-  if (diagNextPollAt > now) {
-    diagNextPollAt = now;
+
+  // Fetch fresh diagnostics immediately so first render shows LIVE data.
+  if (WiFi.status() == WL_CONNECTED) {
+    ControllerDiagData data = diagCache;
+    if (fetchDiagnostics(data)) {
+      diagCache = data;
+      diagCacheValid = true;
+      diagLastSuccessAt = now;
+      diagRetryBackoffMs = CONTROLLER_DIAG_RETRY_BASE_MS;
+      diagSuccessCount++;
+    }
   }
+
+  renderUtilityMode(now);
+  // Schedule next poll at the utility refresh rate (1 s).
+  diagNextPollAt = now + CONTROLLER_DIAG_UTILITY_REFRESH_MS;
 }
 
 void stopUtilityMode(unsigned long now) {
@@ -512,8 +524,7 @@ void loop() {
 
   // ── 5. EC-82: Keypad stuck detection ──
   {
-    Keypad& kp = getKeypad();
-    char heldKey = (kp.getState() == HOLD) ? kp.key[0].kchar : 0;
+    char heldKey = getHeldKey(); // Thread-safe: written by keypadTask on Core 1
     keypadHealth.update(heldKey, now);
 
     static bool stuckReported = false;
@@ -619,7 +630,8 @@ void handleStateMachine(unsigned long now) {
       char key = readKeypad();
       if (!key) break;
 
-      if (currentState == STATE_IDLE && inputLen == 0 && key == '4') {
+      // Personal PIN shortcut (key '4') — only when no PIN-eligible delivery
+      if (currentState == STATE_IDLE && inputLen == 0 && key == '4' && !isPinEligibleNow()) {
         stopUtilityMode(now);
         personalPinLen = 0;
         personalPinCode[0] = '\0';
@@ -641,7 +653,10 @@ void handleStateMachine(unsigned long now) {
       } else if (key == '#') {
         stopUtilityMode(now);
         if (inputLen > 0) enterState(STATE_VERIFYING_OTP);
-      } else if (isUtilityKey(key) && ((currentState == STATE_IDLE && inputLen == 0) || utilityModeActive || !isPinEligibleNow())) {
+      } else if (isUtilityKey(key) && !isPinEligibleNow() &&
+                 ((currentState == STATE_IDLE && inputLen == 0) || utilityModeActive)) {
+        // Utility mode (1-3) only accessible when delivery is NOT PIN-eligible
+        // (i.e., in transit/pickup phase, or no delivery at all)
         startUtilityMode(key, now);
       } else if (inputLen < 6) {
         // Enforce geofence lock: no PIN entry unless journey phase is PIN-eligible.

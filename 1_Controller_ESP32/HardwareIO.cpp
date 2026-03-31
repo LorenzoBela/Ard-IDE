@@ -5,6 +5,7 @@
  */
 
 #include "HardwareIO.h"
+#include <Keypad.h>
 #include <Wire.h>
 #include <Arduino.h>
 
@@ -25,12 +26,23 @@ static Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, KP_ROWS, KP_CO
 
 static QueueHandle_t keyQueue = NULL;
 
+// Thread-safe held-key tracking (written by keypadTask on Core 1,
+// read by main loop on Core 0 for EC-82 stuck detection).
+static volatile char heldKeyAtomic = 0;
+
 static void keypadTask(void *pvParameters) {
   while (true) {
     char k = keypad.getKey();
     if (k) {
       xQueueSend(keyQueue, &k, 0); // Non-blocking send
       Serial.printf("[KEYPAD] Buffered: %c\n", k);
+    }
+    // Track held key for EC-82 stuck detection (same core as getKey).
+    KeyState st = keypad.getState();
+    if (st == HOLD && keypad.key[0].kchar != 0) {
+      heldKeyAtomic = keypad.key[0].kchar;
+    } else if (st == IDLE) {
+      heldKeyAtomic = 0;
     }
     vTaskDelay(pdMS_TO_TICKS(20)); // Poll every 20ms
   }
@@ -86,6 +98,6 @@ char readKeypad() {
   return k;
 }
 
-Keypad& getKeypad() {
-  return keypad;
+char getHeldKey() {
+  return heldKeyAtomic;
 }
