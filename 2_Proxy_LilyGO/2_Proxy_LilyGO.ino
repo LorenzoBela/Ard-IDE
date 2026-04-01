@@ -2131,9 +2131,57 @@ static void writePersonalPinAudit(const char *action,
 }
 
 // ==================== TAMPER CLEAR SUPPRESSION ====================
-// After admin clears tamper, permanently suppress new reed switch
-// events until the box is officially unlocked again.
+// After admin clears tamper, suppress reed switch events only for a bounded
+// period while waiting for a verified unlock transition.
 static bool tamperSuppressedByAdmin = false;
+static unsigned long tamperSuppressedAtMs = 0;
+static bool tamperRetriggerPending = false;
+static unsigned long tamperRetriggerAtMs = 0;
+static const unsigned long TAMPER_SUPPRESSION_TTL_MS = 120000UL;
+
+void writeTamperToFirebase();
+
+static void captureSuppressedTamper(unsigned long now) {
+  tamperRetriggerPending = true;
+  tamperRetriggerAtMs = now;
+  Serial.println("[TAMPER] Suppressed retrigger captured for replay");
+}
+
+static void clearTamperSuppression(const char *reason) {
+  if (tamperSuppressedByAdmin) {
+    Serial.printf("[TAMPER] Suppression cleared (%s)\n", reason ? reason : "unspecified");
+  }
+  tamperSuppressedByAdmin = false;
+  tamperSuppressedAtMs = 0;
+}
+
+static void replayPendingTamperIfAny(unsigned long now, const char *reason) {
+  if (!tamperRetriggerPending) return;
+
+  Serial.printf("[TAMPER] Replaying suppressed tamper (%s)\n",
+                reason ? reason : "unspecified");
+  tamperRetriggerPending = false;
+  tamperRetriggerAtMs = 0;
+
+  if (!theftGuardIsLockdown()) {
+    theftGuardActivateLockdown("tamper_retrigger", now);
+  }
+  writeTamperToFirebase();
+}
+
+static void startTamperSuppression(unsigned long now) {
+  tamperSuppressedByAdmin = true;
+  tamperSuppressedAtMs = now;
+}
+
+static void enforceTamperSuppressionTimeout(unsigned long now) {
+  if (!tamperSuppressedByAdmin || tamperSuppressedAtMs == 0) return;
+
+  if (now - tamperSuppressedAtMs < TAMPER_SUPPRESSION_TTL_MS) return;
+
+  clearTamperSuppression("timeout_no_unlock_ack");
+  replayPendingTamperIfAny(now, "suppression_timeout");
+}
 
 void refreshDeliveryContextFromFirebase() {
   if (!lteConnected) {
@@ -2708,12 +2756,12 @@ void writeCommandAckToFirebase(const char *command, const char *status,
       httpPatchWithRetry(hwPath, "{\"status\":\"UNLOCKING\"}");
 
       // Only clear admin tamper suppression when unlock was acknowledged by
-      // the controller.
+      // the controller, then replay any suppressed retrigger.
       if (tamperSuppressedByAdmin &&
           (strcmp(status, "executed") == 0 ||
            strcmp(status, "already_unlocked") == 0)) {
-        tamperSuppressedByAdmin = false;
-        Serial.println("[TAMPER] Suppression cleared by unlock command ACK");
+        clearTamperSuppression("unlock_command_ack");
+        replayPendingTamperIfAny(millis(), "unlock_command_ack");
       }
     }
   }
@@ -2780,11 +2828,14 @@ void checkAndClearTamperFromFirebase() {
 
   String body = httpGetFromFirebase(clearPath);
   if (body.length() == 0 || body == "null") return;
+  bool clearPayloadIsObject = body.startsWith("{");
 
   // Admin requested clear — reset TheftGuard state machine
   Serial.println("[TAMPER] Admin clear_tamper detected — resetting TheftGuard");
   theftGuardReset();
-  tamperSuppressedByAdmin = true; // Start suppression — ignore new tamper events until unlock
+  startTamperSuppression(millis());
+  tamperRetriggerPending = false;
+  tamperRetriggerAtMs = 0;
 
   // Delete the clear_tamper command node (acknowledge)
   httpPutWithRetry(clearPath, "null");
@@ -2806,7 +2857,21 @@ void checkAndClearTamperFromFirebase() {
   snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
   httpPatchWithRetry(hwPath, "{\"lockdown\":false}");
 
-  Serial.println("[TAMPER] TheftGuard reset to NORMAL, tamper permanently suppressed until unlock");
+  // Append latest clear acknowledgement for incident forensics.
+  unsigned long now_epoch = getCurrentEpoch();
+  char clearAuditJson[256];
+  snprintf(clearAuditJson, sizeof(clearAuditJson),
+           "{\"tamper_clear\":true,\"source\":\"admin_clear\","
+           "\"payload_is_object\":%s,\"suppression_ttl_ms\":%lu,"
+           "\"timestamp\":{\".sv\":\"timestamp\"},\"device_epoch\":%lu}",
+           clearPayloadIsObject ? "true" : "false",
+           (unsigned long)TAMPER_SUPPRESSION_TTL_MS, now_epoch);
+  char clearAuditPath[96];
+  snprintf(clearAuditPath, sizeof(clearAuditPath),
+           "/lock_events/%s/tamper_clear_latest.json", HARDWARE_ID);
+  httpPutWithRetry(clearAuditPath, clearAuditJson);
+
+  Serial.println("[TAMPER] TheftGuard reset to NORMAL, tamper suppressed until unlock or timeout");
 }
 
 // ==================== FACE CHECK FORWARDER ====================
@@ -3288,9 +3353,10 @@ void handleCameraClient() {
 
     // Reed switch tamper: Controller detected unauthorized lid-open
     if (strstr(jsonBuf, "\"tamper\":true") != NULL) {
-      // Check suppression — ignore re-triggers after admin clear until next valid unlock
+      // During suppression, capture retriggers so they can be replayed after
+      // unlock ACK or suppression timeout.
       if (tamperSuppressedByAdmin) {
-        Serial.println("[AP] TAMPER suppressed — awaiting next valid unlock");
+        captureSuppressedTamper(millis());
       } else {
         Serial.println("[AP] TAMPER event received — writing to Firebase");
         writeTamperToFirebase();
@@ -3315,10 +3381,8 @@ void handleCameraClient() {
       // This prevents noisy/partial events from re-enabling tamper spam.
       bool validUnlock = (ul && ov && fd);
       if (validUnlock) {
-        if (tamperSuppressedByAdmin) {
-          Serial.println("[AP] Valid unlock event — tamper suppression cleared");
-        }
-        tamperSuppressedByAdmin = false;
+        clearTamperSuppression("validated_unlock_event");
+        replayPendingTamperIfAny(millis(), "validated_unlock_event");
       } else if (ul && tamperSuppressedByAdmin) {
         Serial.println("[AP] Unlock event without full validation — suppression kept");
       }
@@ -3765,6 +3829,7 @@ void setup() {
 void loop() {
   esp_task_wdt_reset(); // Feed watchdog every loop iteration
   unsigned long now = millis();
+  enforceTamperSuppressionTimeout(now);
 
   // ── Modem/LTE retry with exponential backoff (keeps HTTP server alive) ──
   static unsigned long modemRetryAt = 0;
