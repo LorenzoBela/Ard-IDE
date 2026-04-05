@@ -29,6 +29,7 @@
  */
 
 #include <WiFi.h>
+#include <Preferences.h>
 #include "Config.h"
 #include "HardwareIO.h"
 #include "ProxyClient.h"
@@ -115,6 +116,21 @@ static unsigned long awaitingCloseSince = 0;
 static uint8_t closeAssistAttempts = 0;
 static bool awaitingCloseWarnSent = false;
 
+// ── Handoff checkpoint persistence (brownout-safe replay) ──
+static Preferences handoffPrefs;
+static bool handoffStoreReady = false;
+static bool pendingRecoveryReport = false;
+static char recoveredCheckpointStage[24] = "";
+static char recoveredCheckpointDeliveryId[64] = "";
+
+static const char *CP_NS = "ctrlHndf";
+static const char *CP_KEY_ACTIVE = "active";
+static const char *CP_KEY_DELIVERY = "delId";
+static const char *CP_KEY_STAGE = "stage";
+static const char *CP_KEY_RETRY = "retry";
+static const char *CP_KEY_UPDATED = "upd";
+static const char *CP_KEY_CRC = "crc";
+
 // ── Forward declarations ──
 void enterState(TesterState newState);
 void handleStateMachine(unsigned long now);
@@ -125,6 +141,9 @@ void pollDiagnosticsIfDue(unsigned long now);
 void startUtilityMode(char utilityKey, unsigned long now);
 void renderUtilityMode(unsigned long now);
 void stopUtilityMode(unsigned long now);
+void checkpointHandoffState(const char *stage, uint8_t retryCounter);
+void clearHandoffCheckpoint();
+void updateHandoffCheckpointForState(TesterState state);
 
 static bool hasLoadedOtp() {
   return currentOtp[0] != '\0';
@@ -149,6 +168,121 @@ static bool isPinEligibleNow() {
   }
   // Dropoff-arrived and return mode remain PIN-eligible.
   return true;
+}
+
+static uint32_t computeCheckpointCrc(const char *deliveryId,
+                                     const char *stage,
+                                     uint8_t retryCounter,
+                                     unsigned long updatedAtMs) {
+  uint32_t crc = 2166136261UL;
+  const char *del = deliveryId ? deliveryId : "";
+  const char *stg = stage ? stage : "";
+
+  while (*del) {
+    crc ^= (uint8_t)*del++;
+    crc *= 16777619UL;
+  }
+  while (*stg) {
+    crc ^= (uint8_t)*stg++;
+    crc *= 16777619UL;
+  }
+  crc ^= retryCounter;
+  crc *= 16777619UL;
+  crc ^= (uint32_t)updatedAtMs;
+  crc *= 16777619UL;
+  return crc;
+}
+
+static void initHandoffCheckpointStore() {
+  handoffStoreReady = handoffPrefs.begin(CP_NS, false);
+  if (!handoffStoreReady) {
+    netLog("[CHECKPOINT] NVS unavailable\n");
+    return;
+  }
+
+  if (!handoffPrefs.getBool(CP_KEY_ACTIVE, false)) {
+    return;
+  }
+
+  String del = handoffPrefs.getString(CP_KEY_DELIVERY, "");
+  String stg = handoffPrefs.getString(CP_KEY_STAGE, "");
+  uint8_t retryCounter = (uint8_t)handoffPrefs.getUChar(CP_KEY_RETRY, 0);
+  unsigned long updatedAtMs = handoffPrefs.getULong(CP_KEY_UPDATED, 0);
+  uint32_t storedCrc = handoffPrefs.getULong(CP_KEY_CRC, 0);
+
+  uint32_t computed = computeCheckpointCrc(del.c_str(), stg.c_str(), retryCounter,
+                                           updatedAtMs);
+  if (storedCrc == 0 || storedCrc != computed) {
+    netLog("[CHECKPOINT] CRC mismatch; clearing stale checkpoint\n");
+    clearHandoffCheckpoint();
+    return;
+  }
+
+  strncpy(recoveredCheckpointStage, stg.c_str(), sizeof(recoveredCheckpointStage) - 1);
+  recoveredCheckpointStage[sizeof(recoveredCheckpointStage) - 1] = '\0';
+  strncpy(recoveredCheckpointDeliveryId, del.c_str(), sizeof(recoveredCheckpointDeliveryId) - 1);
+  recoveredCheckpointDeliveryId[sizeof(recoveredCheckpointDeliveryId) - 1] = '\0';
+  pendingRecoveryReport = true;
+
+  netLog("[CHECKPOINT] Recovered stage=%s delivery=%s retry=%u\n",
+         recoveredCheckpointStage,
+         recoveredCheckpointDeliveryId,
+         (unsigned int)retryCounter);
+}
+
+void checkpointHandoffState(const char *stage, uint8_t retryCounter) {
+  if (!handoffStoreReady || !hasActiveDelivery) return;
+
+  const char *deliveryId = activeDeliveryId[0] != '\0' ? activeDeliveryId : "UNKNOWN";
+  unsigned long now = millis();
+  uint32_t crc = computeCheckpointCrc(deliveryId, stage, retryCounter, now);
+
+  handoffPrefs.putBool(CP_KEY_ACTIVE, true);
+  handoffPrefs.putString(CP_KEY_DELIVERY, deliveryId);
+  handoffPrefs.putString(CP_KEY_STAGE, stage ? stage : "unknown");
+  handoffPrefs.putUChar(CP_KEY_RETRY, retryCounter);
+  handoffPrefs.putULong(CP_KEY_UPDATED, now);
+  handoffPrefs.putULong(CP_KEY_CRC, crc);
+}
+
+void clearHandoffCheckpoint() {
+  if (!handoffStoreReady) return;
+  handoffPrefs.putBool(CP_KEY_ACTIVE, false);
+  handoffPrefs.remove(CP_KEY_DELIVERY);
+  handoffPrefs.remove(CP_KEY_STAGE);
+  handoffPrefs.remove(CP_KEY_RETRY);
+  handoffPrefs.remove(CP_KEY_UPDATED);
+  handoffPrefs.remove(CP_KEY_CRC);
+}
+
+void updateHandoffCheckpointForState(TesterState state) {
+  if (!handoffStoreReady) return;
+
+  switch (state) {
+  case STATE_STANDBY:
+  case STATE_RELOCKING:
+    clearHandoffCheckpoint();
+    break;
+  case STATE_IDLE:
+    if (hasActiveDelivery && isPinEligibleNow()) {
+      checkpointHandoffState("handoff_started", (uint8_t)getFailedAttemptCount());
+    }
+    break;
+  case STATE_VERIFYING_OTP:
+    checkpointHandoffState("unlock_attempted", (uint8_t)getFailedAttemptCount());
+    break;
+  case STATE_REQUESTING_FACE:
+    checkpointHandoffState("face_requested", faceAttemptCount);
+    break;
+  case STATE_UNLOCKING:
+    checkpointHandoffState("unlock_confirmed", faceAttemptCount);
+    break;
+  case STATE_AWAITING_CLOSE:
+    checkpointHandoffState("awaiting_close", closeAssistAttempts);
+    break;
+  default:
+    break;
+  }
 }
 
 static void renderIdleJourneyStatus() {
@@ -350,6 +484,8 @@ void setup() {
   initHardwareIO();
   initLock();
   initDisplayHealth();
+  initOtpLockoutPersistence();
+  initHandoffCheckpointStore();
   startWiFiConnection();
 
   currentState = STATE_CONNECTING_WIFI;
@@ -434,6 +570,7 @@ void loop() {
         else if (!hasActiveDelivery && wasActive) {
           netLog("[CONTEXT] Delivery cleared — returning to standby\n");
           resetOtpAttempts();
+          clearHandoffCheckpoint();
           if (currentState == STATE_IDLE || currentState == STATE_ENTERING_PIN ||
               currentState == STATE_PERSONAL_PIN_ENTRY) {
             enterState(STATE_STANDBY);
@@ -590,6 +727,18 @@ void handleStateMachine(unsigned long now) {
       Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
       fetchDeliveryContext();
       lastDeliveryContextFetch = now;
+
+      if (pendingRecoveryReport) {
+        if (hasActiveDelivery) {
+          char detail[96];
+          snprintf(detail, sizeof(detail), "stage=%s delivery=%s",
+                   recoveredCheckpointStage,
+                   recoveredCheckpointDeliveryId);
+          reportAlertToProxy("BOOT_RECOVERY", detail);
+        }
+        pendingRecoveryReport = false;
+      }
+
       enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
     }
     break;
@@ -1080,6 +1229,7 @@ void enterState(TesterState newState) {
   }
 
   currentState = newState;
+  updateHandoffCheckpointForState(newState);
 
   if (newState == STATE_STANDBY) {
     applyIdlePowerPolicy(millis());

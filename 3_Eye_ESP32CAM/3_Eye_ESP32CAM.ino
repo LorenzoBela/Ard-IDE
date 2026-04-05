@@ -19,6 +19,7 @@
  */
 
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <esp_arduino_version.h>
@@ -101,8 +102,16 @@ static unsigned long camRebootAtMs = 0;
 // Deferred upload flag — set by face-check handlers, executed in loop()
 static bool pendingUpload = false;
 static bool uploadInProgress = false;
+static unsigned long uploadRetryAtMs = 0;
 
 static char currentDeliveryId[64] = "UNKNOWN_DELIVERY";
+
+static Preferences camPrefs;
+static bool camPrefsReady = false;
+static const char *CAM_NS = "camQueue";
+static const char *CAM_KEY_PENDING = "pending";
+static const char *CAM_KEY_DELIVERY = "delId";
+static const char *CAM_KEY_QUEUED_AT = "queuedAt";
 
 // Initialize ESP-Face models
 HumanFaceDetectMSR01 *s1;
@@ -138,6 +147,40 @@ void netLog(const char *format, ...) {
   }
 } // ===================== HELPERS =====================
 
+static void persistUploadIntent(bool pending) {
+  if (!camPrefsReady) return;
+  camPrefs.putBool(CAM_KEY_PENDING, pending);
+  if (pending) {
+    camPrefs.putString(CAM_KEY_DELIVERY, currentDeliveryId);
+    camPrefs.putULong(CAM_KEY_QUEUED_AT, millis());
+  } else {
+    camPrefs.remove(CAM_KEY_DELIVERY);
+    camPrefs.remove(CAM_KEY_QUEUED_AT);
+  }
+}
+
+static void initUploadIntentStore() {
+  camPrefsReady = camPrefs.begin(CAM_NS, false);
+  if (!camPrefsReady) {
+    Serial.println(F("[UPLOAD] NVS unavailable; replay disabled"));
+    return;
+  }
+
+  if (!camPrefs.getBool(CAM_KEY_PENDING, false)) {
+    return;
+  }
+
+  String restoredDelivery = camPrefs.getString(CAM_KEY_DELIVERY, "UNKNOWN_DELIVERY");
+  if (restoredDelivery.length() > 0 && restoredDelivery.length() < sizeof(currentDeliveryId)) {
+    strncpy(currentDeliveryId, restoredDelivery.c_str(), sizeof(currentDeliveryId) - 1);
+    currentDeliveryId[sizeof(currentDeliveryId) - 1] = '\0';
+  }
+
+  pendingUpload = true;
+  uploadRetryAtMs = millis();
+  Serial.printf("[UPLOAD] Restored pending intent for %s\n", currentDeliveryId);
+}
+
 bool queueSingleUpload(const char *source) {
   unsigned long now = millis();
 
@@ -152,6 +195,8 @@ bool queueSingleUpload(const char *source) {
   }
 
   pendingUpload = true;
+  uploadRetryAtMs = now;
+  persistUploadIntent(true);
   netLog("[UPLOAD] Queued from %s\n", source);
   return true;
 }
@@ -636,7 +681,7 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
   return false;
 }
 
-void captureHighResAndUpload() {
+bool captureHighResAndUpload() {
   unsigned long t0 = millis();
 
   // Switch to JPEG
@@ -664,7 +709,7 @@ void captureHighResAndUpload() {
   if (!photo) {
     Serial.println(F("ERROR: Hi-res capture failed."));
     switchToDetectMode();
-    return;
+    return false;
   }
 
   Serial.printf("Captured JPEG: %u bytes in %lu ms\n", photo->len,
@@ -689,10 +734,13 @@ void captureHighResAndUpload() {
   }
 
   esp_camera_fb_return(photo);
-  lastUploadAt = millis();
+  if (uploaded) {
+    lastUploadAt = millis();
+  }
 
   // Switch back
   switchToDetectMode();
+  return uploaded;
 }
 
 // ===================== MAIN LOOP =====================
@@ -703,7 +751,9 @@ void handleSerialCommands() {
 
     if (command == 'c' || command == 'C') {
       Serial.println(F("Manual capture (bypass detection)."));
-      captureHighResAndUpload();
+      if (!captureHighResAndUpload()) {
+        Serial.println(F("Manual upload failed; intent kept for retry."));
+      }
     } else if (command == 'h' || command == 'H' || command == '?') {
       printCommands();
     }
@@ -734,6 +784,7 @@ void setup() {
   }
 
   connectWiFi(WIFI_BOOT_CONNECT_TIMEOUT_MS);
+  initUploadIntentStore();
   initTime();
 
   if (!initCamera()) {
@@ -775,6 +826,8 @@ bool setCameraSleepMode(bool sleepMode) {
     digitalWrite(PWDN_GPIO_NUM, HIGH);
     pendingUpload = false;
     uploadInProgress = false;
+    uploadRetryAtMs = 0;
+    persistUploadIntent(false);
     cameraSleepMode = true;
     cameraInDetectMode = false;
     netLog("[POWER] Camera sleep mode enabled\n");
@@ -887,6 +940,9 @@ void handleFaceStatusClient() {
         strncpy(currentDeliveryId, delId.c_str(),
                 sizeof(currentDeliveryId) - 1);
         currentDeliveryId[sizeof(currentDeliveryId) - 1] = '\0';
+        if (pendingUpload) {
+          persistUploadIntent(true);
+        }
       }
     }
   }
@@ -941,12 +997,19 @@ void loop() {
   // Deferred upload — runs AFTER face-check response was sent
   // This avoids deadlock (CAM uploads to the same proxy that requested
   // face-check)
-  if (pendingUpload && !uploadInProgress) {
-    pendingUpload = false;
+  if (pendingUpload && !uploadInProgress && millis() >= uploadRetryAtMs) {
     uploadInProgress = true;
     netLog("[UPLOAD] Deferred capture + upload starting...\n");
-    captureHighResAndUpload();
-    netLog("[UPLOAD] Done. One photo captured.\n");
+    bool uploadOk = captureHighResAndUpload();
+    if (uploadOk) {
+      pendingUpload = false;
+      persistUploadIntent(false);
+      netLog("[UPLOAD] Done. One photo captured.\n");
+    } else {
+      uploadRetryAtMs = millis() + DETECTION_COOLDOWN_MS;
+      persistUploadIntent(true);
+      netLog("[UPLOAD] Failed; will retry after cooldown.\n");
+    }
     uploadInProgress = false;
   }
 
@@ -993,6 +1056,9 @@ void handleUartFaceCommand() {
     if (delId.length() > 0 && delId.length() < sizeof(currentDeliveryId)) {
       strncpy(currentDeliveryId, delId.c_str(), sizeof(currentDeliveryId) - 1);
       currentDeliveryId[sizeof(currentDeliveryId) - 1] = '\0';
+      if (pendingUpload) {
+        persistUploadIntent(true);
+      }
     }
   }
 

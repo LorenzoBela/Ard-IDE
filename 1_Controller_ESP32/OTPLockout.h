@@ -16,6 +16,9 @@
 #include <Arduino.h>
 #include "Config.h"
 
+/** Initialize persisted lockout state from NVS. Call once in setup(). */
+void initOtpLockoutPersistence();
+
 /** Call once a correct OTP is entered or on admin/proxy reset. */
 void resetOtpAttempts();
 
