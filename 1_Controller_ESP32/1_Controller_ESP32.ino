@@ -41,6 +41,8 @@
 
 // ==================== STATE MACHINE ====================
 enum TesterState {
+  STATE_BOOT_SELFTEST,
+  STATE_BOOT_AUTH,
   STATE_CONNECTING_WIFI,
   STATE_STANDBY,
   STATE_IDLE,
@@ -55,7 +57,7 @@ enum TesterState {
   STATE_SHOW_MESSAGE
 };
 
-static TesterState currentState = STATE_CONNECTING_WIFI;
+static TesterState currentState = STATE_BOOT_SELFTEST;
 
 // ── Input buffers ──
 static char    inputCode[8];
@@ -86,6 +88,21 @@ static ControllerPowerPolicy powerPolicy = POWER_POLICY_ACTIVE;
 static unsigned long lastCamPowerCmdAt = 0;
 static bool cameraSleepExpected = false;
 
+enum PeerHealthState {
+  PEER_HEALTHY,
+  PEER_DEGRADED,
+  PEER_DOWN
+};
+
+static PeerHealthState proxyHealthState = PEER_HEALTHY;
+static PeerHealthState camHealthState = PEER_HEALTHY;
+static uint8_t proxyMissCount = 0;
+static uint8_t proxyRecoveryCount = 0;
+static uint8_t camMissCount = 0;
+static uint8_t camRecoveryCount = 0;
+static bool camDownNotified = false;
+static bool offlineModeAnnounced = false;
+
 static ControllerDiagData diagCache = {
   0,
   0.0f,
@@ -95,6 +112,14 @@ static ControllerDiagData diagCache = {
   false,
   false,
   false,
+  false,
+  false,
+  false,
+  0,
+  0,
+  0,
+  0,
+  0,
   0,
   0
 };
@@ -115,6 +140,39 @@ static unsigned long closeAssistUntil = 0;
 static unsigned long awaitingCloseSince = 0;
 static uint8_t closeAssistAttempts = 0;
 static bool awaitingCloseWarnSent = false;
+static unsigned long connectStateEnteredAt = 0;
+static unsigned long otpVerifyStartedAt = 0;
+static unsigned long lastUnlockLatencyMs = 0;
+
+// ── Boot self-test ──
+static bool selfTestWarned = false;
+
+// ── Boot rider authentication ──
+static bool    bootAuthDone = false;      // Rider passed PIN (gates key 6 unjam)
+static bool    bootPhaseComplete = false; // Boot sequence finished (selftest+auth done)
+static char    bootAuthCode[8];
+static uint8_t bootAuthLen = 0;
+static unsigned long bootAuthLastInputAt = 0;
+
+// ── Open-door safety ──
+static unsigned long lastDoorOpenWarnAt = 0;
+static bool doorOpenCriticalSent = false;
+
+// ── Unjam auto-reset tracking ──
+static unsigned long lastUnjamKeyAt = 0;
+
+// ── Offline OTP recovery context (reboot-safe fallback) ──
+static Preferences offlineCtxPrefs;
+static bool offlineCtxStoreReady = false;
+static bool offlineContextFromBoot = false;
+static uint8_t offlineRecoveryTokenRemaining = 0;
+static unsigned long lastOnlineOtpSyncAt = 0;
+
+static const char *OFFLINE_NS = "ctrlOff";
+static const char *OFFLINE_KEY_ACTIVE = "active";
+static const char *OFFLINE_KEY_OTP = "otp";
+static const char *OFFLINE_KEY_DELIVERY = "del";
+static const char *OFFLINE_KEY_TOKEN = "tok";
 
 // ── Handoff checkpoint persistence (brownout-safe replay) ──
 static Preferences handoffPrefs;
@@ -144,6 +202,14 @@ void stopUtilityMode(unsigned long now);
 void checkpointHandoffState(const char *stage, uint8_t retryCounter);
 void clearHandoffCheckpoint();
 void updateHandoffCheckpointForState(TesterState state);
+void initOfflineContextStore();
+void persistOfflineContextSnapshot();
+void clearOfflineContextSnapshot();
+void noteOnlineContextSync(unsigned long now);
+void consumeOfflineRecoveryToken(const char *reason);
+bool isOfflineOtpEligible(unsigned long now);
+void updatePeerHealthOnDiagSuccess(const ControllerDiagData &diag);
+void updatePeerHealthOnDiagFailure();
 
 static bool hasLoadedOtp() {
   return currentOtp[0] != '\0';
@@ -285,7 +351,232 @@ void updateHandoffCheckpointForState(TesterState state) {
   }
 }
 
+static const char *peerHealthStr(PeerHealthState state) {
+  switch (state) {
+  case PEER_HEALTHY:
+    return "HEALTHY";
+  case PEER_DEGRADED:
+    return "DEGRADED";
+  case PEER_DOWN:
+    return "DOWN";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+static char peerHealthCode(PeerHealthState state) {
+  switch (state) {
+  case PEER_HEALTHY:
+    return 'H';
+  case PEER_DEGRADED:
+    return 'D';
+  case PEER_DOWN:
+    return 'X';
+  default:
+    return '?';
+  }
+}
+
+void initOfflineContextStore() {
+  offlineCtxStoreReady = offlineCtxPrefs.begin(OFFLINE_NS, false);
+  if (!offlineCtxStoreReady) {
+    netLog("[OFFLINE] NVS unavailable; reboot fallback disabled\n");
+    return;
+  }
+
+  if (!offlineCtxPrefs.getBool(OFFLINE_KEY_ACTIVE, false)) {
+    return;
+  }
+
+  String otp = offlineCtxPrefs.getString(OFFLINE_KEY_OTP, "");
+  String delivery = offlineCtxPrefs.getString(OFFLINE_KEY_DELIVERY, "");
+  uint8_t token =
+      (uint8_t)offlineCtxPrefs.getUChar(OFFLINE_KEY_TOKEN,
+                                        OFFLINE_RECOVERY_TOKEN_ATTEMPTS);
+  if (token > OFFLINE_RECOVERY_TOKEN_ATTEMPTS) {
+    token = OFFLINE_RECOVERY_TOKEN_ATTEMPTS;
+  }
+
+  if (otp.length() == 0 || delivery.length() == 0 || otp.length() > 6 ||
+      delivery.length() >= sizeof(activeDeliveryId)) {
+    clearOfflineContextSnapshot();
+    return;
+  }
+
+  strncpy(currentOtp, otp.c_str(), sizeof(currentOtp) - 1);
+  currentOtp[sizeof(currentOtp) - 1] = '\0';
+  strncpy(activeDeliveryId, delivery.c_str(), sizeof(activeDeliveryId) - 1);
+  activeDeliveryId[sizeof(activeDeliveryId) - 1] = '\0';
+  hasActiveDelivery = true;
+
+  offlineContextFromBoot = true;
+  offlineRecoveryTokenRemaining = token;
+  netLog("[OFFLINE] Restored OTP context for delivery %s (token=%u)\n",
+         activeDeliveryId, (unsigned int)offlineRecoveryTokenRemaining);
+}
+
+void persistOfflineContextSnapshot() {
+  if (!offlineCtxStoreReady || !hasActiveDelivery || !hasLoadedOtp()) {
+    return;
+  }
+
+  offlineCtxPrefs.putBool(OFFLINE_KEY_ACTIVE, true);
+  offlineCtxPrefs.putString(OFFLINE_KEY_OTP, currentOtp);
+  offlineCtxPrefs.putString(OFFLINE_KEY_DELIVERY, activeDeliveryId);
+  offlineCtxPrefs.putUChar(OFFLINE_KEY_TOKEN, OFFLINE_RECOVERY_TOKEN_ATTEMPTS);
+}
+
+void clearOfflineContextSnapshot() {
+  if (offlineCtxStoreReady) {
+    offlineCtxPrefs.putBool(OFFLINE_KEY_ACTIVE, false);
+    offlineCtxPrefs.remove(OFFLINE_KEY_OTP);
+    offlineCtxPrefs.remove(OFFLINE_KEY_DELIVERY);
+    offlineCtxPrefs.remove(OFFLINE_KEY_TOKEN);
+  }
+
+  offlineContextFromBoot = false;
+  offlineRecoveryTokenRemaining = 0;
+  lastOnlineOtpSyncAt = 0;
+}
+
+void noteOnlineContextSync(unsigned long now) {
+  lastOnlineOtpSyncAt = now;
+  offlineContextFromBoot = false;
+  offlineRecoveryTokenRemaining = OFFLINE_RECOVERY_TOKEN_ATTEMPTS;
+  persistOfflineContextSnapshot();
+}
+
+void consumeOfflineRecoveryToken(const char *reason) {
+  if (!offlineContextFromBoot || offlineRecoveryTokenRemaining == 0) {
+    return;
+  }
+
+  offlineRecoveryTokenRemaining--;
+  if (offlineCtxStoreReady) {
+    offlineCtxPrefs.putUChar(OFFLINE_KEY_TOKEN, offlineRecoveryTokenRemaining);
+  }
+
+  netLog("[OFFLINE] Consumed reboot token (%s), remaining=%u\n",
+         reason ? reason : "unknown",
+         (unsigned int)offlineRecoveryTokenRemaining);
+}
+
+bool isOfflineOtpEligible(unsigned long now) {
+  if (WiFi.status() == WL_CONNECTED) {
+    return true;
+  }
+  if (!hasActiveDelivery || !hasLoadedOtp()) {
+    return false;
+  }
+
+  if (offlineContextFromBoot) {
+    return offlineRecoveryTokenRemaining > 0;
+  }
+
+  if (lastOnlineOtpSyncAt == 0) {
+    return false;
+  }
+
+  return (now - lastOnlineOtpSyncAt) <= OFFLINE_OTP_UPTIME_TTL_MS;
+}
+
+void updatePeerHealthOnDiagSuccess(const ControllerDiagData &diag) {
+  proxyMissCount = 0;
+  if (proxyHealthState != PEER_HEALTHY) {
+    proxyRecoveryCount++;
+    if (proxyRecoveryCount >= LIVENESS_RECOVERY_SUCCESSES) {
+      proxyHealthState = PEER_HEALTHY;
+      proxyRecoveryCount = 0;
+      netLog("[LIVENESS] Proxy -> %s\n", peerHealthStr(proxyHealthState));
+    }
+  }
+
+  bool camNowUp = diag.camUp;
+  if (camNowUp) {
+    camMissCount = 0;
+    if (camHealthState != PEER_HEALTHY) {
+      camRecoveryCount++;
+      if (camRecoveryCount >= LIVENESS_RECOVERY_SUCCESSES) {
+        camHealthState = PEER_HEALTHY;
+        camRecoveryCount = 0;
+        camDownNotified = false;
+        netLog("[LIVENESS] Camera -> %s\n", peerHealthStr(camHealthState));
+      }
+    }
+  } else {
+    camRecoveryCount = 0;
+    if (camMissCount < 255) {
+      camMissCount++;
+    }
+
+    PeerHealthState nextState = camHealthState;
+    if (camMissCount >= LIVENESS_DOWN_MISSES) {
+      nextState = PEER_DOWN;
+    } else if (camMissCount >= LIVENESS_DEGRADED_MISSES) {
+      nextState = PEER_DEGRADED;
+    }
+
+    if (nextState != camHealthState) {
+      camHealthState = nextState;
+      netLog("[LIVENESS] Camera -> %s (age=%lums)\n",
+             peerHealthStr(camHealthState), diag.camAgeMs);
+
+      if (camHealthState == PEER_DOWN && !camDownNotified) {
+        camDownNotified = true;
+        reportAlertToProxy("CAM_DOWN", "diag_cam_stale");
+      }
+    }
+  }
+}
+
+void updatePeerHealthOnDiagFailure() {
+  camRecoveryCount = 0;
+  proxyRecoveryCount = 0;
+
+  if (proxyMissCount < 255) {
+    proxyMissCount++;
+  }
+
+  PeerHealthState nextState = proxyHealthState;
+  if (proxyMissCount >= LIVENESS_DOWN_MISSES) {
+    nextState = PEER_DOWN;
+  } else if (proxyMissCount >= LIVENESS_DEGRADED_MISSES) {
+    nextState = PEER_DEGRADED;
+  }
+
+  if (nextState != proxyHealthState) {
+    proxyHealthState = nextState;
+    netLog("[LIVENESS] Proxy -> %s\n", peerHealthStr(proxyHealthState));
+  }
+}
+
 static void renderIdleJourneyStatus() {
+  unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (isOfflineOtpEligible(now)) {
+      if (offlineContextFromBoot) {
+        char line1[17] = "";
+        snprintf(line1, sizeof(line1), "Token:%u", (unsigned int)offlineRecoveryTokenRemaining);
+        updateDisplay("Offline recovery", line1);
+      } else {
+        updateDisplay("Offline cached", "PIN window active");
+      }
+    } else {
+      updateDisplay("Offline", "Reconnecting...");
+    }
+    return;
+  }
+
+  if (proxyHealthState == PEER_DOWN) {
+    if (isOfflineOtpEligible(now)) {
+      updateDisplay("Proxy offline", "Cached OTP mode");
+    } else {
+      updateDisplay("Proxy offline", "Waiting recover");
+    }
+    return;
+  }
+
   if (!hasActiveDelivery) {
     updateDisplay("Box Ready", "No Delivery");
     return;
@@ -327,6 +618,14 @@ static bool isDiagnosticsFresh(unsigned long now) {
   return diagCacheValid && (now - diagLastSuccessAt <= CONTROLLER_DIAG_STALE_MS);
 }
 
+static bool isCameraLikelyUp(unsigned long now) {
+  // Do not block unlock flow on unknown diagnostics; only trust fresh CAM_DOWN.
+  if (!isDiagnosticsFresh(now)) {
+    return true;
+  }
+  return camHealthState != PEER_DOWN;
+}
+
 static unsigned long getDiagRefreshInterval() {
   if (utilityModeActive) {
     return CONTROLLER_DIAG_UTILITY_REFRESH_MS;
@@ -364,15 +663,17 @@ void renderUtilityMode(unsigned long now) {
     snprintf(line1, sizeof(line1), "GPS:%s %s", diagCache.gpsFix ? "LOCK" : "WAIT",
              fresh ? "LIVE" : (diagCacheValid ? "STALE" : "NO DATA"));
   } else {
-    const char *backend = "OK";
-    if (!diagCache.lteConnected || !diagCache.modemOk) {
-      backend = "OFF";
-    } else if (!diagCache.timeSynced || diagCache.firebaseFailures > 0) {
-      backend = "DEGR";
+    if (diagCache.lteConnected && diagCache.modemOk) {
+      snprintf(line0, sizeof(line0), "Net: CONNECTED");
+    } else {
+      snprintf(line0, sizeof(line0), "Net: OFFLINE");
     }
-    snprintf(line0, sizeof(line0), "Backend: %s", backend);
-    snprintf(line1, sizeof(line1), "LTE:%d FB:%d", diagCache.lteConnected ? 1 : 0,
-             diagCache.firebaseFailures);
+
+    if (diagCache.timeSynced && diagCache.firebaseFailures == 0) {
+      snprintf(line1, sizeof(line1), "Sync: OK");
+    } else {
+      snprintf(line1, sizeof(line1), "HTTP/Sync Err:%d", diagCache.firebaseFailures);
+    }
   }
 
   updateDisplay(line0, line1);
@@ -447,12 +748,14 @@ void pollDiagnosticsIfDue(unsigned long now) {
     diagRetryBackoffMs = CONTROLLER_DIAG_RETRY_BASE_MS;
     diagNextPollAt = now + interval;
     diagSuccessCount++;
+    updatePeerHealthOnDiagSuccess(data);
 
     if (utilityModeActive) {
       renderUtilityMode(now);
     }
   } else {
     diagFailCount++;
+    updatePeerHealthOnDiagFailure();
     if (diagRetryBackoffMs < CONTROLLER_DIAG_RETRY_MAX_MS) {
       diagRetryBackoffMs *= 2;
       if (diagRetryBackoffMs > CONTROLLER_DIAG_RETRY_MAX_MS) {
@@ -485,25 +788,49 @@ void setup() {
   initLock();
   initDisplayHealth();
   initOtpLockoutPersistence();
+  initOfflineContextStore();
   initHandoffCheckpointStore();
-  startWiFiConnection();
 
-  currentState = STATE_CONNECTING_WIFI;
+  // Boot self-test runs concurrently with WiFi — both are non-blocking.
+  // WiFi.begin() is async; it handshakes in the background while solenoid clicks.
+  // SECURITY: If rebooting mid-delivery (offline context exists), skip solenoid
+  // pulses to prevent momentary unlock windows. Reed-only check instead.
+  bool midDeliveryBoot = offlineContextFromBoot;
+  initSelfTest(midDeliveryBoot);
+  startWiFiConnection();
+  currentState = STATE_BOOT_SELFTEST;
+  if (!isDisplayFailed()) {
+    updateDisplay("Self-Test...",
+                  midDeliveryBoot ? "Reed check only" : "Checking lock");
+  }
 
   Serial.printf("  Proxy: %s:%d\n", PROXY_HOST, PROXY_PORT);
   Serial.println(F("  Modules: LockSafety, OTPLockout, DisplayHealth, AdminOverride, KeypadHealth"));
+  Serial.println(F("  Boot: SelfTest -> WiFi -> RiderAuth -> Operational"));
 }
 
 // ==================== MAIN LOOP (non-blocking) ====================
 void loop() {
   unsigned long now = millis();
 
-  // ── 1. WiFi monitoring (runs in all states) ──
-  if (WiFi.status() != WL_CONNECTED && currentState != STATE_CONNECTING_WIFI) {
-    netLog("[WIFI] Connection lost, reconnecting...\n");
-    enterState(STATE_CONNECTING_WIFI);
-    WiFi.disconnect();
-    WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
+  // ── 1. WiFi monitoring (runs in all states except boot self-test) ──
+  if (WiFi.status() != WL_CONNECTED && currentState != STATE_CONNECTING_WIFI &&
+      currentState != STATE_BOOT_SELFTEST) {
+    if (isOfflineOtpEligible(now)) {
+      // Keep keypad flow alive in degraded mode while reconnecting in background.
+      if (!offlineModeAnnounced) {
+        netLog("[WIFI] Offline degraded mode active (cached OTP policy)\n");
+        offlineModeAnnounced = true;
+      }
+    } else {
+      offlineModeAnnounced = false;
+      netLog("[WIFI] Connection lost, reconnecting...\n");
+      enterState(STATE_CONNECTING_WIFI);
+      WiFi.disconnect();
+      WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
+    }
+  } else if (WiFi.status() == WL_CONNECTED) {
+    offlineModeAnnounced = false;
   }
   maintainWiFiConnection(now);
 
@@ -551,6 +878,12 @@ void loop() {
       String oldStatus = lastStatusCommand;
       fetchDeliveryContext();
       lastDeliveryContextFetch = now;
+
+      if (hasActiveDelivery && hasLoadedOtp()) {
+        noteOnlineContextSync(now);
+      } else {
+        clearOfflineContextSnapshot();
+      }
 
       if (currentState == STATE_OWNER_UNLOCKED) {
         if ((hasActiveDelivery != wasActive) || (oldStatus != lastStatusCommand)) {
@@ -675,7 +1008,13 @@ void loop() {
     }
   }
 
-  // ── 6. State machine ──
+  // ── 6. Unjam counter auto-reset ──
+  if (lastUnjamKeyAt > 0 && now - lastUnjamKeyAt >= UNJAM_COUNTER_RESET_MS) {
+    resetUnjamCounter();
+    lastUnjamKeyAt = 0;
+  }
+
+  // ── 7. State machine ──
   handleStateMachine(now);
 }
 
@@ -722,11 +1061,153 @@ void applyActivePowerPolicy(unsigned long now) {
 void handleStateMachine(unsigned long now) {
   switch (currentState) {
 
+  // ── BOOT SELF-TEST (POST) ──
+  case STATE_BOOT_SELFTEST: {
+    SelfTestResult stResult = tickSelfTest(now);
+    if (stResult == SELFTEST_RUNNING) {
+      // Update LCD with progress.
+      if (!isDisplayFailed()) {
+        uint8_t pulseNum = getSelfTestPulseNumber();
+        if (pulseNum == 0) {
+          // Reed-only mode (mid-delivery reboot) — no pulses to count.
+          updateDisplay("Self-Test...", "Reed check...");
+        } else {
+          char pulseLine[17];
+          snprintf(pulseLine, sizeof(pulseLine), "Pulse %u/%u",
+                   pulseNum, (unsigned int)SELFTEST_PULSE_COUNT);
+          updateDisplay("Self-Test...", pulseLine);
+        }
+      }
+    } else if (stResult == SELFTEST_PASS) {
+      netLog("[SELFTEST] PASS — solenoid and reed nominal\n");
+      selfTestWarned = false;
+      if (!isDisplayFailed()) {
+        updateDisplay("Self-Test OK", "Connecting...");
+      }
+      messageStartAt = now;
+      // WiFi already started in setup() — just transition to wait for it.
+      enterState(STATE_CONNECTING_WIFI);
+    } else { // SELFTEST_WARN
+      netLog("[SELFTEST] WARN — reed unstable, proceeding with caution\n");
+      selfTestWarned = true;
+      if (!isDisplayFailed()) {
+        updateDisplay("Lock Warning!", "Connecting...");
+      }
+      messageStartAt = now;
+      // WiFi already started in setup() — just transition to wait for it.
+      enterState(STATE_CONNECTING_WIFI);
+    }
+    break;
+  }
+
+  // ── BOOT RIDER AUTH ──
+  case STATE_BOOT_AUTH: {
+    // Idle timeout — dim LCD after 5 minutes of no input.
+    if (BOOT_AUTH_IDLE_TIMEOUT_MS > 0 &&
+        bootAuthLastInputAt > 0 &&
+        now - bootAuthLastInputAt >= BOOT_AUTH_IDLE_TIMEOUT_MS) {
+      displayBacklightOff();
+    }
+
+    char key = readKeypad();
+    if (!key) break;
+
+    // Any keypress resets idle timer and wakes display.
+    bootAuthLastInputAt = now;
+    displayBacklightOn();
+
+    if (key == '*') {
+      // Clear input but cannot exit — must authenticate.
+      bootAuthLen = 0;
+      bootAuthCode[0] = '\0';
+      if (!isDisplayFailed()) {
+        updateDisplay("Rider PIN:", "");
+      }
+    } else if (key == '#') {
+      if (bootAuthLen == 0) break;
+
+      // EC-04: Check lockout before attempting validation.
+      if (isLockedOut(now)) {
+        unsigned long secs = getLockoutSecondsLeft(now);
+        if (!isDisplayFailed()) {
+          char line1[17];
+          snprintf(line1, sizeof(line1), "Wait %lus", secs);
+          updateDisplay("Too many tries!", line1);
+        }
+        bootAuthLen = 0;
+        bootAuthCode[0] = '\0';
+        break;
+      }
+
+      // Validate via proxy (reuses personal PIN toggle endpoint).
+      // Guard: don't waste a lockout attempt if WiFi is down.
+      if (WiFi.status() != WL_CONNECTED) {
+        if (!isDisplayFailed()) {
+          updateDisplay("No connection", "Wait for WiFi");
+        }
+        messageStartAt = now;
+        break;
+      }
+      int decision = requestPersonalPinToggle(bootAuthCode, true);
+      bootAuthLen = 0;
+      bootAuthCode[0] = '\0';
+
+      if (decision == 1) {
+        // Authenticated!
+        bootAuthDone = true;
+        bootPhaseComplete = true;
+        netLog("[BOOT-AUTH] Rider authenticated successfully\n");
+
+        // Report self-test warning if it occurred.
+        if (selfTestWarned) {
+          reportAlertToProxy("BOOT_SELFTEST_WARN", "reed_unstable_at_boot");
+        }
+
+        if (!isDisplayFailed()) {
+          updateDisplay("Auth OK!", "Starting up...");
+        }
+        messageStartAt = now;
+        currentState = STATE_SHOW_MESSAGE;
+      } else {
+        // Invalid PIN.
+        recordFailedAttempt(now);
+        netLog("[BOOT-AUTH] Wrong PIN, attempts remaining: %d\n", getAttemptsRemaining());
+        if (!isDisplayFailed()) {
+          char line1[17];
+          snprintf(line1, sizeof(line1), "%d tries left", getAttemptsRemaining());
+          updateDisplay("Wrong PIN!", line1);
+        }
+        messageStartAt = now;
+        // Stay in BOOT_AUTH after showing message briefly.
+        // We'll handle the return via STATE_SHOW_MESSAGE -> BOOT_AUTH.
+      }
+    } else if (key >= '0' && key <= '9' && bootAuthLen < BOOT_AUTH_MAX_LEN) {
+      bootAuthCode[bootAuthLen++] = key;
+      bootAuthCode[bootAuthLen] = '\0';
+      if (!isDisplayFailed()) {
+        char masked[17] = "";
+        uint8_t i;
+        for (i = 0; i < bootAuthLen && i < 15; i++) {
+          masked[i] = '*';
+        }
+        masked[i] = '\0';
+        updateDisplay("Rider PIN:", masked);
+      }
+    }
+    break;
+  }
+
   case STATE_CONNECTING_WIFI:
     if (WiFi.status() == WL_CONNECTED) {
       Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
       fetchDeliveryContext();
       lastDeliveryContextFetch = now;
+
+      if (hasActiveDelivery && hasLoadedOtp()) {
+        noteOnlineContextSync(now);
+      } else {
+        clearOfflineContextSnapshot();
+      }
 
       if (pendingRecoveryReport) {
         if (hasActiveDelivery) {
@@ -739,7 +1220,36 @@ void handleStateMachine(unsigned long now) {
         pendingRecoveryReport = false;
       }
 
-      enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
+      // Route to boot auth, skip, or bypass based on context.
+      if (offlineContextFromBoot && offlineRecoveryTokenRemaining > 0 &&
+          hasActiveDelivery && hasLoadedOtp()) {
+        // Mid-delivery reboot — trust the session, skip auth.
+        bootAuthDone = true;
+        bootPhaseComplete = true;
+        netLog("[BOOT-AUTH] Skipped (mid-delivery reboot recovery)\n");
+        enterState(STATE_IDLE);
+      } else if (!hasActiveDelivery) {
+        // No active delivery = box is unpaired or idle. No rider PIN to
+        // validate against, so requiring auth would be redundant.
+        bootAuthDone = false; // Key 6 still gated until a rider authenticates.
+        bootPhaseComplete = true; // Boot sequence done — don't loop back to auth.
+        netLog("[BOOT-AUTH] Skipped (no active delivery / unpaired box)\n");
+        enterState(STATE_STANDBY);
+      } else {
+        // Active delivery on fresh boot — require rider authentication.
+        enterState(STATE_BOOT_AUTH);
+      }
+    } else if (offlineContextFromBoot && offlineRecoveryTokenRemaining > 0 &&
+               hasActiveDelivery && hasLoadedOtp() &&
+               (now - connectStateEnteredAt) >= OFFLINE_BOOT_FALLBACK_ENTER_MS) {
+      if (!isDisplayFailed()) {
+        updateDisplay("Offline recovery", "Use PIN once");
+      }
+      bootAuthDone = true; // Trust offline recovery context.
+      bootPhaseComplete = true;
+      netLog("[OFFLINE] Entering degraded mode from CONNECTING (token=%u)\n",
+             (unsigned int)offlineRecoveryTokenRemaining);
+      enterState(STATE_IDLE);
     }
     break;
 
@@ -749,6 +1259,17 @@ void handleStateMachine(unsigned long now) {
       break;
     }
     char standbyKey = readKeypad();
+    if (standbyKey == '5') {
+      bool isOn = toggleBacklightOverride();
+      displayBacklightOn();
+      if (!isDisplayFailed()) {
+        updateDisplay(isOn ? "Backlight: ON" : "Backlight: AUTO", 
+                      isOn ? "Stay Awake" : "Power Save");
+      }
+      messageStartAt = now;
+      currentState = STATE_SHOW_MESSAGE;
+      break;
+    }
     if (standbyKey == '4') {
       personalPinLen = 0;
       personalPinCode[0] = '\0';
@@ -758,6 +1279,44 @@ void handleStateMachine(unsigned long now) {
     }
     if (standbyKey && isUtilityKey(standbyKey)) {
       startUtilityMode(standbyKey, now);
+      break;
+    }
+    // Key '6' — Unjam utility (guarded: auth + not-in-transit)
+    if (standbyKey == '6') {
+      displayBacklightOn();
+      if (!bootAuthDone) {
+        if (!isDisplayFailed()) {
+          updateDisplay("Auth required", "Enter Rider PIN");
+        }
+        messageStartAt = now;
+        currentState = STATE_SHOW_MESSAGE;
+        break;
+      }
+      stopUtilityMode(now);
+      lastUnjamKeyAt = now;
+      UnjamResult ur = fireUnjamPulse(now);
+      if (!isDisplayFailed()) {
+        char line0[17];
+        switch (ur) {
+        case UNJAM_OK:
+          snprintf(line0, sizeof(line0), "Unjam %u/%u",
+                   (unsigned int)(UNJAM_MAX_PULSES - getUnjamPulsesRemaining()),
+                   (unsigned int)UNJAM_MAX_PULSES);
+          updateDisplay(line0, "Click! Press 6");
+          break;
+        case UNJAM_COOLDOWN:
+          updateDisplay("Wait...", "Cooling down");
+          break;
+        case UNJAM_LIMIT:
+          updateDisplay("Limit reached", "Wait 10s reset");
+          break;
+        case UNJAM_OVERHEATED:
+          updateDisplay("Overheated!", "Wait to cool");
+          break;
+        }
+      }
+      messageStartAt = now;
+      currentState = STATE_SHOW_MESSAGE;
       break;
     }
     if (standbyKey && standbyKey != '*') {
@@ -778,6 +1337,20 @@ void handleStateMachine(unsigned long now) {
     while(true) {
       char key = readKeypad();
       if (!key) break;
+
+      // Backlight toggle shortcut (key '5') — only from IDLE when no PIN running
+      if (currentState == STATE_IDLE && inputLen == 0 && key == '5' && !isPinEligibleNow()) {
+        stopUtilityMode(now);
+        bool isOn = toggleBacklightOverride();
+        displayBacklightOn();
+        if (!isDisplayFailed()) {
+          updateDisplay(isOn ? "Backlight: ON" : "Backlight: AUTO", 
+                        isOn ? "Stay Awake" : "Power Save");
+        }
+        messageStartAt = now;
+        currentState = STATE_SHOW_MESSAGE;
+        break;
+      }
 
       // Personal PIN shortcut (key '4') — only when no PIN-eligible delivery
       if (currentState == STATE_IDLE && inputLen == 0 && key == '4' && !isPinEligibleNow()) {
@@ -807,9 +1380,64 @@ void handleStateMachine(unsigned long now) {
         // Utility mode (1-3) only accessible when delivery is NOT PIN-eligible
         // (i.e., in transit/pickup phase, or no delivery at all)
         startUtilityMode(key, now);
+      } else if (key == '6' && currentState == STATE_IDLE && inputLen == 0 && !isPinEligibleNow()) {
+        // Key '6' — Unjam utility (guarded: auth + geofence)
+        if (!bootAuthDone) {
+          if (!isDisplayFailed()) {
+            updateDisplay("Auth required", "Enter Rider PIN");
+          }
+          messageStartAt = now;
+          currentState = STATE_SHOW_MESSAGE;
+          break;
+        }
+        if (isGeoTransitStatus() || isGeoPickupStatus()) {
+          if (!isDisplayFailed()) {
+            updateDisplay("Not available", "In transit");
+          }
+          messageStartAt = now;
+          currentState = STATE_SHOW_MESSAGE;
+          break;
+        }
+        stopUtilityMode(now);
+        lastUnjamKeyAt = now;
+        UnjamResult ur = fireUnjamPulse(now);
+        if (!isDisplayFailed()) {
+          char line0[17];
+          switch (ur) {
+          case UNJAM_OK:
+            snprintf(line0, sizeof(line0), "Unjam %u/%u",
+                     (unsigned int)(UNJAM_MAX_PULSES - getUnjamPulsesRemaining()),
+                     (unsigned int)UNJAM_MAX_PULSES);
+            updateDisplay(line0, "Click! Press 6");
+            break;
+          case UNJAM_COOLDOWN:
+            updateDisplay("Wait...", "Cooling down");
+            break;
+          case UNJAM_LIMIT:
+            updateDisplay("Limit reached", "Wait 10s reset");
+            break;
+          case UNJAM_OVERHEATED:
+            updateDisplay("Overheated!", "Wait to cool");
+            break;
+          }
+        }
+        messageStartAt = now;
+        currentState = STATE_SHOW_MESSAGE;
+        break;
       } else if (inputLen < 6) {
         // Enforce geofence lock: no PIN entry unless journey phase is PIN-eligible.
         if (isPinEligibleNow()) {
+          if (!isCameraLikelyUp(now)) {
+            if (!isDisplayFailed()) {
+              updateDisplay("Camera offline", "Please wait...");
+            } else {
+              fallbackError();
+            }
+            messageStartAt = now;
+            currentState = STATE_SHOW_MESSAGE;
+            break;
+          }
+
           stopUtilityMode(now);
           inputCode[inputLen++] = key;
           inputCode[inputLen] = '\0';
@@ -944,6 +1572,30 @@ void handleStateMachine(unsigned long now) {
       break;
     }
 
+    bool proxyRouteDown = (proxyHealthState == PEER_DOWN);
+    bool offlineAttempt = (WiFi.status() != WL_CONNECTED) || proxyRouteDown;
+    if (proxyRouteDown && WiFi.status() == WL_CONNECTED) {
+      netLog("[OFFLINE] Proxy path down; using cached OTP policy\n");
+    }
+    if (offlineAttempt && !isOfflineOtpEligible(now)) {
+      netLog("[OFFLINE] OTP rejected: cached window/token unavailable\n");
+      if (!isDisplayFailed()) {
+        updateDisplay("Offline expired", proxyRouteDown ? "Proxy recovering" : "Reconnect first");
+      } else {
+        fallbackError();
+      }
+      inputLen = 0;
+      inputCode[0] = '\0';
+      messageStartAt = now;
+      currentState = STATE_SHOW_MESSAGE;
+      break;
+    }
+
+    if (offlineAttempt && offlineContextFromBoot &&
+        offlineRecoveryTokenRemaining > 0) {
+      consumeOfflineRecoveryToken("otp_verify");
+    }
+
     // Validate OTP
     if (strcmp(inputCode, currentOtp) == 0) {
       netLog("[OTP] CORRECT! Requesting face check...\n");
@@ -1001,17 +1653,30 @@ void handleStateMachine(unsigned long now) {
         updateDisplay("Face scanning...", attemptLine);
       }
 
-      int result = requestFaceCheck();
+      int result = 0;
+      if (!isCameraLikelyUp(now)) {
+        result = -2;
+        netLog("[FACE] Skipping request — camera marked down (age=%lums)\n",
+               (unsigned long)diagCache.camAgeMs);
+      } else {
+        result = requestFaceCheck();
+      }
       faceCheckPending = false;
 
       if (result == 1) {
         netLog("[FACE] DETECTED! Unlocking solenoid...\n");
+        if (otpVerifyStartedAt > 0) {
+          lastUnlockLatencyMs = now - otpVerifyStartedAt;
+        } else {
+          lastUnlockLatencyMs = 0;
+        }
         enterState(STATE_UNLOCKING);
         reportEventToProxy(true, true, true, false, faceAttemptCount, false,
-                           false, "");
+                           false, "", lastUnlockLatencyMs);
       } else {
         bool noFace = (result == 0);
-        const char *reason = noFace ? "NO_FACE" : "CAMERA_ERROR";
+        const char *reason = noFace ? "NO_FACE" :
+                (result == -2 ? "CAM_OFFLINE" : "CAMERA_ERROR");
         bool exhausted = (faceAttemptCount >= FACE_CHECK_MAX_ATTEMPTS);
 
         if (!exhausted) {
@@ -1023,7 +1688,9 @@ void handleStateMachine(unsigned long now) {
             char retryLine[17];
             snprintf(retryLine, sizeof(retryLine), "Retry %u/%u", faceAttemptCount + 1,
                      (unsigned int)FACE_CHECK_MAX_ATTEMPTS);
-            updateDisplay(noFace ? "No face found" : "Camera error", retryLine);
+            updateDisplay(noFace ? "No face found" :
+                         (result == -2 ? "Camera offline" : "Camera error"),
+                         retryLine);
           } else {
             fallbackError();
           }
@@ -1156,6 +1823,22 @@ void handleStateMachine(unsigned long now) {
       reportAlertToProxy("SOLENOID_STUCK", "awaiting_close_timeout");
     }
 
+    // ── Open-door safety: periodic LCD warning every 30 s ──
+    if (awaitingCloseSince > 0 && now - lastDoorOpenWarnAt >= DOOR_OPEN_LCD_WARN_INTERVAL_MS) {
+      lastDoorOpenWarnAt = now;
+      if (!isDisplayFailed()) {
+        updateDisplay("! DOOR OPEN !", "Close lid now");
+      }
+    }
+
+    // ── Open-door safety: escalated critical alert after 5 min ──
+    if (!doorOpenCriticalSent && awaitingCloseSince > 0 &&
+        now - awaitingCloseSince >= DOOR_OPEN_CRITICAL_MS) {
+      doorOpenCriticalSent = true;
+      reportAlertToProxy("DOOR_OPEN_CRITICAL", "open_5min_exceeded");
+      netLog("[DOOR] Critical: door open > 5 minutes\n");
+    }
+
     char key = readKeypad();
     if (key == '#' && !isSolenoidActive()) {
       if (closeAssistAttempts >= LOCK_CLOSE_ASSIST_MAX_ATTEMPTS) {
@@ -1215,7 +1898,14 @@ void handleStateMachine(unsigned long now) {
 
   case STATE_SHOW_MESSAGE:
     if (now - messageStartAt >= LCD_MESSAGE_DURATION) {
-      enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
+      // If boot phase is not complete, route back to BOOT_AUTH.
+      // (bootPhaseComplete is separate from bootAuthDone — an unpaired box
+      //  completes boot phase but doesn't authenticate, avoiding a loop.)
+      if (!bootPhaseComplete) {
+        enterState(STATE_BOOT_AUTH);
+      } else {
+        enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
+      }
     }
     break;
   }
@@ -1263,6 +1953,9 @@ void enterState(TesterState newState) {
       updateDisplay("Personal PIN:", "");
     }
     break;
+  case STATE_VERIFYING_OTP:
+    otpVerifyStartedAt = millis();
+    break;
   case STATE_OWNER_UNLOCKED:
     if (!isDisplayFailed()) {
       updateDisplay("Owner Access", "* = Relock");
@@ -1274,11 +1967,29 @@ void enterState(TesterState newState) {
     awaitingCloseSince = millis();
     closeAssistAttempts = 0;
     awaitingCloseWarnSent = false;
+    lastDoorOpenWarnAt = millis();
+    doorOpenCriticalSent = false;
     if (!isDisplayFailed()) {
       updateDisplay("Close lid first", "#=Close assist");
     }
     break;
+  case STATE_BOOT_SELFTEST:
+    initSelfTest();
+    if (!isDisplayFailed()) {
+      updateDisplay("Self-Test...", "Checking lock");
+    }
+    break;
+  case STATE_BOOT_AUTH:
+    bootAuthLen = 0;
+    bootAuthCode[0] = '\0';
+    bootAuthLastInputAt = millis();
+    if (!isDisplayFailed()) {
+      updateDisplay("Rider PIN:", "");
+    }
+    displayBacklightOn();
+    break;
   case STATE_CONNECTING_WIFI:
+    connectStateEnteredAt = millis();
     if (!isDisplayFailed()) {
       updateDisplay("Parcel-Safe v3", "Connecting WiFi");
     }

@@ -28,6 +28,7 @@ String lastStatusCommand     = "";
 // ── WiFi backoff state ──
 static unsigned long wifiRetryAt    = 0;
 static unsigned long wifiBackoffMs  = WIFI_RETRY_BASE_MS;
+static unsigned long wifiRescanAt   = 0;
 
 static String normalizeStatusToken(const String &rawToken) {
   String token = rawToken;
@@ -133,14 +134,23 @@ void startWiFiConnection() {
   if (WIFI_SSID[0] != '\0') {
     WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
   }
-  wifiRetryAt  = millis() + 15000;
+  wifiRetryAt  = millis() + WIFI_FIRST_RETRY_DELAY_MS;
+  wifiRescanAt = millis() + WIFI_RESCAN_INTERVAL_MS;
   wifiBackoffMs = WIFI_RETRY_BASE_MS;
 }
 
 void maintainWiFiConnection(unsigned long now) {
   if (WiFi.status() == WL_CONNECTED) {
     wifiBackoffMs = WIFI_RETRY_BASE_MS;
+    wifiRetryAt = now + WIFI_FIRST_RETRY_DELAY_MS;
+    wifiRescanAt = now + WIFI_RESCAN_INTERVAL_MS;
     return;
+  }
+
+  if (now >= wifiRescanAt) {
+    netLog("[WIFI] Lost link; rescanning AP list...\n");
+    scanForProxy();
+    wifiRescanAt = now + WIFI_RESCAN_INTERVAL_MS;
   }
 
   if (now < wifiRetryAt) return;
@@ -153,9 +163,14 @@ void maintainWiFiConnection(unsigned long now) {
   if (WIFI_SSID[0] != '\0') {
     WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
   }
-  wifiRetryAt = now + wifiBackoffMs;
+
+  unsigned long jitter = (unsigned long)random(0, WIFI_RETRY_JITTER_MS + 1);
+  wifiRetryAt = now + wifiBackoffMs + jitter;
   if (wifiBackoffMs < WIFI_RETRY_MAX_MS) {
     wifiBackoffMs *= 2;
+    if (wifiBackoffMs > WIFI_RETRY_MAX_MS) {
+      wifiBackoffMs = WIFI_RETRY_MAX_MS;
+    }
   }
 }
 
@@ -321,8 +336,40 @@ bool fetchDiagnostics(ControllerDiagData &out) {
     parsed.timeSynced = (field.toInt() != 0);
     parsedAny = true;
   }
+  if (parseDiagField(body, "cam_up", field)) {
+    parsed.camUp = (field.toInt() != 0);
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "ctrl_up", field)) {
+    parsed.controllerUp = (field.toInt() != 0);
+    parsedAny = true;
+  }
   if (parseDiagField(body, "fb_fail", field)) {
     parsed.firebaseFailures = field.toInt();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "cmd_stage", field)) {
+    parsed.commandStage = field.toInt();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "cmd_pending", field)) {
+    parsed.commandPending = (field.toInt() != 0);
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "conn_state", field)) {
+    parsed.connectivityState = field.toInt();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "lte_reconn_ms", field)) {
+    parsed.lteReconnectMs = (unsigned long)field.toInt();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "cam_age", field)) {
+    parsed.camAgeMs = (unsigned long)field.toInt();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "ctrl_age", field)) {
+    parsed.controllerAgeMs = (unsigned long)field.toInt();
     parsedAny = true;
   }
   if (parseDiagField(body, "uptime", field)) {
@@ -340,6 +387,7 @@ bool fetchDiagnostics(ControllerDiagData &out) {
   if (parsed.csq < -1) parsed.csq = -1;
   if (parsed.csq > 31) parsed.csq = 31;
   if (parsed.firebaseFailures < 0) parsed.firebaseFailures = 0;
+  if (parsed.commandStage < 0) parsed.commandStage = 0;
 
   out = parsed;
   return true;
@@ -353,7 +401,8 @@ bool reportEventToProxy(bool otpValid,
                         uint8_t faceAttempts,
                         bool faceRetryExhausted,
                         bool fallbackRequired,
-                        const char *failureReason) {
+                        const char *failureReason,
+                        unsigned long unlockLatencyMs) {
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
@@ -364,17 +413,19 @@ bool reportEventToProxy(bool otpValid,
   const char *safeReason =
       (failureReason != NULL && failureReason[0] != '\0') ? failureReason : "";
 
-  char json[384];
+  char json[448];
   snprintf(json, sizeof(json),
            "{\"otp_valid\":%s,\"face_detected\":%s,\"unlocked\":%s,\"box_id\":"
            "\"%s\",\"delivery_id\":\"%s\",\"thermal_cutoff\":%s,"
            "\"face_attempts\":%u,\"face_retry_exhausted\":%s,"
-           "\"fallback_required\":%s,\"failure_reason\":\"%s\"}",
+           "\"fallback_required\":%s,\"failure_reason\":\"%s\","
+           "\"unlock_latency_ms\":%lu}",
            otpValid ? "true" : "false", faceDetected ? "true" : "false",
            unlocked ? "true" : "false", HARDWARE_ID, activeDeliveryId,
            thermalCutoff ? "true" : "false", (unsigned int)faceAttempts,
            faceRetryExhausted ? "true" : "false",
-           fallbackRequired ? "true" : "false", safeReason);
+           fallbackRequired ? "true" : "false", safeReason,
+           unlockLatencyMs);
 
   http.setTimeout(5000);
   http.begin(url);
@@ -550,7 +601,7 @@ int requestFaceCheck() {
                PROXY_PORT);
     }
 
-    http.setTimeout(FACE_CHECK_TIMEOUT);
+    http.setTimeout(FACE_CHECK_WIFI_TIMEOUT_MS);
     http.begin(url);
     int code = http.GET();
 
@@ -587,7 +638,7 @@ int requestFaceCheck() {
   char uartBuf[32] = "";
   uint8_t uartLen = 0;
 
-  while (millis() - uartStart < FACE_CHECK_TIMEOUT) {
+  while (millis() - uartStart < FACE_CHECK_UART_TIMEOUT_MS) {
     if (Serial2.available()) {
       char c = Serial2.read();
       if (c == '\n' || c == '\r') {
@@ -596,7 +647,8 @@ int requestFaceCheck() {
         uartBuf[uartLen++] = c;
       }
     }
-    delay(10);
+    // Yield CPU without blocking scheduler; keep retry paths millis-driven.
+    yield();
   }
   uartBuf[uartLen] = '\0';
 

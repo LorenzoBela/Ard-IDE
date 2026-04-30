@@ -26,6 +26,9 @@ void displayBacklightOn();
 /** Disable LCD backlight to reduce idle power draw. */
 void displayBacklightOff();
 
+/** Toggle manual backlight override feature. Returns true if override is active. */
+bool toggleBacklightOverride();
+
 /** Read one keypad character (non-blocking). Returns '\0' if nothing pressed. */
 char readKeypad();
 

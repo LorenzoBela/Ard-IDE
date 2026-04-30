@@ -12,6 +12,7 @@
 // ── LCD ──
 static LiquidCrystal_I2C lcd(DISPLAY_I2C_ADDR, 16, 2);
 static bool lcdBacklightEnabled = true;
+static bool manualBacklightOverride = false;
 
 // ── Keypad ──
 static char keys[KP_ROWS][KP_COLS] = {
@@ -20,8 +21,8 @@ static char keys[KP_ROWS][KP_COLS] = {
     {'7', '8', '9'},
     {'*', '0', '#'}
 };
-static byte rowPins[KP_ROWS] = {13, 23, 19, 26};
-static byte colPins[KP_COLS] = {14, 25, 18};
+static uint8_t rowPins[KP_ROWS] = {13, 23, 19, 26};
+static uint8_t colPins[KP_COLS] = {14, 25, 18};
 static Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, KP_ROWS, KP_COLS);
 
 static QueueHandle_t keyQueue = NULL;
@@ -85,10 +86,19 @@ void displayBacklightOn() {
 }
 
 void displayBacklightOff() {
+  if (manualBacklightOverride) return;
   if (lcdBacklightEnabled) {
     lcd.noBacklight();
     lcdBacklightEnabled = false;
   }
+}
+
+bool toggleBacklightOverride() {
+  manualBacklightOverride = !manualBacklightOverride;
+  if (manualBacklightOverride) {
+    displayBacklightOn();
+  }
+  return manualBacklightOverride;
 }
 
 // ==================== KEYPAD ====================

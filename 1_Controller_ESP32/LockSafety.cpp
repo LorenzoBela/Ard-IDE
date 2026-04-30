@@ -27,6 +27,11 @@ static unsigned long reedOpenSince   = 0;     // millis() when stable OPEN began
 static bool          prevQualifiedOpen = false;
 static volatile bool reedEdgeSeen = false;
 
+// ── Unjam utility state (used by maintainLockSafety + fireUnjamPulse) ──
+static uint8_t       unjamPulseCount    = 0;
+static unsigned long unjamLastPulseAt   = 0;
+static unsigned long unjamDeEnergiseAt  = 0;
+
 static void IRAM_ATTR reedSwitchISR() {
   reedEdgeSeen = true;
 }
@@ -41,6 +46,7 @@ static void energise(unsigned long now) {
   digitalWrite(LOCK_PIN, HIGH);
   solenoidOnAt = now;
   coilTempC += LOCK_HEAT_PER_ACTUATION;
+  unjamDeEnergiseAt = 0; // Clear any pending unjam timer (defense in depth).
 }
 
 static void deEnergise() {
@@ -174,9 +180,17 @@ bool maintainLockSafety(unsigned long now) {
   }
   lastCoolTick = now;
 
+  // ── Unjam pulse auto-deenergise (non-blocking) ──
+  if (unjamDeEnergiseAt > 0 && now >= unjamDeEnergiseAt) {
+    deEnergise();
+    unjamDeEnergiseAt = 0;
+    Serial.println(F("[UNJAM] Pulse de-energised (300ms elapsed)"));
+  }
+
   // ── Hard thermal cutoff ──
   if (solenoidOnAt > 0 && (now - solenoidOnAt >= LOCK_MAX_ACTIVE_MS)) {
     deEnergise();
+    unjamDeEnergiseAt = 0; // Clear any pending unjam de-energise
     Serial.println(F("[LOCK] THERMAL CUTOFF (timeout limit)"));
     return true;
   }
@@ -203,3 +217,178 @@ const char* lockStatusStr(LockStatus s) {
     default:                  return "UNKNOWN";
   }
 }
+
+// ==================== BOOT SELF-TEST (POST) ====================
+
+// Sub-stages: even = energise, odd = settle, final = verify
+static uint8_t  stStage       = 0;
+static uint8_t  stPulsesDone  = 0;
+static bool     stBaselineReed = true;
+static bool     stReedFault   = false;
+static unsigned long stStageStartAt = 0;
+static bool     stSkipSolenoid = false; // Reed-only mode (no pulses)
+
+void initSelfTest(bool skipSolenoid) {
+  stStage        = 0;
+  stPulsesDone   = 0;
+  stBaselineReed = readReedRaw();
+  stReedFault    = false;
+  stStageStartAt = 0;
+  stSkipSolenoid = skipSolenoid;
+  Serial.printf("[SELFTEST] Init — baseline reed=%s, solenoid=%s\n",
+                stBaselineReed ? "CLOSED" : "OPEN",
+                stSkipSolenoid ? "SKIP (mid-delivery)" : "ACTIVE");
+}
+
+uint8_t getSelfTestPulseNumber() {
+  if (stSkipSolenoid) return 0; // No pulses in reed-only mode
+  return stPulsesDone + (stStage % 2 == 0 && stStage > 0 ? 0 : 1);
+}
+
+SelfTestResult tickSelfTest(unsigned long now) {
+  // ── Reed-only mode: skip solenoid pulses entirely. ──
+  // Used during mid-delivery reboot to prevent momentary unlock windows.
+  if (stSkipSolenoid) {
+    if (stStage == 0) {
+      stBaselineReed = readReedRaw();
+      stStageStartAt = now;
+      stStage = 254; // Jump straight to final verify
+      Serial.println(F("[SELFTEST] Reed-only mode — no solenoid pulses"));
+      return SELFTEST_RUNNING;
+    }
+    // Fall through to stage 254 (final verify) below.
+  }
+
+  // Stage 0: Record baseline and start first pulse immediately.
+  if (stStage == 0) {
+    stBaselineReed = readReedRaw();
+    stStageStartAt = now;
+    energise(now);
+    stStage = 1;
+    Serial.printf("[SELFTEST] Pulse %u/%u — energise\n",
+                  stPulsesDone + 1, (unsigned int)SELFTEST_PULSE_COUNT);
+    return SELFTEST_RUNNING;
+  }
+
+  // Odd stages (1, 3, 5): solenoid is ON — wait for pulse duration.
+  if (stStage % 2 == 1) {
+    if (now - stStageStartAt >= SELFTEST_PULSE_DURATION_MS) {
+      deEnergise();
+      stPulsesDone++;
+      Serial.printf("[SELFTEST] Pulse %u/%u — de-energise\n",
+                    stPulsesDone, (unsigned int)SELFTEST_PULSE_COUNT);
+
+      // Check if we've done all pulses.
+      if (stPulsesDone >= SELFTEST_PULSE_COUNT) {
+        stStage = 254; // Final verify stage
+        stStageStartAt = now;
+        return SELFTEST_RUNNING;
+      }
+
+      // Move to settle stage.
+      stStage++;
+      stStageStartAt = now;
+    }
+    return SELFTEST_RUNNING;
+  }
+
+  // Even stages (2, 4): settle/cooling gap between pulses.
+  if (stStage < 254) {
+    if (now - stStageStartAt >= SELFTEST_INTERVAL_MS) {
+      // Check reed during settle — should still match baseline.
+      bool currentReed = readReedRaw();
+      if (currentReed != stBaselineReed) {
+        Serial.printf("[SELFTEST] Reed drift during settle: was=%d now=%d\n",
+                      stBaselineReed, currentReed);
+        stReedFault = true;
+      }
+
+      // Start next pulse.
+      stStageStartAt = now;
+      energise(now);
+      stStage++;
+      Serial.printf("[SELFTEST] Pulse %u/%u — energise\n",
+                    stPulsesDone + 1, (unsigned int)SELFTEST_PULSE_COUNT);
+    }
+    return SELFTEST_RUNNING;
+  }
+
+  // Stage 254: Final settle after last pulse, then verify.
+  if (stStage == 254) {
+    // In reed-only mode, use a short settle (500ms) instead of full interval.
+    unsigned long settleTime = stSkipSolenoid ? 500UL : SELFTEST_INTERVAL_MS;
+    if (now - stStageStartAt >= settleTime) {
+      bool finalReed = readReedRaw();
+      if (finalReed != stBaselineReed) {
+        Serial.printf("[SELFTEST] Reed mismatch after test: baseline=%d final=%d\n",
+                      stBaselineReed, finalReed);
+        stReedFault = true;
+      }
+
+      if (stReedFault) {
+        Serial.println(F("[SELFTEST] WARN — reed was unstable during test"));
+        return SELFTEST_WARN;
+      }
+
+      Serial.println(F("[SELFTEST] PASS — solenoid and reed nominal"));
+      return SELFTEST_PASS;
+    }
+    return SELFTEST_RUNNING;
+  }
+
+  // Should never reach here.
+  return SELFTEST_WARN;
+}
+
+// ==================== UNJAM UTILITY (KEY 6) ====================
+
+UnjamResult fireUnjamPulse(unsigned long now) {
+  // Auto-reset counter if idle long enough.
+  if (unjamPulseCount > 0 && unjamLastPulseAt > 0 &&
+      now - unjamLastPulseAt >= UNJAM_COUNTER_RESET_MS) {
+    resetUnjamCounter();
+  }
+
+  // Guard: thermal
+  if (coilTempC >= LOCK_THERMAL_MAX_TEMP) {
+    Serial.println(F("[UNJAM] Blocked — coil overheated"));
+    return UNJAM_OVERHEATED;
+  }
+
+  // Guard: cooldown
+  if (unjamLastPulseAt > 0 && now - unjamLastPulseAt < UNJAM_COOLDOWN_MS) {
+    Serial.println(F("[UNJAM] Blocked — cooldown active"));
+    return UNJAM_COOLDOWN;
+  }
+
+  // Guard: pulse limit
+  if (unjamPulseCount >= UNJAM_MAX_PULSES) {
+    Serial.println(F("[UNJAM] Blocked — max pulses reached, wait for reset"));
+    return UNJAM_LIMIT;
+  }
+
+  // Fire pulse — energise now, schedule de-energise.
+  energise(now);
+  unjamDeEnergiseAt = now + UNJAM_PULSE_DURATION_MS;
+  unjamPulseCount++;
+  unjamLastPulseAt = now;
+
+  Serial.printf("[UNJAM] Pulse %u/%u fired (300ms)\n",
+                unjamPulseCount, (unsigned int)UNJAM_MAX_PULSES);
+  return UNJAM_OK;
+}
+
+void resetUnjamCounter() {
+  if (unjamPulseCount > 0) {
+    Serial.println(F("[UNJAM] Pulse counter reset"));
+  }
+  unjamPulseCount = 0;
+  unjamLastPulseAt = 0;
+  unjamDeEnergiseAt = 0;
+}
+
+uint8_t getUnjamPulsesRemaining() {
+  uint8_t used = unjamPulseCount;
+  return used < UNJAM_MAX_PULSES ? (UNJAM_MAX_PULSES - used) : 0;
+}
+

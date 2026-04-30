@@ -134,10 +134,24 @@ unsigned long cachedStatusSetAt = 0;
 uint8_t cachedStatusServesRemaining = 0;
 #define STATUS_COMMAND_MAX_SERVES 60
 #define STATUS_COMMAND_RETRY_WINDOW_MS 60000
+enum CommandDeliveryStage : uint8_t {
+  CMD_STAGE_NONE = 0,
+  CMD_STAGE_PENDING = 1,
+  CMD_STAGE_ACK_SENT = 2,
+  CMD_STAGE_DONE = 3
+};
+uint8_t cachedStatusStage = CMD_STAGE_NONE;
+char cachedCommandAckStatus[32] = "";
+char cachedCommandAckDetails[96] = "";
+unsigned long lastCommandAckRetryAt = 0;
+#define COMMAND_ACK_RETRY_INTERVAL_MS 3000
 bool rebootAllPending = false;
 bool rebootCamDispatchDone = false;
 unsigned long rebootAllAtMs = 0;
+unsigned long rebootAllQueuedAtMs = 0;
+bool rebootAllWaitLogged = false;
 #define REBOOT_ALL_GRACE_MS 5000
+#define REBOOT_ALL_WAIT_FOR_CONTROLLER_MS 45000
 
 // Internal proxy state to prevent telemetry from overwriting physical lock state on Firebase
 bool isBoxLocked = true;
@@ -184,6 +198,51 @@ static bool extractJsonStringValue(const char *json, const char *key,
 }
 bool camClientKnown = false;
 #define CAM_FACE_PORT 80 // ESP32-CAM runs a tiny HTTP server on port 80
+static unsigned long camLastSeenAt = 0;
+#define CAM_LIVENESS_STALE_MS 30000
+static unsigned long controllerLastSeenAt = 0;
+#define CONTROLLER_LIVENESS_STALE_MS 30000
+
+enum ConnectivityMatrixState : uint8_t {
+  CONN_ALL_UP = 0,
+  CONN_CAM_DOWN_CTRL_UP = 1,
+  CONN_CTRL_DOWN_CAM_UP = 2,
+  CONN_BOTH_DOWN = 3
+};
+static ConnectivityMatrixState connectivityState = CONN_BOTH_DOWN;
+static ConnectivityMatrixState lastConnectivityState = CONN_BOTH_DOWN;
+
+enum ModemRecoveryState : uint8_t {
+  MODEM_RECOVERY_IDLE = 0,
+  MODEM_RECOVERY_REQUESTED = 1,
+  MODEM_RECOVERY_RUNNING = 2
+};
+static volatile ModemRecoveryState modemRecoveryState = MODEM_RECOVERY_IDLE;
+static volatile bool modemRecoveryRequested = false;
+static unsigned long modemRetryAt = 0;
+static unsigned long modemRetryBackoffMs = 10000;
+static const unsigned long MODEM_RETRY_BACKOFF_MAX_MS = 120000;
+static TaskHandle_t modemRecoveryTaskHandle = NULL;
+static unsigned long lastLteReconnectLatencyMs = 0;
+static unsigned long lteRecoveryAttemptCount = 0;
+static unsigned long lastLteRecoveryStartedAt = 0;
+
+static char lastCommandAckIdempotencyKey[65] = "";
+static unsigned long lastCommandAckIdempotencyAt = 0;
+static char lastTamperIdempotencyKey[65] = "";
+static unsigned long lastTamperIdempotencyAt = 0;
+static char lastLockEventIdempotencyKey[65] = "";
+static unsigned long lastLockEventIdempotencyAt = 0;
+static const unsigned long IDEMPOTENCY_DEDUPE_WINDOW_MS = 15000;
+
+static unsigned long lastDurabilityMetricFlushAt = 0;
+static const unsigned long DURABILITY_METRICS_INTERVAL_MS = 3600000UL;
+static DpWriteMetrics lastDpMetricsSnapshot = {0, 0, 0, 0};
+
+static uint32_t lastPersistedContextHash = 0;
+static bool persistedContextHashReady = false;
+static uint32_t lastPersistedPinContextHash = 0;
+static bool persistedPinContextHashReady = false;
 
 unsigned long lastPersonalPinFlushAt = 0;
 #define PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS 5000
@@ -226,6 +285,13 @@ unsigned long dateTimeToEpoch(int year, int month, int day, int hour, int min,
 
 // Forward declaration (implementation appears in auto-provisioning section).
 String httpGetFromFirebase(const char *path);
+bool writeCommandAckToFirebase(const char *command, const char *status,
+                               const char *details);
+void scheduleModemRecovery(const char *reason);
+void modemRecoveryTask(void *);
+void maybeEvaluateConnectivityMatrix(unsigned long now);
+void maybePublishDurabilityMetrics(unsigned long now);
+static bool isControllerUp(unsigned long now);
 
 static unsigned long getCompileTimeEpoch() {
   // __DATE__ = "Mmm dd yyyy"  __TIME__ = "hh:mm:ss"
@@ -1356,10 +1422,167 @@ void checkModemHealth() {
     Serial.printf("[HEALTH] Modem unresponsive (%u/%u)\n",
                   consecutiveModemFailures, MAX_CONSECUTIVE_FAILURES);
     if (consecutiveModemFailures >= MAX_CONSECUTIVE_FAILURES) {
-      hardResetModem();
+      modemOK = false;
+      lteConnected = false;
+      scheduleModemRecovery("health_timeout");
+      consecutiveModemFailures = 0;
     }
   } else {
     consecutiveModemFailures = 0;
+  }
+}
+
+void scheduleModemRecovery(const char *reason) {
+  if (modemRecoveryState == MODEM_RECOVERY_RUNNING || modemRecoveryRequested) {
+    return;
+  }
+
+  modemRecoveryRequested = true;
+  modemRecoveryState = MODEM_RECOVERY_REQUESTED;
+  lteRecoveryAttemptCount++;
+  lastLteRecoveryStartedAt = millis();
+  modemRetryAt = millis() + modemRetryBackoffMs;
+  Serial.printf("[RETRY] Scheduled modem recovery (%s)\n",
+                reason ? reason : "unspecified");
+}
+
+void modemRecoveryTask(void *) {
+  while (true) {
+    if (modemRecoveryRequested && modemRecoveryState == MODEM_RECOVERY_REQUESTED) {
+      modemRecoveryRequested = false;
+      modemRecoveryState = MODEM_RECOVERY_RUNNING;
+
+      unsigned long startedAt = millis();
+      Serial.println("[RETRY] Async modem recovery started");
+
+      if (!modemOK) {
+        powerModem();
+        modemOK = initModem();
+      }
+
+      if (modemOK && !lteConnected) {
+        lteConnected = connectLTE();
+        if (lteConnected) {
+          syncNetworkTime();
+        }
+      }
+
+      if (modemOK && lteConnected) {
+        modemRetryBackoffMs = 10000;
+      } else {
+        modemRetryBackoffMs *= 2;
+        if (modemRetryBackoffMs > MODEM_RETRY_BACKOFF_MAX_MS) {
+          modemRetryBackoffMs = MODEM_RETRY_BACKOFF_MAX_MS;
+        }
+      }
+
+      lastLteReconnectLatencyMs = millis() - startedAt;
+      modemRetryAt = millis() + modemRetryBackoffMs;
+      Serial.printf("[RETRY] Async modem recovery done | modem=%d lte=%d latency=%lums\n",
+                    (int)modemOK, (int)lteConnected, lastLteReconnectLatencyMs);
+
+      modemRecoveryState = MODEM_RECOVERY_IDLE;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+void maybeEvaluateConnectivityMatrix(unsigned long now) {
+  unsigned long camAgeMs = (camLastSeenAt > 0) ? (now - camLastSeenAt) : 0;
+  bool camUp = camClientKnown && camLastSeenAt > 0 &&
+               (camAgeMs <= CAM_LIVENESS_STALE_MS);
+  unsigned long ctrlAgeMs =
+      (controllerLastSeenAt > 0) ? (now - controllerLastSeenAt) : 0;
+  bool ctrlUp = controllerLastSeenAt > 0 &&
+                (ctrlAgeMs <= CONTROLLER_LIVENESS_STALE_MS);
+
+  ConnectivityMatrixState nextState = CONN_BOTH_DOWN;
+  if (camUp && ctrlUp) {
+    nextState = CONN_ALL_UP;
+  } else if (!camUp && ctrlUp) {
+    nextState = CONN_CAM_DOWN_CTRL_UP;
+  } else if (camUp && !ctrlUp) {
+    nextState = CONN_CTRL_DOWN_CAM_UP;
+  }
+
+  connectivityState = nextState;
+  if (connectivityState != lastConnectivityState) {
+    Serial.printf("[LIVENESS] Connectivity matrix -> %s\n",
+                  connectivityStateStr(connectivityState));
+    if (connectivityState == CONN_CTRL_DOWN_CAM_UP) {
+      if (cachedStatusStage == CMD_STAGE_PENDING && cachedStatus[0] != '\0') {
+        // Keep pending command durable and ready to serve once controller returns.
+        cachedStatusServesRemaining = STATUS_COMMAND_MAX_SERVES;
+        cachedStatusSetAt = now;
+        dpSaveCommandState(cachedStatus, DP_CMD_STAGE_PENDING,
+                           cachedStatusServesRemaining, "", "");
+        Serial.printf("[LIVENESS] Holding pending command until controller recovers: %s\n",
+                      cachedStatus);
+      }
+
+      if (rebootAllPending) {
+        rebootAllQueuedAtMs = now;
+        rebootAllWaitLogged = false;
+        Serial.println("[REBOOT_ALL] Controller down; waiting before proxy reboot");
+      }
+    } else if (connectivityState == CONN_BOTH_DOWN) {
+      if (cachedStatusStage == CMD_STAGE_PENDING && cachedStatus[0] != '\0') {
+        cachedStatusServesRemaining = STATUS_COMMAND_MAX_SERVES;
+        cachedStatusSetAt = now;
+        Serial.printf("[LIVENESS] Both peers down; command kept pending: %s\n",
+                      cachedStatus);
+      }
+      rebootAllWaitLogged = false;
+    } else {
+      rebootAllWaitLogged = false;
+    }
+    lastConnectivityState = connectivityState;
+  }
+}
+
+static bool isControllerUp(unsigned long now) {
+  if (controllerLastSeenAt == 0) {
+    return false;
+  }
+  return (unsigned long)(now - controllerLastSeenAt) <=
+         CONTROLLER_LIVENESS_STALE_MS;
+}
+
+void maybePublishDurabilityMetrics(unsigned long now) {
+  if (!lteConnected) return;
+  if ((now - lastDurabilityMetricFlushAt) < DURABILITY_METRICS_INTERVAL_MS) {
+    return;
+  }
+
+  DpWriteMetrics current = {0, 0, 0, 0};
+  dpGetWriteMetrics(&current);
+
+  unsigned long deliveryDelta = current.deliveryWrites - lastDpMetricsSnapshot.deliveryWrites;
+  unsigned long commandDelta = current.commandWrites - lastDpMetricsSnapshot.commandWrites;
+  unsigned long pinDelta = current.personalPinWrites - lastDpMetricsSnapshot.personalPinWrites;
+  unsigned long auditDelta = current.auditWrites - lastDpMetricsSnapshot.auditWrites;
+
+  char metricsJson[320];
+  snprintf(metricsJson, sizeof(metricsJson),
+           "{\"delivery_writes\":%lu,\"command_writes\":%lu,\"pin_writes\":%lu,"
+           "\"audit_writes\":%lu,\"window_ms\":%lu,\"conn_state\":%u,"
+           "\"lte_reconnect_last_ms\":%lu,\"lte_recovery_attempts\":%lu}",
+           deliveryDelta,
+           commandDelta,
+           pinDelta,
+           auditDelta,
+           (unsigned long)DURABILITY_METRICS_INTERVAL_MS,
+           (unsigned int)connectivityState,
+           lastLteReconnectLatencyMs,
+           lteRecoveryAttemptCount);
+
+  char metricPath[80];
+  snprintf(metricPath, sizeof(metricPath), "/hardware/%s/nvs_metrics.json",
+           HARDWARE_ID);
+  if (httpPutWithRetry(metricPath, metricsJson)) {
+    lastDpMetricsSnapshot = current;
+    lastDurabilityMetricFlushAt = now;
   }
 }
 
@@ -1424,7 +1647,7 @@ void sendToFirebase() {
   // so the web dashboard always gets an accurate UTC ms timestamp,
   // regardless of whether the ESP32's NTP sync succeeded.
   // uptime_ms = millis() â€” device time since boot, survives web page refresh.
-  char hardwareJson[768];
+  char hardwareJson[896];
   snprintf(hardwareJson, sizeof(hardwareJson),
            "{\"status\":\"%s\","
            "\"connection\":\"LTE\","
@@ -1440,6 +1663,11 @@ void sendToFirebase() {
            "\"time_synced\":%s,"
            "\"batt_v\":%.2f,"
            "\"batt_pct\":%d,"
+           "\"batt_mah\":%lu,"
+           "\"batt_cap_mah\":%lu,"
+           "\"batt_pin_mv\":%d,"
+           "\"batt_adc\":%d,"
+           "\"batt_sensor_ok\":%s,"
            "\"batt_low\":%s,"
            "\"geo_state\":\"%s\","
            "\"geo_dist_m\":%.1f,"
@@ -1448,6 +1676,11 @@ void sendToFirebase() {
            (unsigned long)millis(), now_epoch, tsBuf,
            timeSynced ? "true" : "false",
            batteryGetVoltage(), batteryGetPercentage(),
+           (unsigned long)batteryGetRemainingMah(),
+           (unsigned long)batteryGetCapacityMah(),
+           batteryGetPinMilliVolts(),
+           batteryGetAdcRaw(),
+           batterySensorLooksValid() ? "true" : "false",
            batteryIsLow() ? "true" : "false",
            geoProxy.stateStr(geoProxy.snap.stableState),
            geoProxy.snap.distanceM,
@@ -1502,7 +1735,7 @@ void sendToFirebase() {
         "[RELIABILITY] %u consecutive Firebase failures â€” reconnecting LTE\n",
         firebaseFailures);
     lteConnected = false;
-    connectLTE();
+    scheduleModemRecovery("firebase_failures");
     firebaseFailures = 0;
   }
 }
@@ -2035,6 +2268,68 @@ static void sha256Hex(const char *input, char *outHex, size_t outLen) {
   outHex[64] = '\0';
 }
 
+static uint32_t fnv1a32(const char *text) {
+  const char *src = text ? text : "";
+  uint32_t hash = 2166136261u;
+  while (*src) {
+    hash ^= (uint8_t)*src++;
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
+static uint32_t buildDeliveryContextHash(const char *otp, const char *deliveryId) {
+  uint32_t hash = fnv1a32(otp);
+  hash ^= fnv1a32(deliveryId);
+  return hash;
+}
+
+static uint32_t buildPersonalPinContextHash(bool enabled,
+                                            const char *hashHex,
+                                            const char *salt,
+                                            const char *riderId) {
+  char enabledFlag[2] = {'0', '\0'};
+  enabledFlag[0] = enabled ? '1' : '0';
+  uint32_t hash = fnv1a32(enabledFlag);
+  hash ^= fnv1a32(hashHex);
+  hash ^= fnv1a32(salt);
+  hash ^= fnv1a32(riderId);
+  return hash;
+}
+
+static bool sameIdempotencyRecently(const char *key,
+                                    const char *lastKey,
+                                    unsigned long lastAt,
+                                    unsigned long now) {
+  if (!key || !lastKey || key[0] == '\0' || lastKey[0] == '\0') {
+    return false;
+  }
+  if (strcmp(key, lastKey) != 0) {
+    return false;
+  }
+  return (now - lastAt) <= IDEMPOTENCY_DEDUPE_WINDOW_MS;
+}
+
+static void buildIdempotencyKey(const char *seed, char *outHex, size_t outLen) {
+  if (!outHex || outLen < 65) return;
+  sha256Hex(seed ? seed : "", outHex, outLen);
+}
+
+static const char *connectivityStateStr(uint8_t state) {
+  switch (state) {
+    case CONN_ALL_UP:
+      return "ALL_UP";
+    case CONN_CAM_DOWN_CTRL_UP:
+      return "CAM_DOWN_CTRL_UP";
+    case CONN_CTRL_DOWN_CAM_UP:
+      return "CTRL_DOWN_CAM_UP";
+    case CONN_BOTH_DOWN:
+      return "BOTH_DOWN";
+    default:
+      return "UNKNOWN";
+  }
+}
+
 static void clearPersonalPinRuntimeCache(bool clearPersisted) {
   personalPinEnabled = false;
   cachedPersonalPinHashMcu[0] = '\0';
@@ -2046,6 +2341,9 @@ static void clearPersonalPinRuntimeCache(bool clearPersisted) {
     dpSavePersonalPinHash("");
     dpSavePersonalPinSalt("");
     dpSavePersonalPinRiderId("");
+    lastPersistedPinContextHash =
+        buildPersonalPinContextHash(false, "", "", "");
+    persistedPinContextHashReady = true;
   }
 }
 
@@ -2181,6 +2479,178 @@ static void enforceTamperSuppressionTimeout(unsigned long now) {
 
   clearTamperSuppression("timeout_no_unlock_ack");
   replayPendingTamperIfAny(now, "suppression_timeout");
+}
+
+static void clearCommandRuntimeState() {
+  cachedStatus[0] = '\0';
+  cachedStatusSetAt = 0;
+  cachedStatusServesRemaining = 0;
+  cachedStatusStage = CMD_STAGE_NONE;
+  cachedCommandAckStatus[0] = '\0';
+  cachedCommandAckDetails[0] = '\0';
+  lastCommandAckRetryAt = 0;
+  rebootAllPending = false;
+  rebootCamDispatchDone = false;
+  rebootAllAtMs = 0;
+  rebootAllQueuedAtMs = 0;
+  rebootAllWaitLogged = false;
+}
+
+static void armPendingCommand(const char *command) {
+  if (!command || command[0] == '\0') {
+    clearCommandRuntimeState();
+    dpClearCommandState();
+    return;
+  }
+
+  strncpy(cachedStatus, command, sizeof(cachedStatus) - 1);
+  cachedStatus[sizeof(cachedStatus) - 1] = '\0';
+  cachedStatusStage = CMD_STAGE_PENDING;
+  cachedStatusSetAt = millis();
+  cachedStatusServesRemaining = STATUS_COMMAND_MAX_SERVES;
+  cachedCommandAckStatus[0] = '\0';
+  cachedCommandAckDetails[0] = '\0';
+  lastCommandAckRetryAt = 0;
+
+  dpSaveCommandState(cachedStatus, DP_CMD_STAGE_PENDING,
+                     cachedStatusServesRemaining, "", "");
+}
+
+static void markCommandAckSent(const char *command, const char *status,
+                               const char *details) {
+  if (command && command[0] != '\0') {
+    strncpy(cachedStatus, command, sizeof(cachedStatus) - 1);
+    cachedStatus[sizeof(cachedStatus) - 1] = '\0';
+  }
+
+  strncpy(cachedCommandAckStatus, status ? status : "unknown",
+          sizeof(cachedCommandAckStatus) - 1);
+  cachedCommandAckStatus[sizeof(cachedCommandAckStatus) - 1] = '\0';
+
+  strncpy(cachedCommandAckDetails, details ? details : "",
+          sizeof(cachedCommandAckDetails) - 1);
+  cachedCommandAckDetails[sizeof(cachedCommandAckDetails) - 1] = '\0';
+
+  cachedStatusStage = CMD_STAGE_ACK_SENT;
+  cachedStatusServesRemaining = 0;
+  cachedStatusSetAt = millis();
+  lastCommandAckRetryAt = 0;
+
+  dpSaveCommandState(cachedStatus, DP_CMD_STAGE_ACK_SENT, 0,
+                     cachedCommandAckStatus, cachedCommandAckDetails);
+}
+
+static void markCommandDone() {
+  cachedStatus[0] = '\0';
+  cachedStatusSetAt = 0;
+  cachedStatusServesRemaining = 0;
+  cachedStatusStage = CMD_STAGE_DONE;
+  cachedCommandAckStatus[0] = '\0';
+  cachedCommandAckDetails[0] = '\0';
+  lastCommandAckRetryAt = 0;
+  rebootAllPending = false;
+  rebootCamDispatchDone = false;
+  rebootAllAtMs = 0;
+  dpSaveCommandState("", DP_CMD_STAGE_DONE, 0, "", "");
+}
+
+static void restorePersistedCommandState() {
+  char persistedCommand[16] = "";
+  char persistedAckStatus[32] = "";
+  char persistedAckDetails[96] = "";
+  uint8_t persistedStage = DP_CMD_STAGE_NONE;
+  uint8_t persistedServes = 0;
+
+  if (!dpLoadCommandState(persistedCommand, sizeof(persistedCommand),
+                          &persistedStage, &persistedServes,
+                          persistedAckStatus, sizeof(persistedAckStatus),
+                          persistedAckDetails, sizeof(persistedAckDetails))) {
+    return;
+  }
+
+  if (persistedStage == DP_CMD_STAGE_PENDING && persistedCommand[0] != '\0') {
+    strncpy(cachedStatus, persistedCommand, sizeof(cachedStatus) - 1);
+    cachedStatus[sizeof(cachedStatus) - 1] = '\0';
+    cachedStatusStage = CMD_STAGE_PENDING;
+    cachedStatusServesRemaining =
+        persistedServes > 0 ? persistedServes : STATUS_COMMAND_MAX_SERVES;
+    cachedStatusSetAt = millis();
+    Serial.printf("[DP] Restored pending command: %s\n", cachedStatus);
+    return;
+  }
+
+  if (persistedStage == DP_CMD_STAGE_ACK_SENT && persistedCommand[0] != '\0' &&
+      persistedAckStatus[0] != '\0') {
+    strncpy(cachedStatus, persistedCommand, sizeof(cachedStatus) - 1);
+    cachedStatus[sizeof(cachedStatus) - 1] = '\0';
+
+    strncpy(cachedCommandAckStatus, persistedAckStatus,
+            sizeof(cachedCommandAckStatus) - 1);
+    cachedCommandAckStatus[sizeof(cachedCommandAckStatus) - 1] = '\0';
+
+    strncpy(cachedCommandAckDetails, persistedAckDetails,
+            sizeof(cachedCommandAckDetails) - 1);
+    cachedCommandAckDetails[sizeof(cachedCommandAckDetails) - 1] = '\0';
+
+    cachedStatusStage = CMD_STAGE_ACK_SENT;
+    cachedStatusServesRemaining = 0;
+    cachedStatusSetAt = millis();
+    lastCommandAckRetryAt = 0;
+    Serial.printf("[DP] Restored pending command ACK upload: %s (%s)\n",
+                  cachedStatus, cachedCommandAckStatus);
+    return;
+  }
+
+  if (persistedStage == DP_CMD_STAGE_DONE) {
+    cachedStatusStage = CMD_STAGE_DONE;
+    Serial.println("[DP] Restored command state DONE");
+    return;
+  }
+
+  // Corrupted/incomplete persisted state: clear and fail closed.
+  clearCommandRuntimeState();
+  dpClearCommandState();
+  Serial.println("[DP] Cleared invalid persisted command state");
+}
+
+static void maybeRearmPendingCommand(unsigned long now) {
+  if (cachedStatusStage != CMD_STAGE_PENDING || cachedStatus[0] == '\0') {
+    return;
+  }
+  if (cachedStatusServesRemaining > 0 &&
+      (unsigned long)(now - cachedStatusSetAt) <= STATUS_COMMAND_RETRY_WINDOW_MS) {
+    return;
+  }
+
+  cachedStatusServesRemaining = STATUS_COMMAND_MAX_SERVES;
+  cachedStatusSetAt = now;
+  Serial.printf("[AP] Command still pending ACK, re-arming serve window: %s\n",
+                cachedStatus);
+}
+
+static void retryPendingCommandAck(unsigned long now) {
+  if (!lteConnected || cachedStatusStage != CMD_STAGE_ACK_SENT) {
+    return;
+  }
+  if (now < lastCommandAckRetryAt) {
+    return;
+  }
+  if (cachedStatus[0] == '\0' || cachedCommandAckStatus[0] == '\0') {
+    clearCommandRuntimeState();
+    dpClearCommandState();
+    return;
+  }
+
+  bool ackWritten = writeCommandAckToFirebase(cachedStatus,
+                                              cachedCommandAckStatus,
+                                              cachedCommandAckDetails);
+  if (ackWritten) {
+    Serial.printf("[CMD_ACK] Durable ACK flushed, command DONE: %s\n",
+                  cachedStatus);
+    markCommandDone();
+  } else {
+    lastCommandAckRetryAt = now + COMMAND_ACK_RETRY_INTERVAL_MS;
+  }
 }
 
 void refreshDeliveryContextFromFirebase() {
@@ -2409,23 +2879,43 @@ void refreshDeliveryContextFromFirebase() {
             cachedPersonalPinSalt[0] || cachedPersonalPinRiderId[0]) {
           Serial.println("[PIN] Personal PIN runtime fields missing; clearing stale cache");
           clearPersonalPinRuntimeCache(true);
+          lastPersistedPinContextHash =
+              buildPersonalPinContextHash(false, "", "", "");
+          persistedPinContextHashReady = true;
         }
       } else if (!riderValid) {
         Serial.println("[PIN] Missing current_rider_id; clearing Personal PIN cache");
         clearPersonalPinRuntimeCache(true);
+        lastPersistedPinContextHash =
+            buildPersonalPinContextHash(false, "", "", "");
+        persistedPinContextHashReady = true;
       } else if (!parsedEnabled || !enabledVal) {
         clearPersonalPinRuntimeCache(true);
         strncpy(cachedPersonalPinRiderId, parsedRider,
                 sizeof(cachedPersonalPinRiderId) - 1);
         cachedPersonalPinRiderId[sizeof(cachedPersonalPinRiderId) - 1] = '\0';
-        dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+        uint32_t nextPinHash =
+            buildPersonalPinContextHash(false, "", "", cachedPersonalPinRiderId);
+        if (!persistedPinContextHashReady ||
+            nextPinHash != lastPersistedPinContextHash) {
+          dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+          lastPersistedPinContextHash = nextPinHash;
+          persistedPinContextHashReady = true;
+        }
       } else if (!hashValid || !saltValid) {
         Serial.println("[PIN] Incomplete Personal PIN runtime payload; clearing cache");
         clearPersonalPinRuntimeCache(true);
         strncpy(cachedPersonalPinRiderId, parsedRider,
                 sizeof(cachedPersonalPinRiderId) - 1);
         cachedPersonalPinRiderId[sizeof(cachedPersonalPinRiderId) - 1] = '\0';
-        dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+        uint32_t nextPinHash =
+            buildPersonalPinContextHash(false, "", "", cachedPersonalPinRiderId);
+        if (!persistedPinContextHashReady ||
+            nextPinHash != lastPersistedPinContextHash) {
+          dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+          lastPersistedPinContextHash = nextPinHash;
+          persistedPinContextHashReady = true;
+        }
       } else {
         if (riderChanged) {
           Serial.printf("[PIN] Rider changed (%s -> %s); replacing Personal PIN cache\n",
@@ -2433,22 +2923,33 @@ void refreshDeliveryContextFromFirebase() {
         }
 
         personalPinEnabled = true;
-        dpSavePersonalPinEnabled(true);
 
         strncpy(cachedPersonalPinHashMcu, parsedHash,
                 sizeof(cachedPersonalPinHashMcu) - 1);
         cachedPersonalPinHashMcu[sizeof(cachedPersonalPinHashMcu) - 1] = '\0';
-        dpSavePersonalPinHash(cachedPersonalPinHashMcu);
 
         strncpy(cachedPersonalPinSalt, parsedSalt,
                 sizeof(cachedPersonalPinSalt) - 1);
         cachedPersonalPinSalt[sizeof(cachedPersonalPinSalt) - 1] = '\0';
-        dpSavePersonalPinSalt(cachedPersonalPinSalt);
 
         strncpy(cachedPersonalPinRiderId, parsedRider,
                 sizeof(cachedPersonalPinRiderId) - 1);
         cachedPersonalPinRiderId[sizeof(cachedPersonalPinRiderId) - 1] = '\0';
-        dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+
+        uint32_t nextPinHash =
+            buildPersonalPinContextHash(true,
+                                        cachedPersonalPinHashMcu,
+                                        cachedPersonalPinSalt,
+                                        cachedPersonalPinRiderId);
+        if (!persistedPinContextHashReady ||
+            nextPinHash != lastPersistedPinContextHash) {
+          dpSavePersonalPinEnabled(true);
+          dpSavePersonalPinHash(cachedPersonalPinHashMcu);
+          dpSavePersonalPinSalt(cachedPersonalPinSalt);
+          dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+          lastPersistedPinContextHash = nextPinHash;
+          persistedPinContextHashReady = true;
+        }
       }
     }
 
@@ -2465,7 +2966,9 @@ void refreshDeliveryContextFromFirebase() {
         cachedReturnOtp[0] = '\0';
         returnActive = false;
 
-        dpClear();
+        dpClearDeliveryContext();
+        persistedContextHashReady = false;
+        lastPersistedContextHash = 0;
         clearPersonalPinRuntimeCache(false);
 
         char hwPath[64];
@@ -2558,9 +3061,16 @@ void refreshDeliveryContextFromFirebase() {
     }
     lastReturnActive = returnActive;
 
-    // ── NVS persistence ──
-    if (otpCacheValid)          dpSaveOtp(cachedOtp);
-    if (deliveryIdCacheValid)   dpSaveDeliveryId(cachedDeliveryId);
+    // ── NVS persistence (write only when context changes) ──
+    uint32_t deliveryCtxHash =
+        buildDeliveryContextHash(otpCacheValid ? cachedOtp : "",
+                                 deliveryIdCacheValid ? cachedDeliveryId : "");
+    if (!persistedContextHashReady || deliveryCtxHash != lastPersistedContextHash) {
+      dpSaveDeliveryContext(otpCacheValid ? cachedOtp : "",
+                            deliveryIdCacheValid ? cachedDeliveryId : "");
+      lastPersistedContextHash = deliveryCtxHash;
+      persistedContextHashReady = true;
+    }
 
     // ── EC-78: Detect reassignment ──
     int raIdx = body.indexOf("\"reassignment_pending\":true");
@@ -2615,16 +3125,23 @@ void refreshDeliveryContextFromFirebase() {
       if (end > start) {
         int len = end - start;
         if (len > 0 && len < (int)sizeof(cachedStatus)) {
-          strncpy(cachedStatus, body.c_str() + start, len);
-          cachedStatus[len] = '\0';
-          if (strcmp(cachedStatus, "NONE") == 0) {
-            cachedStatus[0] = '\0';
-            cachedStatusSetAt = 0;
-            cachedStatusServesRemaining = 0;
-            Serial.println("[CONTEXT] Remote command cleared (NONE)");
+          char parsedCommand[16] = "";
+          strncpy(parsedCommand, body.c_str() + start, len);
+          parsedCommand[len] = '\0';
+
+          if (strcmp(parsedCommand, "NONE") == 0) {
+            if (cachedStatusStage == CMD_STAGE_ACK_SENT) {
+              Serial.println("[CONTEXT] command=NONE ignored while ACK upload pending");
+            } else {
+              clearCommandRuntimeState();
+              dpClearCommandState();
+              rebootAllPending = false;
+              rebootCamDispatchDone = false;
+              rebootAllAtMs = 0;
+              Serial.println("[CONTEXT] Remote command cleared (NONE)");
+            }
           } else {
-            cachedStatusSetAt = millis();
-            cachedStatusServesRemaining = STATUS_COMMAND_MAX_SERVES;
+            armPendingCommand(parsedCommand);
             Serial.printf("[CONTEXT] Remote command parsed: '%s' (retry window armed)\n",
                           cachedStatus);
 
@@ -2632,6 +3149,8 @@ void refreshDeliveryContextFromFirebase() {
               rebootAllPending = true;
               rebootCamDispatchDone = false;
               rebootAllAtMs = millis() + REBOOT_ALL_GRACE_MS;
+              rebootAllQueuedAtMs = millis();
+              rebootAllWaitLogged = false;
               Serial.printf("[REBOOT_ALL] Grace window started (%lums)\n",
                             (unsigned long)REBOOT_ALL_GRACE_MS);
             }
@@ -2681,7 +3200,8 @@ void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked,
                               int faceAttempts = 0,
                               bool faceRetryExhausted = false,
                               bool fallbackRequired = false,
-                              const char *failureReason = "") {
+                              const char *failureReason = "",
+                              unsigned long unlockLatencyMs = 0) {
   if (!lteConnected) {
     Serial.println("[EVENT] LTE not connected");
     return;
@@ -2696,22 +3216,53 @@ void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked,
   char eventJson[384];
   const char *safeReason =
       (failureReason != NULL && failureReason[0] != '\0') ? failureReason : "";
+  char idempotencySeed[192];
+  snprintf(idempotencySeed, sizeof(idempotencySeed),
+           "%s|%d|%d|%d|%d|%d|%d|%s",
+           HARDWARE_ID,
+           otpValid ? 1 : 0,
+           faceDetected ? 1 : 0,
+           unlocked ? 1 : 0,
+           faceAttempts,
+           faceRetryExhausted ? 1 : 0,
+           fallbackRequired ? 1 : 0,
+           safeReason);
+  char idempotencyKey[65] = "";
+  buildIdempotencyKey(idempotencySeed, idempotencyKey, sizeof(idempotencyKey));
+  unsigned long nowMs = millis();
+  if (sameIdempotencyRecently(idempotencyKey,
+                              lastLockEventIdempotencyKey,
+                              lastLockEventIdempotencyAt,
+                              nowMs)) {
+    Serial.println("[EVENT] lock_events deduped in short window");
+    return;
+  }
+
   snprintf(eventJson, sizeof(eventJson),
            "{\"otp_valid\":%s,\"face_detected\":%s,\"unlocked\":%s,"
            "\"timestamp\":{\".sv\":\"timestamp\"},\"device_epoch\":%lu,"
            "\"timestamp_str\":\"%s\",\"face_attempts\":%d,"
            "\"face_retry_exhausted\":%s,\"fallback_required\":%s,"
-           "\"failure_reason\":\"%s\"}",
+           "\"failure_reason\":\"%s\",\"unlock_latency_ms\":%lu,"
+           "\"idempotency_key\":\"%s\"}",
            otpValid ? "true" : "false", faceDetected ? "true" : "false",
            unlocked ? "true" : "false", now_epoch, tsBuf, faceAttempts,
            faceRetryExhausted ? "true" : "false",
-           fallbackRequired ? "true" : "false", safeReason);
+           fallbackRequired ? "true" : "false", safeReason,
+           unlockLatencyMs,
+           idempotencyKey);
 
   char eventPath[64];
   snprintf(eventPath, sizeof(eventPath), "/lock_events/%s/latest.json",
            HARDWARE_ID);
   bool ok = httpPutWithRetry(eventPath, eventJson);
   Serial.printf("[EVENT] lock_events: %s\n", ok ? "OK" : "FAIL");
+  if (ok) {
+    strncpy(lastLockEventIdempotencyKey, idempotencyKey,
+            sizeof(lastLockEventIdempotencyKey) - 1);
+    lastLockEventIdempotencyKey[sizeof(lastLockEventIdempotencyKey) - 1] = '\0';
+    lastLockEventIdempotencyAt = nowMs;
+  }
 
   const char *newStatus = unlocked ? "UNLOCKING" : "LOCKED";
   isBoxLocked = !unlocked;
@@ -2724,27 +3275,51 @@ void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked,
 }
 
 // ==================== COMMAND ACK WRITER ====================
-void writeCommandAckToFirebase(const char *command, const char *status,
+bool writeCommandAckToFirebase(const char *command, const char *status,
                                const char *details) {
   if (!lteConnected) {
     Serial.println("[CMD_ACK] LTE not connected");
-    return;
+    return false;
   }
 
   unsigned long now_epoch = getCurrentEpoch();
+  unsigned long nowMs = millis();
+  char idempotencySeed[224];
+  snprintf(idempotencySeed, sizeof(idempotencySeed), "%s|%s|%s|%s",
+           HARDWARE_ID,
+           command ? command : "",
+           status ? status : "",
+           details ? details : "");
+  char idempotencyKey[65] = "";
+  buildIdempotencyKey(idempotencySeed, idempotencyKey, sizeof(idempotencyKey));
+  if (sameIdempotencyRecently(idempotencyKey,
+                              lastCommandAckIdempotencyKey,
+                              lastCommandAckIdempotencyAt,
+                              nowMs)) {
+    Serial.println("[CMD_ACK] Deduped in short window");
+    return true;
+  }
+
   char json[320];
   snprintf(json, sizeof(json),
            "{\"command_ack_command\":\"%s\",\"command_ack_status\":\"%s\","
            "\"command_ack_details\":\"%s\",\"command_ack_at\":{\".sv\":\"timestamp\"},"
-           "\"command_ack_epoch\":%lu}",
+           "\"command_ack_epoch\":%lu,\"command_ack_idempotency\":\"%s\"}",
            command ? command : "", status ? status : "", details ? details : "",
-           now_epoch);
+           now_epoch,
+           idempotencyKey);
 
   char hwPath[64];
   snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
   bool ok = httpPatchWithRetry(hwPath, json);
   Serial.printf("[CMD_ACK] Firebase write: %s (%s/%s)\n", ok ? "OK" : "FAIL",
                 command ? command : "", status ? status : "");
+  if (ok) {
+    strncpy(lastCommandAckIdempotencyKey, idempotencyKey,
+            sizeof(lastCommandAckIdempotencyKey) - 1);
+    lastCommandAckIdempotencyKey[sizeof(lastCommandAckIdempotencyKey) - 1] = '\0';
+    lastCommandAckIdempotencyAt = nowMs;
+  }
 
   // Sync internal state and immediately patch `status` at root too if executed/already_locked
   if (ok && (strcmp(status, "executed") == 0 || strcmp(status, "already_locked") == 0 || strcmp(status, "already_unlocked") == 0)) {
@@ -2765,6 +3340,8 @@ void writeCommandAckToFirebase(const char *command, const char *status,
       }
     }
   }
+
+  return ok;
 }
 
 // ==================== TAMPER EVENT WRITER ====================
@@ -2775,6 +3352,18 @@ void writeTamperToFirebase() {
   }
 
   unsigned long now_epoch = getCurrentEpoch();
+  unsigned long nowMs = millis();
+  char idempotencyKey[65] = "";
+  buildIdempotencyKey("tamper|reed_switch", idempotencyKey,
+                      sizeof(idempotencyKey));
+  if (sameIdempotencyRecently(idempotencyKey,
+                              lastTamperIdempotencyKey,
+                              lastTamperIdempotencyAt,
+                              nowMs)) {
+    Serial.println("[TAMPER] Deduped in short window");
+    return;
+  }
+
   char tsBuf[30];
   String tsStr = formatTimestamp(now_epoch);
   strncpy(tsBuf, tsStr.c_str(), sizeof(tsBuf) - 1);
@@ -2786,14 +3375,20 @@ void writeTamperToFirebase() {
            "{\"detected\":true,\"lockdown\":true,"
            "\"timestamp\":{\".sv\":\"timestamp\"},"
            "\"device_epoch\":%lu,\"timestamp_str\":\"%s\","
-           "\"source\":\"reed_switch\"}",
-           now_epoch, tsBuf);
+           "\"source\":\"reed_switch\",\"idempotency_key\":\"%s\"}",
+           now_epoch, tsBuf, idempotencyKey);
 
   char tamperPath[64];
   snprintf(tamperPath, sizeof(tamperPath), "/hardware/%s/tamper.json",
            HARDWARE_ID);
   bool ok = httpPutWithRetry(tamperPath, tamperJson);
   Serial.printf("[TAMPER] Firebase tamper write: %s\n", ok ? "OK" : "FAIL");
+  if (ok) {
+    strncpy(lastTamperIdempotencyKey, idempotencyKey,
+            sizeof(lastTamperIdempotencyKey) - 1);
+    lastTamperIdempotencyKey[sizeof(lastTamperIdempotencyKey) - 1] = '\0';
+    lastTamperIdempotencyAt = nowMs;
+  }
 
   // Also update the top-level theft_state so useSecurityAlerts fires
   char theftJson[32];
@@ -2808,8 +3403,9 @@ void writeTamperToFirebase() {
   snprintf(eventJson, sizeof(eventJson),
            "{\"tamper\":true,\"source\":\"reed_switch\","
            "\"timestamp\":{\".sv\":\"timestamp\"},"
-           "\"device_epoch\":%lu,\"timestamp_str\":\"%s\"}",
-           now_epoch, tsBuf);
+           "\"device_epoch\":%lu,\"timestamp_str\":\"%s\","
+           "\"idempotency_key\":\"%s\"}",
+           now_epoch, tsBuf, idempotencyKey);
   char eventPath[64];
   snprintf(eventPath, sizeof(eventPath), "/lock_events/%s/latest.json",
            HARDWARE_ID);
@@ -2889,6 +3485,7 @@ String forwardFaceCheck(String deliveryId) {
     Serial.println("[FACE] Cannot connect to ESP32-CAM");
     return "ERROR:cam_unreachable";
   }
+  camClientKnown = true;
 
   if (deliveryId.length() > 0) {
     camClient.print("GET /face-status?delivery_id=");
@@ -2921,6 +3518,9 @@ String forwardFaceCheck(String deliveryId) {
   }
 
   camClient.stop();
+  if (result.length() > 0) {
+    camLastSeenAt = millis();
+  }
   Serial.printf("[FACE] CAM response: %s\n", result.c_str());
   return result;
 }
@@ -2935,6 +3535,7 @@ String forwardCameraPowerCommand(const String &mode) {
     Serial.println("[CAM] Cannot connect to ESP32-CAM for power command");
     return "ERROR:cam_unreachable";
   }
+  camClientKnown = true;
 
   camClient.print("GET /cam-power?mode=");
   camClient.print(mode);
@@ -2964,6 +3565,9 @@ String forwardCameraPowerCommand(const String &mode) {
   }
 
   camClient.stop();
+  if (result.length() > 0) {
+    camLastSeenAt = millis();
+  }
   Serial.printf("[CAM] Power mode=%s response: %s\n", mode.c_str(),
                 result.c_str());
   return result.length() > 0 ? result : "ERROR:cam_timeout";
@@ -2972,6 +3576,24 @@ String forwardCameraPowerCommand(const String &mode) {
 void triggerRebootAllIfScheduled(unsigned long now) {
   if (!rebootAllPending) {
     return;
+  }
+
+  if (!isControllerUp(now)) {
+    if (rebootAllQueuedAtMs == 0) {
+      rebootAllQueuedAtMs = now;
+    }
+    unsigned long waitMs = now - rebootAllQueuedAtMs;
+    if (waitMs < REBOOT_ALL_WAIT_FOR_CONTROLLER_MS) {
+      if (!rebootAllWaitLogged) {
+        Serial.printf("[REBOOT_ALL] Waiting for controller recovery (%lu/%lu ms)\n",
+                      waitMs, (unsigned long)REBOOT_ALL_WAIT_FOR_CONTROLLER_MS);
+        rebootAllWaitLogged = true;
+      }
+      return;
+    }
+
+    Serial.println("[REBOOT_ALL] Controller still down after wait window, proceeding");
+    rebootAllWaitLogged = false;
   }
 
   if (!rebootCamDispatchDone) {
@@ -3059,6 +3681,7 @@ void handleCameraClient() {
 
   // ── GET /otp ──
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/otp")) {
+    controllerLastSeenAt = millis();
     String otpPart, delPart;
     String geoOverride = "";
 
@@ -3115,32 +3738,22 @@ void handleCameraClient() {
     // Keep command available for a short retry window so controller can catch it.
     unsigned long nowMs = millis();
     bool statusActive =
-        cachedStatus[0] != '\0' &&
-        cachedStatusServesRemaining > 0 &&
-        (unsigned long)(nowMs - cachedStatusSetAt) <= STATUS_COMMAND_RETRY_WINDOW_MS;
+        cachedStatusStage == CMD_STAGE_PENDING && cachedStatus[0] != '\0';
 
     // Priority: status command > geo override > return mode (they are mutually exclusive actions).
     if (statusActive) {
+      maybeRearmPendingCommand(nowMs);
       body += "," + String(cachedStatus);
       if (cachedStatusServesRemaining > 0) {
         cachedStatusServesRemaining--;
       }
       if (cachedStatusServesRemaining == 0) {
-        Serial.printf("[AP] Status command consumed max serves: %s\n", cachedStatus);
-        cachedStatus[0] = '\0';
-        cachedStatusSetAt = 0;
+        // Keep pending command alive until controller ACK arrives.
+        maybeRearmPendingCommand(nowMs);
       }
     } else if (geoOverride != "") {
       body += "," + geoOverride;
     } else if (returnActive) {
-      // Drop stale command if retry window elapsed.
-      if (cachedStatus[0] != '\0' &&
-          (unsigned long)(nowMs - cachedStatusSetAt) > STATUS_COMMAND_RETRY_WINDOW_MS) {
-        Serial.printf("[AP] Status command expired after retry window: %s\n", cachedStatus);
-        cachedStatus[0] = '\0';
-        cachedStatusSetAt = 0;
-        cachedStatusServesRemaining = 0;
-      }
       body += ",RETURNING";
     }
     Serial.printf("[AP] -> GET /otp  serving: '%s'\n", body.c_str());
@@ -3166,6 +3779,7 @@ void handleCameraClient() {
 
   // ── POST /command-ack ──
   if (strcmp(method, "POST") == 0 && strcmp(reqPath, "/command-ack") == 0) {
+    controllerLastSeenAt = millis();
     Serial.println("[AP] -> POST /command-ack");
     char jsonBuf[320] = "";
     if (contentLength > 0 && contentLength < sizeof(jsonBuf)) {
@@ -3193,11 +3807,18 @@ void handleCameraClient() {
     Serial.printf("[CMD_ACK] command=%s status=%s details=%s\n", cmd, status,
                   details);
 
-    if (cmd[0] != '\0' && strcmp(cachedStatus, cmd) == 0) {
-      cachedStatus[0] = '\0';
-      cachedStatusServesRemaining = 0;
-      cachedStatusSetAt = 0;
-      Serial.println("[AP] Cleared cachedStatus locally upon ACK");
+    bool trackedAck = false;
+    if (cmd[0] != '\0') {
+      bool hasDifferentPending =
+          cachedStatusStage == CMD_STAGE_PENDING && cachedStatus[0] != '\0' &&
+          strcmp(cachedStatus, cmd) != 0;
+      if (hasDifferentPending) {
+        Serial.printf("[CMD_ACK] Ignoring mismatch ACK (%s) while pending %s\n",
+                      cmd, cachedStatus);
+      } else {
+        markCommandAckSent(cmd, status, details);
+        trackedAck = true;
+      }
     }
 
     // Send HTTP 200 OK before blocking on Firebase write
@@ -3208,7 +3829,14 @@ void handleCameraClient() {
     client.stop(); // Disconnect ESP32 immediately to prevent -11 timeout
     
     // Now write to Firebase (takes a few seconds)
-    writeCommandAckToFirebase(cmd, status, details);
+    bool ackWritten = writeCommandAckToFirebase(cmd, status, details);
+    if (trackedAck) {
+      if (ackWritten) {
+        markCommandDone();
+      } else {
+        lastCommandAckRetryAt = millis() + COMMAND_ACK_RETRY_INTERVAL_MS;
+      }
+    }
     return;
   }
 
@@ -3335,6 +3963,7 @@ void handleCameraClient() {
 
   // â”€â”€ POST /event â”€â”€
   if (strcmp(method, "POST") == 0 && strcmp(reqPath, "/event") == 0) {
+    controllerLastSeenAt = millis();
     Serial.println("[AP] -> POST /event");
     char jsonBuf[384] = "";
     if (contentLength > 0 && contentLength < sizeof(jsonBuf)) {
@@ -3369,11 +3998,13 @@ void handleCameraClient() {
       int faceAttempts = 0;
       bool faceRetryExhausted = false;
       bool fallbackRequired = false;
+      int unlockLatencyMs = 0;
       char failureReason[24] = "";
 
       readTopLevelJsonInt(jsonStr, "face_attempts", faceAttempts);
       readTopLevelJsonBool(jsonStr, "face_retry_exhausted", faceRetryExhausted);
       readTopLevelJsonBool(jsonStr, "fallback_required", fallbackRequired);
+      readTopLevelJsonInt(jsonStr, "unlock_latency_ms", unlockLatencyMs);
       readTopLevelJsonString(jsonStr, "failure_reason", failureReason,
                              sizeof(failureReason));
       
@@ -3389,7 +4020,8 @@ void handleCameraClient() {
       
       // Also write alert events to the lock_events stream so it appears in web UI
       writeLockEventToFirebase(ov, fd, ul, faceAttempts, faceRetryExhausted,
-                               fallbackRequired, failureReason);
+                               fallbackRequired, failureReason,
+                               (unsigned long)(unlockLatencyMs > 0 ? unlockLatencyMs : 0));
     }
     
     return;
@@ -3397,17 +4029,39 @@ void handleCameraClient() {
 
   // â”€â”€ GET /diag â”€â”€
   if (strcmp(method, "GET") == 0 && strcmp(reqPath, "/diag") == 0) {
-    char body[192];
+    unsigned long nowMs = millis();
+    unsigned long camAgeMs = (camLastSeenAt > 0) ? (nowMs - camLastSeenAt) : 0;
+    bool camUp = camClientKnown && camLastSeenAt > 0 &&
+                 (camAgeMs <= CAM_LIVENESS_STALE_MS);
+    unsigned long ctrlAgeMs =
+      (controllerLastSeenAt > 0) ? (nowMs - controllerLastSeenAt) : 0;
+    bool ctrlUp = controllerLastSeenAt > 0 &&
+            (ctrlAgeMs <= CONTROLLER_LIVENESS_STALE_MS);
+
+     char body[512];
     snprintf(body, sizeof(body),
-             "batt_pct=%d,batt_v=%.2f,rssi=%d,csq=%d,gps_fix=%d,lte=%d,modem=%d,time=%d,fb_fail=%u,uptime=%lu",
+       "batt_pct=%d,batt_v=%.2f,batt_mah=%lu,batt_cap_mah=%lu,batt_pin_mv=%d,batt_adc=%d,batt_ok=%d,rssi=%d,csq=%d,gps_fix=%d,lte=%d,modem=%d,time=%d,fb_fail=%u,uptime=%lu,cam_up=%d,cam_age=%lu,ctrl_up=%d,ctrl_age=%lu,cmd_stage=%u,cmd_pending=%d,conn_state=%u,lte_reconn_ms=%lu",
              batteryGetPercentage(), batteryGetVoltage(),
+         (unsigned long)batteryGetRemainingMah(),
+         (unsigned long)batteryGetCapacityMah(),
+             batteryGetPinMilliVolts(),
+             batteryGetAdcRaw(),
+             batterySensorLooksValid() ? 1 : 0,
              cachedSignalRssi, cachedSignalCsq,
              gpsFix ? 1 : 0,
              lteConnected ? 1 : 0,
              modemOK ? 1 : 0,
              timeSynced ? 1 : 0,
              (unsigned int)firebaseFailures,
-             (unsigned long)millis());
+             (unsigned long)nowMs,
+             camUp ? 1 : 0,
+         (unsigned long)camAgeMs,
+         ctrlUp ? 1 : 0,
+       (unsigned long)ctrlAgeMs,
+       (unsigned int)cachedStatusStage,
+       (cachedStatusStage == CMD_STAGE_PENDING) ? 1 : 0,
+       (unsigned int)connectivityState,
+       lastLteReconnectLatencyMs);
 
     String resp =
         "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n"
@@ -3438,6 +4092,7 @@ void handleCameraClient() {
   Serial.println("[AP] -> POST /upload");
   camClientIP = clientAddr;
   camClientKnown = true;
+  camLastSeenAt = millis();
   Serial.printf("[AP] CAM IP: %s | Image: %u bytes\n",
                 camClientIP.toString().c_str(), contentLength);
 
@@ -3792,14 +4447,24 @@ void setup() {
   dpBegin();
 
   // Restore persisted delivery context (survives brown-out / reboot)
-  if (dpLoadOtp(cachedOtp, sizeof(cachedOtp))) {
-    otpCacheValid = true;
-    Serial.printf("[DP] Restored OTP from NVS: %s\n", cachedOtp);
+  char restoredOtp[8] = "";
+  char restoredDeliveryId[64] = "";
+  if (dpLoadDeliveryContext(restoredOtp, sizeof(restoredOtp),
+                            restoredDeliveryId, sizeof(restoredDeliveryId))) {
+    if (restoredOtp[0] != '\0') {
+      strncpy(cachedOtp, restoredOtp, sizeof(cachedOtp) - 1);
+      cachedOtp[sizeof(cachedOtp) - 1] = '\0';
+      otpCacheValid = true;
+      Serial.printf("[DP] Restored OTP from NVS: %s\n", cachedOtp);
+    }
+    if (restoredDeliveryId[0] != '\0') {
+      strncpy(cachedDeliveryId, restoredDeliveryId, sizeof(cachedDeliveryId) - 1);
+      cachedDeliveryId[sizeof(cachedDeliveryId) - 1] = '\0';
+      deliveryIdCacheValid = true;
+      Serial.printf("[DP] Restored DeliveryID from NVS: %s\n", cachedDeliveryId);
+    }
   }
-  if (dpLoadDeliveryId(cachedDeliveryId, sizeof(cachedDeliveryId))) {
-    deliveryIdCacheValid = true;
-    Serial.printf("[DP] Restored DeliveryID from NVS: %s\n", cachedDeliveryId);
-  }
+  restorePersistedCommandState();
   if (dpLoadPersonalPinHash(cachedPersonalPinHashMcu,
                             sizeof(cachedPersonalPinHashMcu))) {
     Serial.println("[DP] Restored personal PIN hash from NVS");
@@ -3820,6 +4485,28 @@ void setup() {
     clearPersonalPinRuntimeCache(true);
   }
 
+  lastPersistedContextHash =
+      buildDeliveryContextHash(otpCacheValid ? cachedOtp : "",
+                               deliveryIdCacheValid ? cachedDeliveryId : "");
+  persistedContextHashReady = true;
+  lastPersistedPinContextHash =
+      buildPersonalPinContextHash(personalPinEnabled,
+                                  cachedPersonalPinHashMcu,
+                                  cachedPersonalPinSalt,
+                                  cachedPersonalPinRiderId);
+  persistedPinContextHashReady = true;
+  dpGetWriteMetrics(&lastDpMetricsSnapshot);
+
+  if (modemRecoveryTaskHandle == NULL) {
+    xTaskCreatePinnedToCore(modemRecoveryTask,
+                            "ModemRecovery",
+                            8192,
+                            NULL,
+                            1,
+                            &modemRecoveryTaskHandle,
+                            0);
+  }
+
   Serial.println("\n=== Ready (LTE Only - AT+HTTP) ===\n");
 
   printMemoryReport();
@@ -3830,40 +4517,15 @@ void loop() {
   esp_task_wdt_reset(); // Feed watchdog every loop iteration
   unsigned long now = millis();
   enforceTamperSuppressionTimeout(now);
+  maybeEvaluateConnectivityMatrix(now);
 
   // ── Modem/LTE retry with exponential backoff (keeps HTTP server alive) ──
-  static unsigned long modemRetryAt = 0;
-  static unsigned long modemRetryBackoffMs = 10000; // start at 10s
-  const unsigned long MODEM_RETRY_BACKOFF_MAX_MS = 120000; // cap at 120s
-
   if ((!modemOK || !lteConnected) && now >= modemRetryAt) {
-    Serial.println("[RETRY] Modem/LTE health check...");
-
-    if (!modemOK) {
-      Serial.println("[RETRY] Reinitializing modem...");
-      powerModem();
-      modemOK = initModem();
-    }
-
-    if (modemOK && !lteConnected) {
-      Serial.println("[RETRY] Reconnecting LTE...");
-      lteConnected = connectLTE();
-      if (lteConnected) {
-        // On first successful LTE after boot or outage, resync time.
-        syncNetworkTime();
-      }
-    }
-
-    if (!modemOK || !lteConnected) {
-      modemRetryBackoffMs *= 2;
-      if (modemRetryBackoffMs > MODEM_RETRY_BACKOFF_MAX_MS) {
-        modemRetryBackoffMs = MODEM_RETRY_BACKOFF_MAX_MS;
-      }
+    if (modemRecoveryState == MODEM_RECOVERY_IDLE) {
+      scheduleModemRecovery("loop_backoff");
     } else {
-      modemRetryBackoffMs = 10000;
+      modemRetryAt = now + modemRetryBackoffMs;
     }
-
-    modemRetryAt = now + modemRetryBackoffMs;
   }
 
     bool hasActiveDelivery = deliveryIdCacheValid && cachedDeliveryId[0] != '\0';
@@ -3906,7 +4568,7 @@ void loop() {
       if (!modem.isGprsConnected()) {
         Serial.println("LTE: Connection lost, reconnecting...");
         lteConnected = false;
-        connectLTE();
+        scheduleModemRecovery("gprs_lost");
       }
     }
     lastSig = now;
@@ -3948,10 +4610,75 @@ void loop() {
   // ── Battery monitor (10 s interval) ──
   if (now - lastBatteryRead >= BATTERY_READ_INTERVAL) {
     batteryUpdate();
+
+    // Debug: log raw ADC for first 5 reads so we can diagnose GPIO35 state
+    static int battDbgCount = 0;
+    if (battDbgCount < 5) {
+      Serial.printf("[BATT] DBG #%d: pin=%dmV raw=%d -> %.2fV  valid=%d\n",
+                    battDbgCount, batteryGetPinMilliVolts(), batteryGetAdcRaw(),
+                    batteryGetVoltage(), batterySensorLooksValid() ? 1 : 0);
+      battDbgCount++;
+    }
+
+    // Fallback: if GPIO35 ADC is floating (no onboard divider to VBUS),
+    // read the modem's own supply voltage via AT+CBC.
+    if (!batterySensorLooksValid() && modemOK) {
+      String cbcResp = sendATAndWait("+CBC", 2000);
+
+      // Always log the raw AT+CBC response for first 3 attempts
+      static int cbcDbgCount = 0;
+      if (cbcDbgCount < 3) {
+        Serial.printf("[BATT] AT+CBC raw response: [%s]\n", cbcResp.c_str());
+        cbcDbgCount++;
+      }
+
+      int cbcIdx = cbcResp.indexOf("+CBC:");
+      if (cbcIdx >= 0) {
+        String cbcData = cbcResp.substring(cbcIdx + 5);
+        cbcData.trim();
+        // A7670E formats: "+CBC: bcs,bcl,voltage_mv" or "+CBC: voltage_mv"
+        int c1 = cbcData.indexOf(',');
+        int c2 = (c1 > 0) ? cbcData.indexOf(',', c1 + 1) : -1;
+        int mvVal = 0;
+        if (c2 > 0) {
+          mvVal = cbcData.substring(c2 + 1).toInt(); // 3rd field
+        } else if (c1 > 0) {
+          mvVal = cbcData.substring(c1 + 1).toInt();  // 2nd field
+        } else {
+          mvVal = cbcData.toInt();                     // single field
+        }
+        if (mvVal > 1000 && mvVal < 6000) {
+          batterySetExternalVoltage((float)mvVal / 1000.0f);
+          static unsigned long lastCbcLog = 0;
+          if (now - lastCbcLog >= 60000) {
+            Serial.printf("[BATT] Modem AT+CBC: %dmV -> %.2fV (%d%%)\n",
+                          mvVal, batteryGetVoltage(), batteryGetPercentage());
+            lastCbcLog = now;
+          }
+        } else {
+          static bool cbcWarnOnce = false;
+          if (!cbcWarnOnce) {
+            Serial.printf("[BATT] AT+CBC parsed mV=%d from [%s] — unusable\n",
+                          mvVal, cbcData.c_str());
+            cbcWarnOnce = true;
+          }
+        }
+      } else {
+        static bool cbcMissOnce = false;
+        if (!cbcMissOnce) {
+          Serial.println("[BATT] AT+CBC: no +CBC: in response — modem may not support it");
+          cbcMissOnce = true;
+        }
+      }
+    }
+
     lastBatteryRead = now;
     if (batteryIsCritical()) {
-      Serial.printf("[BATT] CRITICAL: %.2fV (%d%%)\n",
-                    batteryGetVoltage(), batteryGetPercentage());
+      Serial.printf("[BATT] CRITICAL: %.2fV (%d%%, %lumAh left, pin=%dmV raw=%d ok=%d)\n",
+                    batteryGetVoltage(), batteryGetPercentage(),
+                    (unsigned long)batteryGetRemainingMah(),
+                    batteryGetPinMilliVolts(), batteryGetAdcRaw(),
+                    batterySensorLooksValid() ? 1 : 0);
     }
   }
 
@@ -4003,10 +4730,16 @@ void loop() {
     lastDeliveryContextRead = now;
   }
 
+  if (lteConnected) {
+    retryPendingCommandAck(now);
+  }
+
   if (lteConnected && now - lastPersonalPinFlushAt >= PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS) {
     flushQueuedPersonalPinAudits();
     lastPersonalPinFlushAt = now;
   }
+
+  maybePublishDurabilityMetrics(now);
 
   delay(100);
 }

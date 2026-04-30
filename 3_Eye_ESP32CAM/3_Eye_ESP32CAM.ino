@@ -20,6 +20,7 @@
 
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <SPIFFS.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <esp_arduino_version.h>
@@ -61,6 +62,8 @@ char WIFI_SSID[24] = "";
 char DEVICE_ID[24] = "OV3660_CAM_001";
 #define FILE_PREFIX "capture"
 #define MAX_UPLOAD_RETRIES 3
+#define UPLOAD_RETRY_BASE_MS 5000
+#define UPLOAD_RETRY_MAX_MS 60000
 
 // ===================== DETECTION CONFIG =====================
 #define DETECTION_COOLDOWN_MS 5000     // Min time between uploads
@@ -71,6 +74,9 @@ char DEVICE_ID[24] = "OV3660_CAM_001";
 #define WIFI_BOOT_CONNECT_TIMEOUT_MS 120000
 #define WIFI_RECONNECT_TIMEOUT_MS 20000
 #define WIFI_MAINTAIN_INTERVAL_MS 8000
+#define WIFI_RETRY_BASE_MS 2000
+#define WIFI_RETRY_MAX_MS 30000
+#define WIFI_RETRY_JITTER_MS 400
 
 // ===================== CAMERA PINS: AI THINKER =====================
 #define PWDN_GPIO_NUM 32
@@ -103,6 +109,10 @@ static unsigned long camRebootAtMs = 0;
 static bool pendingUpload = false;
 static bool uploadInProgress = false;
 static unsigned long uploadRetryAtMs = 0;
+static uint8_t pendingUploadRetryCount = 0;
+static bool payloadStoreReady = false;
+static char pendingObjectPath[128] = "";
+static const char *CAM_PENDING_FILE = "/pending.jpg";
 
 static char currentDeliveryId[64] = "UNKNOWN_DELIVERY";
 
@@ -112,6 +122,27 @@ static const char *CAM_NS = "camQueue";
 static const char *CAM_KEY_PENDING = "pending";
 static const char *CAM_KEY_DELIVERY = "delId";
 static const char *CAM_KEY_QUEUED_AT = "queuedAt";
+static const char *CAM_KEY_RETRY = "retry";
+static const char *CAM_KEY_OBJECT = "obj";
+
+// WiFi reconnect scheduler (non-blocking)
+static bool wifiConnectInProgress = false;
+static unsigned long wifiConnectStartedAt = 0;
+static unsigned long wifiNextAttemptAt = 0;
+static unsigned long wifiBackoffMs = WIFI_RETRY_BASE_MS;
+static unsigned long wifiReconnectStartAt = 0;
+static unsigned long lastWifiReconnectLatencyMs = 0;
+
+// Write telemetry (hourly)
+static unsigned long camNvsWritesThisWindow = 0;
+static unsigned long camSpiffsWritesThisWindow = 0;
+static unsigned long camMetricsWindowStartedAt = 0;
+static const unsigned long CAM_WRITE_METRICS_WINDOW_MS = 3600000UL;
+
+// Deferred face-status client intake to avoid blocking wait loops
+static WiFiClient pendingFaceClient;
+static bool pendingFaceClientActive = false;
+static unsigned long pendingFaceClientDeadlineAt = 0;
 
 // Initialize ESP-Face models
 HumanFaceDetectMSR01 *s1;
@@ -147,16 +178,151 @@ void netLog(const char *format, ...) {
   }
 } // ===================== HELPERS =====================
 
+bool uploadToSupabase(const uint8_t *data, size_t len,
+                      const String &objectPath);
+
+static uint32_t fnv1a32(const char *text) {
+  const char *src = text ? text : "";
+  uint32_t hash = 2166136261u;
+  while (*src) {
+    hash ^= (uint8_t)*src++;
+    hash *= 16777619u;
+  }
+  return hash;
+}
+
+static void bumpNvsWrites(unsigned long count) {
+  if (count == 0) return;
+  camNvsWritesThisWindow += count;
+}
+
+static void bumpSpiffsWrites(unsigned long count) {
+  if (count == 0) return;
+  camSpiffsWritesThisWindow += count;
+}
+
+static void maybePublishWriteMetrics(unsigned long now) {
+  if (camMetricsWindowStartedAt == 0) {
+    camMetricsWindowStartedAt = now;
+    return;
+  }
+
+  unsigned long elapsed = now - camMetricsWindowStartedAt;
+  if (elapsed < CAM_WRITE_METRICS_WINDOW_MS) {
+    return;
+  }
+
+  netLog("[METRICS] nvs_writes=%lu spiffs_writes=%lu window_s=%lu wifi_reconnect_last_ms=%lu\n",
+         camNvsWritesThisWindow,
+         camSpiffsWritesThisWindow,
+         elapsed / 1000UL,
+         lastWifiReconnectLatencyMs);
+
+  camNvsWritesThisWindow = 0;
+  camSpiffsWritesThisWindow = 0;
+  camMetricsWindowStartedAt = now;
+}
+
 static void persistUploadIntent(bool pending) {
   if (!camPrefsReady) return;
   camPrefs.putBool(CAM_KEY_PENDING, pending);
+  bumpNvsWrites(1);
   if (pending) {
     camPrefs.putString(CAM_KEY_DELIVERY, currentDeliveryId);
     camPrefs.putULong(CAM_KEY_QUEUED_AT, millis());
+    camPrefs.putUChar(CAM_KEY_RETRY, pendingUploadRetryCount);
+    camPrefs.putString(CAM_KEY_OBJECT, pendingObjectPath);
+    bumpNvsWrites(4);
   } else {
     camPrefs.remove(CAM_KEY_DELIVERY);
     camPrefs.remove(CAM_KEY_QUEUED_AT);
+    camPrefs.remove(CAM_KEY_RETRY);
+    camPrefs.remove(CAM_KEY_OBJECT);
+    bumpNvsWrites(4);
+    pendingUploadRetryCount = 0;
+    pendingObjectPath[0] = '\0';
   }
+}
+
+static void clearPendingPayloadStorage() {
+  if (!payloadStoreReady) {
+    pendingObjectPath[0] = '\0';
+    return;
+  }
+  if (SPIFFS.exists(CAM_PENDING_FILE)) {
+    if (SPIFFS.remove(CAM_PENDING_FILE)) {
+      bumpSpiffsWrites(1);
+    }
+  }
+  pendingObjectPath[0] = '\0';
+}
+
+static bool savePendingPayload(const uint8_t *data, size_t len,
+                               const String &objectPath) {
+  if (!payloadStoreReady || !data || len == 0 || len > 400000) {
+    return false;
+  }
+
+  File f = SPIFFS.open(CAM_PENDING_FILE, FILE_WRITE);
+  if (!f) {
+    netLog("[UPLOAD] Pending payload open fail\n");
+    return false;
+  }
+
+  size_t written = f.write(data, len);
+  f.close();
+  if (written != len) {
+    netLog("[UPLOAD] Pending payload write fail %u/%u\n",
+           (unsigned int)written, (unsigned int)len);
+    return false;
+  }
+
+  bumpSpiffsWrites(1);
+
+  strncpy(pendingObjectPath, objectPath.c_str(), sizeof(pendingObjectPath) - 1);
+  pendingObjectPath[sizeof(pendingObjectPath) - 1] = '\0';
+  return true;
+}
+
+static bool uploadPendingPayloadFromStorage() {
+  if (!payloadStoreReady || !SPIFFS.exists(CAM_PENDING_FILE) ||
+      pendingObjectPath[0] == '\0') {
+    return false;
+  }
+
+  File f = SPIFFS.open(CAM_PENDING_FILE, FILE_READ);
+  if (!f) {
+    return false;
+  }
+
+  size_t len = (size_t)f.size();
+  if (len == 0 || len > 400000) {
+    f.close();
+    return false;
+  }
+
+  uint8_t *buf = (uint8_t *)ps_malloc(len);
+  if (!buf) {
+    buf = (uint8_t *)malloc(len);
+  }
+  if (!buf) {
+    f.close();
+    return false;
+  }
+
+  size_t rd = f.read(buf, len);
+  f.close();
+  if (rd != len) {
+    free(buf);
+    return false;
+  }
+
+  bool ok = uploadToSupabase(buf, len, String(pendingObjectPath));
+  free(buf);
+  if (ok) {
+    clearPendingPayloadStorage();
+  }
+  return ok;
 }
 
 static void initUploadIntentStore() {
@@ -176,9 +342,33 @@ static void initUploadIntentStore() {
     currentDeliveryId[sizeof(currentDeliveryId) - 1] = '\0';
   }
 
+  pendingUploadRetryCount =
+      (uint8_t)camPrefs.getUChar(CAM_KEY_RETRY, 0);
+
+  String obj = camPrefs.getString(CAM_KEY_OBJECT, "");
+  if (obj.length() > 0 && obj.length() < sizeof(pendingObjectPath)) {
+    strncpy(pendingObjectPath, obj.c_str(), sizeof(pendingObjectPath) - 1);
+    pendingObjectPath[sizeof(pendingObjectPath) - 1] = '\0';
+  }
+
   pendingUpload = true;
-  uploadRetryAtMs = millis();
-  Serial.printf("[UPLOAD] Restored pending intent for %s\n", currentDeliveryId);
+  unsigned long backoff = 0;
+  if (pendingUploadRetryCount > 0) {
+    backoff = UPLOAD_RETRY_BASE_MS;
+    for (uint8_t i = 1; i < pendingUploadRetryCount; i++) {
+      if (backoff >= (UPLOAD_RETRY_MAX_MS / 2)) {
+        backoff = UPLOAD_RETRY_MAX_MS;
+        break;
+      }
+      backoff *= 2;
+    }
+    if (backoff > UPLOAD_RETRY_MAX_MS) {
+      backoff = UPLOAD_RETRY_MAX_MS;
+    }
+  }
+  uploadRetryAtMs = millis() + backoff;
+  Serial.printf("[UPLOAD] Restored pending intent for %s retry=%u\n",
+                currentDeliveryId, (unsigned int)pendingUploadRetryCount);
 }
 
 bool queueSingleUpload(const char *source) {
@@ -196,6 +386,8 @@ bool queueSingleUpload(const char *source) {
 
   pendingUpload = true;
   uploadRetryAtMs = now;
+  pendingUploadRetryCount = 0;
+  pendingObjectPath[0] = '\0';
   persistUploadIntent(true);
   netLog("[UPLOAD] Queued from %s\n", source);
   return true;
@@ -369,21 +561,72 @@ bool connectWiFi(unsigned long timeoutMs = WIFI_BOOT_CONNECT_TIMEOUT_MS) {
 }
 
 void maintainWiFiConnection() {
-  static unsigned long lastAttemptAt = 0;
   unsigned long now = millis();
 
   if (WiFi.status() == WL_CONNECTED) {
+    if (wifiReconnectStartAt != 0) {
+      lastWifiReconnectLatencyMs = now - wifiReconnectStartAt;
+      netLog("[WIFI] Recovered in %lums\n", lastWifiReconnectLatencyMs);
+      wifiReconnectStartAt = 0;
+    }
+    wifiConnectInProgress = false;
+    wifiBackoffMs = WIFI_RETRY_BASE_MS;
+    wifiNextAttemptAt = now + WIFI_RETRY_BASE_MS;
     return;
   }
 
-  if (now - lastAttemptAt < WIFI_MAINTAIN_INTERVAL_MS) {
+  if (wifiReconnectStartAt == 0) {
+    wifiReconnectStartAt = now;
+  }
+
+  if (wifiConnectInProgress) {
+    if ((now - wifiConnectStartedAt) < WIFI_RECONNECT_TIMEOUT_MS) {
+      return;
+    }
+
+    wl_status_t failedStatus = WiFi.status();
+    netLog("[WIFI] Attempt timeout (%s)\n", wifiStatusText(failedStatus));
+    WiFi.disconnect(false, false);
+    wifiConnectInProgress = false;
+
+    unsigned long jitter = (unsigned long)random(0, WIFI_RETRY_JITTER_MS + 1);
+    wifiNextAttemptAt = now + wifiBackoffMs + jitter;
+    if (wifiBackoffMs < WIFI_RETRY_MAX_MS) {
+      wifiBackoffMs *= 2;
+      if (wifiBackoffMs > WIFI_RETRY_MAX_MS) {
+        wifiBackoffMs = WIFI_RETRY_MAX_MS;
+      }
+    }
     return;
   }
 
-  lastAttemptAt = now;
-  Serial.printf("[WIFI] Link down (%s). Reconnecting...\n",
-                wifiStatusText(WiFi.status()));
-  connectWiFi(WIFI_RECONNECT_TIMEOUT_MS);
+  if (now < wifiNextAttemptAt) {
+    return;
+  }
+
+  if (WIFI_SSID[0] == '\0') {
+    scanForProxyAP();
+  }
+  if (WIFI_SSID[0] == '\0') {
+    wifiNextAttemptAt = now + wifiBackoffMs;
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  WiFi.disconnect(false, false);
+
+  IPAddress staticIP(192, 168, 4, 10);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.config(staticIP, gateway, subnet, gateway);
+
+  netLog("[WIFI] Non-blocking reconnect attempt to '%s'\n", WIFI_SSID);
+  WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
+  wifiConnectInProgress = true;
+  wifiConnectStartedAt = now;
 }
 
 void initTime() {
@@ -642,7 +885,7 @@ String makeObjectPath() {
 bool uploadToSupabase(const uint8_t *data, size_t len,
                       const String &objectPath) {
   if (WiFi.status() != WL_CONNECTED) {
-    connectWiFi(WIFI_RECONNECT_TIMEOUT_MS);
+    maintainWiFiConnection();
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println(F("Upload skipped: WiFi (proxy AP) disconnected."));
       return false;
@@ -660,6 +903,10 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
   http.addHeader("Content-Type", "image/jpeg");
   // Tell the proxy the Supabase storage path for this image
   http.addHeader("X-Object-Path", objectPath);
+  char idempotencyKey[48];
+  snprintf(idempotencyKey, sizeof(idempotencyKey), "%08lx-%u",
+           (unsigned long)fnv1a32(objectPath.c_str()), (unsigned int)len);
+  http.addHeader("X-Idempotency-Key", idempotencyKey);
 
   Serial.printf("Uploading via LTE proxy (%s)...\n", endpoint.c_str());
   int code = http.POST((uint8_t *)data, len);
@@ -722,20 +969,21 @@ bool captureHighResAndUpload() {
   // before the modem blasts the network.
   delay(1500);
 
-  String objectPath = makeObjectPath();
-  bool uploaded = false;
-  for (int attempt = 1; attempt <= MAX_UPLOAD_RETRIES; attempt++) {
-    Serial.printf("Upload attempt %d/%d\n", attempt, MAX_UPLOAD_RETRIES);
-    if (uploadToSupabase(photo->buf, photo->len, objectPath)) {
-      uploaded = true;
-      break;
+  String objectPath =
+      (pendingObjectPath[0] != '\0') ? String(pendingObjectPath)
+                                     : makeObjectPath();
+  if (payloadStoreReady) {
+    if (!savePendingPayload(photo->buf, photo->len, objectPath)) {
+      netLog("[UPLOAD] Warning: payload snapshot not persisted\n");
     }
-    delay(1000);
   }
+
+  bool uploaded = uploadToSupabase(photo->buf, photo->len, objectPath);
 
   esp_camera_fb_return(photo);
   if (uploaded) {
     lastUploadAt = millis();
+    clearPendingPayloadStorage();
   }
 
   // Switch back
@@ -752,6 +1000,12 @@ void handleSerialCommands() {
     if (command == 'c' || command == 'C') {
       Serial.println(F("Manual capture (bypass detection)."));
       if (!captureHighResAndUpload()) {
+        pendingUpload = true;
+        uploadRetryAtMs = millis() + UPLOAD_RETRY_BASE_MS;
+        if (pendingUploadRetryCount == 0) {
+          pendingUploadRetryCount = 1;
+        }
+        persistUploadIntent(true);
         Serial.println(F("Manual upload failed; intent kept for retry."));
       }
     } else if (command == 'h' || command == 'H' || command == '?') {
@@ -784,6 +1038,10 @@ void setup() {
   }
 
   connectWiFi(WIFI_BOOT_CONNECT_TIMEOUT_MS);
+  payloadStoreReady = SPIFFS.begin(true);
+  if (!payloadStoreReady) {
+    Serial.println(F("[UPLOAD] SPIFFS unavailable; payload replay disabled"));
+  }
   initUploadIntentStore();
   initTime();
 
@@ -827,6 +1085,8 @@ bool setCameraSleepMode(bool sleepMode) {
     pendingUpload = false;
     uploadInProgress = false;
     uploadRetryAtMs = 0;
+    pendingUploadRetryCount = 0;
+    clearPendingPayloadStorage();
     persistUploadIntent(false);
     cameraSleepMode = true;
     cameraInDetectMode = false;
@@ -848,21 +1108,35 @@ bool setCameraSleepMode(bool sleepMode) {
 // Runs face detection on demand. Responds IMMEDIATELY, then defers upload
 // to loop() to avoid deadlock (CAM uploads back to the same proxy).
 void handleFaceStatusClient() {
-  WiFiClient client = faceServer.available();
-  if (!client)
-    return;
-
-  Serial.println(F("[HTTP] Face-status request received"));
-
-  // Wait for data
-  unsigned long timeout = millis() + 5000;
-  while (!client.available() && millis() < timeout) {
-    delay(10);
+  if (!pendingFaceClientActive) {
+    WiFiClient incoming = faceServer.available();
+    if (!incoming) {
+      return;
+    }
+    pendingFaceClient = incoming;
+    pendingFaceClientActive = true;
+    pendingFaceClientDeadlineAt = millis() + 500;
+    Serial.println(F("[HTTP] Face-status request queued"));
   }
-  if (!client.available()) {
+
+  WiFiClient &client = pendingFaceClient;
+  if (!client.connected()) {
     client.stop();
+    pendingFaceClientActive = false;
     return;
   }
+
+  if (!client.available()) {
+    if (millis() < pendingFaceClientDeadlineAt) {
+      return;
+    }
+    client.stop();
+    pendingFaceClientActive = false;
+    return;
+  }
+
+  client.setTimeout(50);
+  Serial.println(F("[HTTP] Face-status request received"));
 
   String requestLine = client.readStringUntil('\n');
   requestLine.trim();
@@ -907,8 +1181,9 @@ void handleFaceStatusClient() {
              (int)result.length(), result.c_str());
     client.print(resp);
     client.flush();
-    delay(20);
+    yield();
     client.stop();
+    pendingFaceClientActive = false;
     return;
   }
 
@@ -925,8 +1200,9 @@ void handleFaceStatusClient() {
              (int)strlen(body), body);
     client.print(resp404);
     client.flush();
-    delay(50);
+    yield();
     client.stop();
+    pendingFaceClientActive = false;
     return;
   }
 
@@ -984,13 +1260,15 @@ void handleFaceStatusClient() {
            (int)fullResult.length(), fullResult.c_str());
   client.print(resp);
   client.flush();
-  delay(50);
+  yield();
   client.stop();
+  pendingFaceClientActive = false;
 }
 
 void loop() {
   handleSerialCommands();
   maintainWiFiConnection();
+  maybePublishWriteMetrics(millis());
   handleFaceStatusClient(); // On-demand face-check via WiFi (from proxy)
   handleUartFaceCommand();  // On-demand face-check via UART (from Tester)
 
@@ -1000,15 +1278,53 @@ void loop() {
   if (pendingUpload && !uploadInProgress && millis() >= uploadRetryAtMs) {
     uploadInProgress = true;
     netLog("[UPLOAD] Deferred capture + upload starting...\n");
-    bool uploadOk = captureHighResAndUpload();
+    bool uploadOk = false;
+
+    if (payloadStoreReady && pendingObjectPath[0] != '\0' &&
+        SPIFFS.exists(CAM_PENDING_FILE)) {
+      netLog("[UPLOAD] Replaying persisted payload...\n");
+      uploadOk = uploadPendingPayloadFromStorage();
+    }
+
+    if (!uploadOk) {
+      uploadOk = captureHighResAndUpload();
+    }
+
     if (uploadOk) {
       pendingUpload = false;
+      pendingUploadRetryCount = 0;
       persistUploadIntent(false);
       netLog("[UPLOAD] Done. One photo captured.\n");
     } else {
-      uploadRetryAtMs = millis() + DETECTION_COOLDOWN_MS;
-      persistUploadIntent(true);
-      netLog("[UPLOAD] Failed; will retry after cooldown.\n");
+      if (pendingUploadRetryCount < 255) {
+        pendingUploadRetryCount++;
+      }
+
+      if (pendingUploadRetryCount >= MAX_UPLOAD_RETRIES) {
+        netLog("[UPLOAD] Retry limit reached (%u). Dropping pending intent.\n",
+               (unsigned int)pendingUploadRetryCount);
+        pendingUpload = false;
+        clearPendingPayloadStorage();
+        persistUploadIntent(false);
+      } else {
+        unsigned long backoff = UPLOAD_RETRY_BASE_MS;
+        for (uint8_t i = 1; i < pendingUploadRetryCount; i++) {
+          if (backoff >= (UPLOAD_RETRY_MAX_MS / 2)) {
+            backoff = UPLOAD_RETRY_MAX_MS;
+            break;
+          }
+          backoff *= 2;
+        }
+        if (backoff > UPLOAD_RETRY_MAX_MS) {
+          backoff = UPLOAD_RETRY_MAX_MS;
+        }
+
+        uploadRetryAtMs = millis() + backoff;
+        persistUploadIntent(true);
+        netLog("[UPLOAD] Failed; retry #%u in %lums.\n",
+               (unsigned int)pendingUploadRetryCount,
+               (unsigned long)backoff);
+      }
     }
     uploadInProgress = false;
   }

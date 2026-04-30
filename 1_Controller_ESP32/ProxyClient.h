@@ -32,7 +32,15 @@ struct ControllerDiagData {
 	bool lteConnected;
 	bool modemOk;
 	bool timeSynced;
+	bool camUp;
+	bool controllerUp;
+	bool commandPending;
 	int firebaseFailures;
+	int commandStage;
+	int connectivityState;
+	unsigned long camAgeMs;
+	unsigned long controllerAgeMs;
+	unsigned long lteReconnectMs;
 	unsigned long proxyUptimeMs;
 };
 
@@ -67,7 +75,8 @@ bool reportEventToProxy(bool otpValid,
 						uint8_t faceAttempts = 0,
 						bool faceRetryExhausted = false,
 						bool fallbackRequired = false,
-						const char *failureReason = "");
+						const char *failureReason = "",
+						unsigned long unlockLatencyMs = 0);
 
 /**
  * Report a safety/health alert to proxy POST /event → Firebase.

@@ -90,4 +90,51 @@ void suppressTamper();
 /** Re-enable tamper detection (call when relocking / leaving unlock state). */
 void armTamper();
 
+// ==================== BOOT SELF-TEST (POST) ====================
+
+enum SelfTestResult {
+  SELFTEST_RUNNING,    // Still in progress, call tickSelfTest() again
+  SELFTEST_PASS,       // All pulses completed, reed stable
+  SELFTEST_WARN        // Completed but reed was unstable (lid loose / reed fault)
+};
+
+/**
+ * Reset the self-test state machine. Call before entering STATE_BOOT_SELFTEST.
+ * @param skipSolenoid  When true, only checks reed baseline — NO solenoid pulses.
+ *                      Use when rebooting mid-delivery to prevent momentary unlock.
+ */
+void initSelfTest(bool skipSolenoid = false);
+
+/**
+ * Non-blocking self-test tick. Call from loop() while in STATE_BOOT_SELFTEST.
+ * Pulses the solenoid SELFTEST_PULSE_COUNT times with SELFTEST_INTERVAL_MS gaps.
+ * Returns SELFTEST_RUNNING until complete, then SELFTEST_PASS or SELFTEST_WARN.
+ */
+SelfTestResult tickSelfTest(unsigned long now);
+
+/** Returns the current pulse number (1-based) during self-test for LCD display. */
+uint8_t getSelfTestPulseNumber();
+
+// ==================== UNJAM UTILITY (KEY 6) ====================
+
+enum UnjamResult {
+  UNJAM_OK,            // Pulse fired successfully
+  UNJAM_COOLDOWN,      // Too soon since last pulse, wait
+  UNJAM_LIMIT,         // Max pulses exceeded, must wait for reset
+  UNJAM_OVERHEATED     // Thermal model blocks actuation
+};
+
+/**
+ * Fire a single unjam pulse (UNJAM_PULSE_DURATION_MS).
+ * Enforces thermal, cooldown, and pulse-count limits.
+ * The solenoid is de-energised by maintainLockSafety() after the pulse duration.
+ */
+UnjamResult fireUnjamPulse(unsigned long now);
+
+/** Reset the unjam pulse counter (call after UNJAM_COUNTER_RESET_MS idle). */
+void resetUnjamCounter();
+
+/** Number of unjam pulses remaining before hitting UNJAM_MAX_PULSES. */
+uint8_t getUnjamPulsesRemaining();
+
 #endif // LOCK_SAFETY_H
