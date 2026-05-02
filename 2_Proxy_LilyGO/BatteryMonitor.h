@@ -1,19 +1,13 @@
 /**
- * BatteryMonitor.h — Battery voltage monitoring for VBUS-powered LilyGO
+ * BatteryMonitor.h — Dual-channel battery voltage monitoring
  *
  * Hardware (this project setup):
- *   - 7.4V 2S Li-ion pack (24000 mAh) → buck converter → ~4.9V
- *   - Buck output wired to VBUS + GND on LilyGO T-SIM A7670E
- *   - LilyGO onboard voltage divider (2× 100kΩ) on GPIO35
- *     reads the power rail: pin_mV ≈ VBUS / 2
+ *   Channel A (GPIO34): 7.5V 2S Li-ion pack via voltage sensor module
+ *   Channel B (GPIO35): 12V  3S Li-ion pack via voltage sensor module
  *
- * Note:
- *   Because a buck converter holds its output steady until the input
- *   drops below its minimum operating voltage, the VBUS reading is
- *   mostly flat (~4.9V) and then drops sharply near end-of-charge.
- *   We map the useful range (VBUS 3.3V–5.1V) to 0–100 % SOC.
- *   For precise pack-level monitoring, route a sense wire from BAT+
- *   (pre-buck) through an external divider into a free ADC pin.
+ * Both use standard "DC 0-25V Voltage Sensor Modules" (30kΩ/7.5kΩ divider,
+ * multiply-back ratio = 5.0).  The modules output 0–5V proportional to
+ * 0–25V input, but ESP32 ADC at 11 dB reads 0–3.3V so practical max ≈ 16.5V.
  */
 
 #ifndef BATTERY_MONITOR_H
@@ -21,59 +15,75 @@
 
 #include <Arduino.h>
 
-// ── ADC pin ──
-#define BATT_PIN              35
+// ── Channel identifiers ──
+enum BattChannel : uint8_t {
+  BATT_CH_A = 0,   // 7.5V pack on GPIO34
+  BATT_CH_B = 1,   // 12V pack on GPIO35
+  BATT_CH_COUNT = 2
+};
 
-// ── Voltage divider ──
-// LilyGO onboard: 100k / 100k = ratio 2.0
-#define BATT_DIVIDER_RATIO    2.00f
+// ── Pin assignments ──
+#define BATT_PIN_A            34
+#define BATT_PIN_B            35
 
-// ── VBUS voltage thresholds (post-buck) ──
-// Buck converter nominally outputs 4.9V.
-// As the 2S pack discharges below the converter's dropout the output sags.
-//   Full   = 5.10V  (buck running comfortably)
-//   Empty  = 3.30V  (ESP32 brownout imminent)
-#define BATT_MIN_VOLTAGE      3.30f
-#define BATT_MAX_VOLTAGE      5.10f
+// ── Voltage sensor module divider ratio ──
+// Module: 30kΩ (R1) + 7.5kΩ (R2) → ratio = (30+7.5)/7.5 = 5.0
+#define BATT_DIVIDER_RATIO    5.00f
 
-// ── Pack capacity (informational) ──
-#define BATT_CAPACITY_MAH     24000UL
+// ── Channel A: 7.5V 2S Li-ion thresholds ──
+#define BATT_A_MIN_VOLTAGE    6.00f    // 2S cutoff  (3.0V/cell)
+#define BATT_A_MAX_VOLTAGE    8.40f    // 2S full    (4.2V/cell)
+#define BATT_A_CAPACITY_MAH   24000UL
 
-// ── ADC settings ──
-#define BATT_SAMPLES          16       // More samples → smoother reading
+// ── Channel B: 12V 3S Li-ion thresholds ──
+#define BATT_B_MIN_VOLTAGE    9.00f    // 3S cutoff  (3.0V/cell)
+#define BATT_B_MAX_VOLTAGE    12.60f   // 3S full    (4.2V/cell)
+#define BATT_B_CAPACITY_MAH   24000UL  // Adjust if different pack
+
+// ── ADC settings (shared) ──
+#define BATT_SAMPLES          16
 #define BATT_ADC_REF          3.3f
 #define BATT_ADC_ATTEN        ADC_11db
 
-// ── Calibration knobs (tune with DMM) ──
+// ── Calibration knobs (tune per channel with DMM if needed) ──
 #define BATT_CAL_GAIN         1.000f
 #define BATT_CAL_OFFSET       0.00f
 
 // ── Validity & smoothing ──
-// A real VBUS reading through the 2:1 divider gives 1650–2450 mV on the pin.
-// A floating GPIO35 reads 50–300 mV of noise.  Set threshold to 1000 mV
-// so floating-pin noise is always rejected and the AT+CBC modem fallback fires.
-#define BATT_SENSOR_MIN_PIN_MV 1000
-#define BATT_EMA_ALPHA        0.15f    // Slower filter (less jitter)
+// With ratio 5.0, a valid 6V pack gives pin = 1200mV.
+// Anything below 400mV is floating noise.
+#define BATT_SENSOR_MIN_PIN_MV 400
+#define BATT_EMA_ALPHA        0.15f
 
-// ── Warning thresholds ──
+// ── Warning thresholds (percentage) ──
 #define BATT_LOW_PCT          20
 #define BATT_CRITICAL_PCT     10
 
 // ── Public API ──
 void     batteryBegin();
-float    batteryUpdate();              // Read + smooth, returns voltage
-float    batteryGetVoltage();
-int      batteryGetPercentage();
-unsigned long batteryGetCapacityMah();
-unsigned long batteryGetRemainingMah();
-int      batteryGetPinMilliVolts();
-int      batteryGetAdcRaw();
-bool     batterySensorLooksValid();
-bool     batteryIsLow();               // < 20 %
-bool     batteryIsCritical();          // < 10 %
+void     batteryUpdate();              // Read + smooth both channels
 
-// Fallback: feed voltage from an external source (e.g. modem AT+CBC)
-// when GPIO35 is floating / not connected to the power rail.
-void     batterySetExternalVoltage(float volts);
+// Per-channel getters
+float    batteryGetVoltage(BattChannel ch);
+int      batteryGetPercentage(BattChannel ch);
+unsigned long batteryGetCapacityMah(BattChannel ch);
+unsigned long batteryGetRemainingMah(BattChannel ch);
+int      batteryGetPinMilliVolts(BattChannel ch);
+int      batteryGetAdcRaw(BattChannel ch);
+bool     batterySensorLooksValid(BattChannel ch);
+bool     batteryIsLow(BattChannel ch);
+bool     batteryIsCritical(BattChannel ch);
+
+// Legacy single-channel wrappers (default = channel A / 7.5V)
+// Keeps existing call sites working without modification.
+inline float    batteryGetVoltage()          { return batteryGetVoltage(BATT_CH_A); }
+inline int      batteryGetPercentage()       { return batteryGetPercentage(BATT_CH_A); }
+inline unsigned long batteryGetCapacityMah() { return batteryGetCapacityMah(BATT_CH_A); }
+inline unsigned long batteryGetRemainingMah(){ return batteryGetRemainingMah(BATT_CH_A); }
+inline int      batteryGetPinMilliVolts()    { return batteryGetPinMilliVolts(BATT_CH_A); }
+inline int      batteryGetAdcRaw()           { return batteryGetAdcRaw(BATT_CH_A); }
+inline bool     batterySensorLooksValid()    { return batterySensorLooksValid(BATT_CH_A); }
+inline bool     batteryIsLow()               { return batteryIsLow(BATT_CH_A); }
+inline bool     batteryIsCritical()          { return batteryIsCritical(BATT_CH_A); }
 
 #endif // BATTERY_MONITOR_H

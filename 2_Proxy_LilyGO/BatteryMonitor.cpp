@@ -1,78 +1,68 @@
 /**
- * BatteryMonitor.cpp — Battery voltage monitoring implementation
+ * BatteryMonitor.cpp — Dual-channel battery voltage monitoring
  *
- * Reads the VBUS rail via the LilyGO onboard 100k/100k divider on GPIO35.
- * The buck converter outputs ~4.9V from a 7.4V 2S pack.
- * SOC is estimated from the VBUS voltage: the buck holds steady near 4.9V
- * while the pack is healthy, then sags as the pack nears cutoff.
+ * Channel A (GPIO34): 7.5V 2S Li-ion pack
+ * Channel B (GPIO35): 12V  3S Li-ion pack
+ * Both via standard "DC 0-25V Voltage Sensor Module" (ratio 5.0).
  */
 
 #include "BatteryMonitor.h"
 
-static float voltage = 0.0f;
-static bool  emaInitialized = false;
-static int   lastAdcRaw = 0;
-static int   lastPinMv  = 0;
-
-// ── SOC lookup curve for VBUS (post-buck) ──
-// The buck converter output is ~4.9V while the pack has charge.
-// As the 2S pack voltage drops toward the converter's minimum input
-// (typically ~6.0–6.5V for a 4.9V out buck), the output begins to sag.
-// This curve maps the observable VBUS range to approximate SOC.
-struct SocPoint {
-  float v;
-  int   pct;
+// ── Per-channel state ──
+struct BattState {
+  uint8_t pin;
+  float   minV;
+  float   maxV;
+  unsigned long capMah;
+  float   voltage;
+  int     lastAdcRaw;
+  int     lastPinMv;
+  bool    emaInit;
 };
 
-static const SocPoint kSocCurve[] = {
-  {5.10f, 100},   // Buck comfortably regulating
-  {5.00f,  95},
-  {4.90f,  85},   // Nominal VBUS
-  {4.80f,  70},   // Slight sag — pack getting low
-  {4.70f,  55},
-  {4.50f,  40},   // Noticeable sag
-  {4.30f,  25},
-  {4.00f,  15},   // Buck struggling
-  {3.70f,   5},
-  {3.30f,   0},   // ESP32 brownout territory
+static BattState ch[BATT_CH_COUNT];
+
+// ── SOC lookup point ──
+struct SocPoint { float v; int pct; };
+
+// 2S Li-ion OCV curve (channel A — 7.5V pack)
+static const SocPoint kSoc2S[] = {
+  {8.40f, 100},
+  {8.20f,  90},
+  {7.95f,  80},
+  {7.75f,  70},
+  {7.55f,  60},
+  {7.35f,  50},
+  {7.15f,  40},
+  {6.95f,  30},
+  {6.75f,  20},
+  {6.45f,  10},
+  {6.00f,   0},
 };
 
-static float readBatteryVoltageAveraged() {
-  uint32_t sumRaw = 0;
-  uint32_t sumMv  = 0;
+// 3S Li-ion OCV curve (channel B — 12V pack)
+static const SocPoint kSoc3S[] = {
+  {12.60f, 100},
+  {12.30f,  90},
+  {11.93f,  80},
+  {11.63f,  70},
+  {11.33f,  60},
+  {11.03f,  50},
+  {10.73f,  40},
+  {10.43f,  30},
+  {10.13f,  20},
+  { 9.68f,  10},
+  { 9.00f,   0},
+};
 
-  for (int i = 0; i < BATT_SAMPLES; i++) {
-    int raw = analogRead(BATT_PIN);
-    int mv  = analogReadMilliVolts(BATT_PIN);
-    if (raw < 0) raw = 0;
-    if (mv  < 0) mv  = 0;
-    sumRaw += (uint32_t)raw;
-    sumMv  += (uint32_t)mv;
-  }
-
-  lastAdcRaw = (int)(sumRaw / (uint32_t)BATT_SAMPLES);
-  lastPinMv  = (int)(sumMv  / (uint32_t)BATT_SAMPLES);
-
-  float pinV = (float)lastPinMv / 1000.0f;
-
-  // Fallback for cores where analogReadMilliVolts may return 0 unexpectedly.
-  if (lastPinMv <= 0) {
-    pinV     = ((float)lastAdcRaw / 4095.0f) * BATT_ADC_REF;
-    lastPinMv = (int)(pinV * 1000.0f + 0.5f);
-  }
-
-  float vbus = (pinV * BATT_DIVIDER_RATIO * BATT_CAL_GAIN) + BATT_CAL_OFFSET;
-  return vbus;
-}
-
-static int socFromVoltage(float v) {
-  const int n = (int)(sizeof(kSocCurve) / sizeof(kSocCurve[0]));
-  if (v >= kSocCurve[0].v)     return 100;
-  if (v <= kSocCurve[n - 1].v) return 0;
+// ── Generic SOC interpolation ──
+static int socFromCurve(float v, const SocPoint *curve, int n) {
+  if (v >= curve[0].v)     return 100;
+  if (v <= curve[n - 1].v) return 0;
 
   for (int i = 0; i < (n - 1); i++) {
-    const SocPoint &hi = kSocCurve[i];
-    const SocPoint &lo = kSocCurve[i + 1];
+    const SocPoint &hi = curve[i];
+    const SocPoint &lo = curve[i + 1];
     if (v <= hi.v && v >= lo.v) {
       float span = hi.v - lo.v;
       if (span <= 0.0f) return lo.pct;
@@ -83,83 +73,156 @@ static int socFromVoltage(float v) {
       return (int)(pct + 0.5f);
     }
   }
-
   return 0;
 }
 
-void batteryBegin() {
-  pinMode(BATT_PIN, INPUT);
-  analogReadResolution(12);
-  analogSetPinAttenuation(BATT_PIN, BATT_ADC_ATTEN);
+static int socForChannel(BattChannel idx) {
+  float v = ch[idx].voltage;
+  if (v < ch[idx].minV) v = ch[idx].minV;
+  if (v > ch[idx].maxV) v = ch[idx].maxV;
 
-  // Take a burst of readings to prime the EMA filter.
-  float initial = readBatteryVoltageAveraged();
-  voltage        = initial;
-  emaInitialized = true;
-
-  Serial.printf("[BATT] Init: VBUS=%.2fV  pin=%dmV  raw=%d  valid=%d\n",
-                initial, lastPinMv, lastAdcRaw,
-                (lastPinMv >= BATT_SENSOR_MIN_PIN_MV) ? 1 : 0);
-}
-
-float batteryUpdate() {
-  // HARWARE BYPASS: The user only has VBUS and GND connected from a buck converter.
-  // There is no sense wire. We hardcode simulate a healthy battery so the system doesn't shut down.
-  voltage = 8.4f;      // Faked max 2S voltage
-  lastPinMv = 3000;    // Faked valid pin voltage
-  lastAdcRaw = 4095;   // Faked ADC reading
-  return voltage;
-}
-
-float batteryGetVoltage()    { return voltage; }
-
-int batteryGetPercentage() {
-  return 100; // Always 100% because we cannot measure the real pack through the buck converter
-}
-
-unsigned long batteryGetCapacityMah() {
-  return BATT_CAPACITY_MAH;
-}
-
-unsigned long batteryGetRemainingMah() {
-  return BATT_CAPACITY_MAH; // Always full
-}
-
-int batteryGetPinMilliVolts() {
-  return lastPinMv;
-}
-
-int batteryGetAdcRaw() {
-  return lastAdcRaw;
-}
-
-bool batterySensorLooksValid() {
-  return true; // Always valid
-}
-
-bool batteryIsLow() {
-  return false; // Never low
-}
-
-bool batteryIsCritical() {
-  return false; // Never critical
-}
-
-void batterySetExternalVoltage(float volts) {
-  if (volts < 0.1f) return;  // Reject garbage
-
-  // Apply EMA smoothing, same as the ADC path.
-  if (!emaInitialized) {
-    voltage        = volts;
-    emaInitialized = true;
+  if (idx == BATT_CH_A) {
+    return socFromCurve(v, kSoc2S, (int)(sizeof(kSoc2S) / sizeof(kSoc2S[0])));
   } else {
-    voltage = (BATT_EMA_ALPHA * volts) + ((1.0f - BATT_EMA_ALPHA) * voltage);
+    return socFromCurve(v, kSoc3S, (int)(sizeof(kSoc3S) / sizeof(kSoc3S[0])));
+  }
+}
+
+// ── Read one channel (averaged) ──
+static float readChannelAveraged(BattChannel idx) {
+  uint32_t sumRaw = 0;
+  uint32_t sumMv  = 0;
+
+  for (int i = 0; i < BATT_SAMPLES; i++) {
+    int raw = analogRead(ch[idx].pin);
+    int mv  = analogReadMilliVolts(ch[idx].pin);
+    if (raw < 0) raw = 0;
+    if (mv  < 0) mv  = 0;
+    sumRaw += (uint32_t)raw;
+    sumMv  += (uint32_t)mv;
   }
 
-  // Synthesise a plausible pin millivolt value so batterySensorLooksValid()
-  // returns true and the rest of the API (percentage, low, critical) works.
-  lastPinMv = (int)(volts * 1000.0f / BATT_DIVIDER_RATIO + 0.5f);
-  if (lastPinMv < BATT_SENSOR_MIN_PIN_MV) {
-    lastPinMv = BATT_SENSOR_MIN_PIN_MV;  // Force valid
+  ch[idx].lastAdcRaw = (int)(sumRaw / (uint32_t)BATT_SAMPLES);
+  ch[idx].lastPinMv  = (int)(sumMv  / (uint32_t)BATT_SAMPLES);
+
+  float pinV = (float)ch[idx].lastPinMv / 1000.0f;
+
+  // Fallback for cores where analogReadMilliVolts returns 0.
+  if (ch[idx].lastPinMv <= 0) {
+    pinV = ((float)ch[idx].lastAdcRaw / 4095.0f) * BATT_ADC_REF;
+    ch[idx].lastPinMv = (int)(pinV * 1000.0f + 0.5f);
   }
+
+  float batV = (pinV * BATT_DIVIDER_RATIO * BATT_CAL_GAIN) + BATT_CAL_OFFSET;
+  return batV;
+}
+
+// ── Public API ──
+
+void batteryBegin() {
+  // Channel A — 7.5V on GPIO34
+  ch[BATT_CH_A].pin     = BATT_PIN_A;
+  ch[BATT_CH_A].minV    = BATT_A_MIN_VOLTAGE;
+  ch[BATT_CH_A].maxV    = BATT_A_MAX_VOLTAGE;
+  ch[BATT_CH_A].capMah  = BATT_A_CAPACITY_MAH;
+  ch[BATT_CH_A].voltage = 0.0f;
+  ch[BATT_CH_A].lastAdcRaw = 0;
+  ch[BATT_CH_A].lastPinMv  = 0;
+  ch[BATT_CH_A].emaInit    = false;
+
+  // Channel B — 12V on GPIO35
+  ch[BATT_CH_B].pin     = BATT_PIN_B;
+  ch[BATT_CH_B].minV    = BATT_B_MIN_VOLTAGE;
+  ch[BATT_CH_B].maxV    = BATT_B_MAX_VOLTAGE;
+  ch[BATT_CH_B].capMah  = BATT_B_CAPACITY_MAH;
+  ch[BATT_CH_B].voltage = 0.0f;
+  ch[BATT_CH_B].lastAdcRaw = 0;
+  ch[BATT_CH_B].lastPinMv  = 0;
+  ch[BATT_CH_B].emaInit    = false;
+
+  // Configure both ADC pins
+  for (int i = 0; i < BATT_CH_COUNT; i++) {
+    pinMode(ch[i].pin, INPUT);
+    analogSetPinAttenuation(ch[i].pin, BATT_ADC_ATTEN);
+  }
+  analogReadResolution(12);
+
+  // Prime readings
+  for (int i = 0; i < BATT_CH_COUNT; i++) {
+    float v = readChannelAveraged((BattChannel)i);
+    ch[i].voltage = v;
+    ch[i].emaInit = true;
+  }
+
+  Serial.printf("[BATT] Init CH-A (7.5V): %.2fV pin=%dmV raw=%d valid=%d\n",
+                ch[0].voltage, ch[0].lastPinMv, ch[0].lastAdcRaw,
+                (ch[0].lastPinMv >= BATT_SENSOR_MIN_PIN_MV) ? 1 : 0);
+  Serial.printf("[BATT] Init CH-B (12V):  %.2fV pin=%dmV raw=%d valid=%d\n",
+                ch[1].voltage, ch[1].lastPinMv, ch[1].lastAdcRaw,
+                (ch[1].lastPinMv >= BATT_SENSOR_MIN_PIN_MV) ? 1 : 0);
+}
+
+void batteryUpdate() {
+  for (int i = 0; i < BATT_CH_COUNT; i++) {
+    float v = readChannelAveraged((BattChannel)i);
+
+    // Skip floating / disconnected sensor
+    if (ch[i].lastPinMv < BATT_SENSOR_MIN_PIN_MV) continue;
+
+    if (!ch[i].emaInit) {
+      ch[i].voltage = v;
+      ch[i].emaInit = true;
+    } else {
+      ch[i].voltage = (BATT_EMA_ALPHA * v) + ((1.0f - BATT_EMA_ALPHA) * ch[i].voltage);
+    }
+
+    // Upper hard guard
+    float hardMax = ch[i].maxV * 1.5f;
+    if (ch[i].voltage > hardMax) ch[i].voltage = hardMax;
+  }
+}
+
+float batteryGetVoltage(BattChannel idx) {
+  if (idx >= BATT_CH_COUNT) return 0.0f;
+  return ch[idx].voltage;
+}
+
+int batteryGetPercentage(BattChannel idx) {
+  if (idx >= BATT_CH_COUNT) return 0;
+  if (!batterySensorLooksValid(idx)) return 0;
+  return socForChannel(idx);
+}
+
+unsigned long batteryGetCapacityMah(BattChannel idx) {
+  if (idx >= BATT_CH_COUNT) return 0;
+  return ch[idx].capMah;
+}
+
+unsigned long batteryGetRemainingMah(BattChannel idx) {
+  int pct = batteryGetPercentage(idx);
+  unsigned long cap = batteryGetCapacityMah(idx);
+  return (unsigned long)((cap * (unsigned long)pct + 50UL) / 100UL);
+}
+
+int batteryGetPinMilliVolts(BattChannel idx) {
+  if (idx >= BATT_CH_COUNT) return 0;
+  return ch[idx].lastPinMv;
+}
+
+int batteryGetAdcRaw(BattChannel idx) {
+  if (idx >= BATT_CH_COUNT) return 0;
+  return ch[idx].lastAdcRaw;
+}
+
+bool batterySensorLooksValid(BattChannel idx) {
+  if (idx >= BATT_CH_COUNT) return false;
+  return ch[idx].lastPinMv >= BATT_SENSOR_MIN_PIN_MV;
+}
+
+bool batteryIsLow(BattChannel idx) {
+  return batterySensorLooksValid(idx) && (batteryGetPercentage(idx) < BATT_LOW_PCT);
+}
+
+bool batteryIsCritical(BattChannel idx) {
+  return batterySensorLooksValid(idx) && (batteryGetPercentage(idx) < BATT_CRITICAL_PCT);
 }

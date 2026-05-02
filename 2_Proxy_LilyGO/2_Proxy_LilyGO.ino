@@ -1647,7 +1647,7 @@ void sendToFirebase() {
   // so the web dashboard always gets an accurate UTC ms timestamp,
   // regardless of whether the ESP32's NTP sync succeeded.
   // uptime_ms = millis() â€” device time since boot, survives web page refresh.
-  char hardwareJson[896];
+  char hardwareJson[1152];
   snprintf(hardwareJson, sizeof(hardwareJson),
            "{\"status\":\"%s\","
            "\"connection\":\"LTE\","
@@ -1669,19 +1669,30 @@ void sendToFirebase() {
            "\"batt_adc\":%d,"
            "\"batt_sensor_ok\":%s,"
            "\"batt_low\":%s,"
+           "\"batt_b_v\":%.2f,"
+           "\"batt_b_pct\":%d,"
+           "\"batt_b_mah\":%lu,"
+           "\"batt_b_cap_mah\":%lu,"
+           "\"batt_b_sensor_ok\":%s,"
+           "\"batt_b_low\":%s,"
            "\"geo_state\":\"%s\","
            "\"geo_dist_m\":%.1f,"
            "\"theft_state\":\"%s\"}",
            boxStatus, rssi, csq, opBuf, gpsFix ? "true" : "false", dataBytesOut,
            (unsigned long)millis(), now_epoch, tsBuf,
            timeSynced ? "true" : "false",
-           batteryGetVoltage(), batteryGetPercentage(),
-           (unsigned long)batteryGetRemainingMah(),
-           (unsigned long)batteryGetCapacityMah(),
-           batteryGetPinMilliVolts(),
-           batteryGetAdcRaw(),
-           batterySensorLooksValid() ? "true" : "false",
-           batteryIsLow() ? "true" : "false",
+           batteryGetVoltage(BATT_CH_A), batteryGetPercentage(BATT_CH_A),
+           (unsigned long)batteryGetRemainingMah(BATT_CH_A),
+           (unsigned long)batteryGetCapacityMah(BATT_CH_A),
+           batteryGetPinMilliVolts(BATT_CH_A),
+           batteryGetAdcRaw(BATT_CH_A),
+           batterySensorLooksValid(BATT_CH_A) ? "true" : "false",
+           batteryIsLow(BATT_CH_A) ? "true" : "false",
+           batteryGetVoltage(BATT_CH_B), batteryGetPercentage(BATT_CH_B),
+           (unsigned long)batteryGetRemainingMah(BATT_CH_B),
+           (unsigned long)batteryGetCapacityMah(BATT_CH_B),
+           batterySensorLooksValid(BATT_CH_B) ? "true" : "false",
+           batteryIsLow(BATT_CH_B) ? "true" : "false",
            geoProxy.stateStr(geoProxy.snap.stableState),
            geoProxy.snap.distanceM,
            theftGuardStateStr());
@@ -4038,15 +4049,18 @@ void handleCameraClient() {
     bool ctrlUp = controllerLastSeenAt > 0 &&
             (ctrlAgeMs <= CONTROLLER_LIVENESS_STALE_MS);
 
-     char body[512];
+     char body[640];
     snprintf(body, sizeof(body),
-       "batt_pct=%d,batt_v=%.2f,batt_mah=%lu,batt_cap_mah=%lu,batt_pin_mv=%d,batt_adc=%d,batt_ok=%d,rssi=%d,csq=%d,gps_fix=%d,lte=%d,modem=%d,time=%d,fb_fail=%u,uptime=%lu,cam_up=%d,cam_age=%lu,ctrl_up=%d,ctrl_age=%lu,cmd_stage=%u,cmd_pending=%d,conn_state=%u,lte_reconn_ms=%lu",
-             batteryGetPercentage(), batteryGetVoltage(),
-         (unsigned long)batteryGetRemainingMah(),
-         (unsigned long)batteryGetCapacityMah(),
-             batteryGetPinMilliVolts(),
-             batteryGetAdcRaw(),
-             batterySensorLooksValid() ? 1 : 0,
+       "batt_pct=%d,batt_v=%.2f,batt_mah=%lu,batt_cap_mah=%lu,batt_pin_mv=%d,batt_adc=%d,batt_ok=%d,batt_b_pct=%d,batt_b_v=%.2f,batt_b_mah=%lu,batt_b_ok=%d,rssi=%d,csq=%d,gps_fix=%d,lte=%d,modem=%d,time=%d,fb_fail=%u,uptime=%lu,cam_up=%d,cam_age=%lu,ctrl_up=%d,ctrl_age=%lu,cmd_stage=%u,cmd_pending=%d,conn_state=%u,lte_reconn_ms=%lu",
+             batteryGetPercentage(BATT_CH_A), batteryGetVoltage(BATT_CH_A),
+         (unsigned long)batteryGetRemainingMah(BATT_CH_A),
+         (unsigned long)batteryGetCapacityMah(BATT_CH_A),
+             batteryGetPinMilliVolts(BATT_CH_A),
+             batteryGetAdcRaw(BATT_CH_A),
+             batterySensorLooksValid(BATT_CH_A) ? 1 : 0,
+             batteryGetPercentage(BATT_CH_B), batteryGetVoltage(BATT_CH_B),
+         (unsigned long)batteryGetRemainingMah(BATT_CH_B),
+             batterySensorLooksValid(BATT_CH_B) ? 1 : 0,
              cachedSignalRssi, cachedSignalCsq,
              gpsFix ? 1 : 0,
              lteConnected ? 1 : 0,
@@ -4607,78 +4621,30 @@ void loop() {
     }
   }
 
-  // ── Battery monitor (10 s interval) ──
+  // ── Battery monitor (10 s interval) — dual channel ──
   if (now - lastBatteryRead >= BATTERY_READ_INTERVAL) {
     batteryUpdate();
-
-    // Debug: log raw ADC for first 5 reads so we can diagnose GPIO35 state
-    static int battDbgCount = 0;
-    if (battDbgCount < 5) {
-      Serial.printf("[BATT] DBG #%d: pin=%dmV raw=%d -> %.2fV  valid=%d\n",
-                    battDbgCount, batteryGetPinMilliVolts(), batteryGetAdcRaw(),
-                    batteryGetVoltage(), batterySensorLooksValid() ? 1 : 0);
-      battDbgCount++;
-    }
-
-    // Fallback: if GPIO35 ADC is floating (no onboard divider to VBUS),
-    // read the modem's own supply voltage via AT+CBC.
-    if (!batterySensorLooksValid() && modemOK) {
-      String cbcResp = sendATAndWait("+CBC", 2000);
-
-      // Always log the raw AT+CBC response for first 3 attempts
-      static int cbcDbgCount = 0;
-      if (cbcDbgCount < 3) {
-        Serial.printf("[BATT] AT+CBC raw response: [%s]\n", cbcResp.c_str());
-        cbcDbgCount++;
-      }
-
-      int cbcIdx = cbcResp.indexOf("+CBC:");
-      if (cbcIdx >= 0) {
-        String cbcData = cbcResp.substring(cbcIdx + 5);
-        cbcData.trim();
-        // A7670E formats: "+CBC: bcs,bcl,voltage_mv" or "+CBC: voltage_mv"
-        int c1 = cbcData.indexOf(',');
-        int c2 = (c1 > 0) ? cbcData.indexOf(',', c1 + 1) : -1;
-        int mvVal = 0;
-        if (c2 > 0) {
-          mvVal = cbcData.substring(c2 + 1).toInt(); // 3rd field
-        } else if (c1 > 0) {
-          mvVal = cbcData.substring(c1 + 1).toInt();  // 2nd field
-        } else {
-          mvVal = cbcData.toInt();                     // single field
-        }
-        if (mvVal > 1000 && mvVal < 6000) {
-          batterySetExternalVoltage((float)mvVal / 1000.0f);
-          static unsigned long lastCbcLog = 0;
-          if (now - lastCbcLog >= 60000) {
-            Serial.printf("[BATT] Modem AT+CBC: %dmV -> %.2fV (%d%%)\n",
-                          mvVal, batteryGetVoltage(), batteryGetPercentage());
-            lastCbcLog = now;
-          }
-        } else {
-          static bool cbcWarnOnce = false;
-          if (!cbcWarnOnce) {
-            Serial.printf("[BATT] AT+CBC parsed mV=%d from [%s] — unusable\n",
-                          mvVal, cbcData.c_str());
-            cbcWarnOnce = true;
-          }
-        }
-      } else {
-        static bool cbcMissOnce = false;
-        if (!cbcMissOnce) {
-          Serial.println("[BATT] AT+CBC: no +CBC: in response — modem may not support it");
-          cbcMissOnce = true;
-        }
-      }
-    }
-
     lastBatteryRead = now;
-    if (batteryIsCritical()) {
-      Serial.printf("[BATT] CRITICAL: %.2fV (%d%%, %lumAh left, pin=%dmV raw=%d ok=%d)\n",
-                    batteryGetVoltage(), batteryGetPercentage(),
-                    (unsigned long)batteryGetRemainingMah(),
-                    batteryGetPinMilliVolts(), batteryGetAdcRaw(),
-                    batterySensorLooksValid() ? 1 : 0);
+
+    // Log both channels periodically (every 60s)
+    static unsigned long lastBattLog = 0;
+    if (now - lastBattLog >= 60000) {
+      Serial.printf("[BATT] CH-A(7.5V): %.2fV %d%% pin=%dmV | CH-B(12V): %.2fV %d%% pin=%dmV\n",
+                    batteryGetVoltage(BATT_CH_A), batteryGetPercentage(BATT_CH_A),
+                    batteryGetPinMilliVolts(BATT_CH_A),
+                    batteryGetVoltage(BATT_CH_B), batteryGetPercentage(BATT_CH_B),
+                    batteryGetPinMilliVolts(BATT_CH_B));
+      lastBattLog = now;
+    }
+
+    // Critical warning for either channel
+    if (batteryIsCritical(BATT_CH_A)) {
+      Serial.printf("[BATT] CRITICAL CH-A: %.2fV (%d%%)\n",
+                    batteryGetVoltage(BATT_CH_A), batteryGetPercentage(BATT_CH_A));
+    }
+    if (batteryIsCritical(BATT_CH_B)) {
+      Serial.printf("[BATT] CRITICAL CH-B: %.2fV (%d%%)\n",
+                    batteryGetVoltage(BATT_CH_B), batteryGetPercentage(BATT_CH_B));
     }
   }
 

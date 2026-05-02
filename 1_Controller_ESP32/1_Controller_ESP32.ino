@@ -1188,7 +1188,11 @@ void handleStateMachine(unsigned long now) {
         char masked[17] = "";
         uint8_t i;
         for (i = 0; i < bootAuthLen && i < 15; i++) {
-          masked[i] = '*';
+          if (i == bootAuthLen - 1) {
+            masked[i] = bootAuthCode[i];
+          } else {
+            masked[i] = '*';
+          }
         }
         masked[i] = '\0';
         updateDisplay("Rider PIN:", masked);
@@ -1444,8 +1448,19 @@ void handleStateMachine(unsigned long now) {
           if (currentState == STATE_IDLE) currentState = STATE_ENTERING_PIN;
 
           if (!isDisplayFailed()) {
+            char masked[17] = "";
+            uint8_t i;
+            for (i = 0; i < inputLen && i < 15; i++) {
+              if (i == inputLen - 1) {
+                masked[i] = inputCode[i];
+              } else {
+                masked[i] = '*';
+              }
+            }
+            masked[i] = '\0';
+
             char display[17];
-            snprintf(display, sizeof(display), "PIN: %s", inputCode);
+            snprintf(display, sizeof(display), "PIN: %s", masked);
             if (lastStatusCommand == "RETURNING") {
               updateDisplay("Return PIN:", display);
             } else {
@@ -1533,7 +1548,11 @@ void handleStateMachine(unsigned long now) {
           char masked[17] = "";
           uint8_t i;
           for (i = 0; i < personalPinLen && i < 15; i++) {
-            masked[i] = '*';
+            if (i == personalPinLen - 1) {
+              masked[i] = personalPinCode[i];
+            } else {
+              masked[i] = '*';
+            }
           }
           masked[i] = '\0';
           updateDisplay("Personal PIN:", masked);
