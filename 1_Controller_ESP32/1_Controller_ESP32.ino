@@ -394,21 +394,25 @@ void initOfflineContextStore() {
     token = OFFLINE_RECOVERY_TOKEN_ATTEMPTS;
   }
 
-  if (otp.length() == 0 || delivery.length() == 0 || otp.length() > 6 ||
-      delivery.length() >= sizeof(activeDeliveryId)) {
+  if (delivery.length() == 0 || delivery.length() >= sizeof(activeDeliveryId) || otp.length() > 6) {
     clearOfflineContextSnapshot();
     return;
   }
 
-  strncpy(currentOtp, otp.c_str(), sizeof(currentOtp) - 1);
-  currentOtp[sizeof(currentOtp) - 1] = '\0';
   strncpy(activeDeliveryId, delivery.c_str(), sizeof(activeDeliveryId) - 1);
   activeDeliveryId[sizeof(activeDeliveryId) - 1] = '\0';
   hasActiveDelivery = true;
 
+  if (otp.length() > 0) {
+    strncpy(currentOtp, otp.c_str(), sizeof(currentOtp) - 1);
+    currentOtp[sizeof(currentOtp) - 1] = '\0';
+  } else {
+    currentOtp[0] = '\0';
+  }
+
   offlineContextFromBoot = true;
   offlineRecoveryTokenRemaining = token;
-  netLog("[OFFLINE] Restored OTP context for delivery %s (token=%u)\n",
+  netLog("[OFFLINE] Restored context for delivery %s (token=%u)\n",
          activeDeliveryId, (unsigned int)offlineRecoveryTokenRemaining);
 }
 
@@ -441,6 +445,17 @@ void noteOnlineContextSync(unsigned long now) {
   offlineContextFromBoot = false;
   offlineRecoveryTokenRemaining = OFFLINE_RECOVERY_TOKEN_ATTEMPTS;
   persistOfflineContextSnapshot();
+}
+
+void noteOnlineDeliveryOnly(unsigned long now) {
+  lastOnlineOtpSyncAt = now;
+  offlineContextFromBoot = false;
+  offlineRecoveryTokenRemaining = OFFLINE_RECOVERY_TOKEN_ATTEMPTS;
+  if (!offlineCtxStoreReady || !hasActiveDelivery) return;
+  offlineCtxPrefs.putBool(OFFLINE_KEY_ACTIVE, true);
+  offlineCtxPrefs.putString(OFFLINE_KEY_OTP, "");
+  offlineCtxPrefs.putString(OFFLINE_KEY_DELIVERY, activeDeliveryId);
+  offlineCtxPrefs.putUChar(OFFLINE_KEY_TOKEN, OFFLINE_RECOVERY_TOKEN_ATTEMPTS);
 }
 
 void consumeOfflineRecoveryToken(const char *reason) {
@@ -871,8 +886,12 @@ void loop() {
       fetchDeliveryContext();
       lastDeliveryContextFetch = now;
 
-      if (hasActiveDelivery && hasLoadedOtp()) {
-        noteOnlineContextSync(now);
+      if (hasActiveDelivery) {
+        if (hasLoadedOtp()) {
+          noteOnlineContextSync(now);
+        } else {
+          noteOnlineDeliveryOnly(now);
+        }
       } else {
         clearOfflineContextSnapshot();
       }
@@ -1224,8 +1243,12 @@ void handleStateMachine(unsigned long now) {
       fetchDeliveryContext();
       lastDeliveryContextFetch = now;
 
-      if (hasActiveDelivery && hasLoadedOtp()) {
-        noteOnlineContextSync(now);
+      if (hasActiveDelivery) {
+        if (hasLoadedOtp()) {
+          noteOnlineContextSync(now);
+        } else {
+          noteOnlineDeliveryOnly(now);
+        }
       } else {
         clearOfflineContextSnapshot();
       }
@@ -1243,7 +1266,7 @@ void handleStateMachine(unsigned long now) {
 
       // Route to boot auth, skip, or bypass based on context.
       if (offlineContextFromBoot && offlineRecoveryTokenRemaining > 0 &&
-          hasActiveDelivery && hasLoadedOtp()) {
+          hasActiveDelivery) {
         // Mid-delivery reboot — trust the session, skip auth.
         bootAuthDone = true;
         bootPhaseComplete = true;

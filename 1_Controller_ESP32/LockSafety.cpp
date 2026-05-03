@@ -246,29 +246,31 @@ uint8_t getSelfTestPulseNumber() {
 }
 
 SelfTestResult tickSelfTest(unsigned long now) {
-  // ── Reed-only mode: skip solenoid pulses entirely. ──
-  // Used during mid-delivery reboot to prevent momentary unlock windows.
-  if (stSkipSolenoid) {
-    if (stStage == 0) {
-      stBaselineReed = readReedRaw();
-      stStageStartAt = now;
-      stStage = 254; // Jump straight to final verify
-      Serial.println(F("[SELFTEST] Reed-only mode — no solenoid pulses"));
-      return SELFTEST_RUNNING;
-    }
-    // Fall through to stage 254 (final verify) below.
-  }
-
-  // Stage 0: Record baseline and start first pulse immediately.
+  // Stage 0: Record baseline. If mid-delivery (stSkipSolenoid), skip
+  // solenoid pulses entirely to prevent unauthorized unlocking.
+  // On a fresh boot (no delivery), run the full diagnostic pulse check.
   if (stStage == 0) {
     stBaselineReed = readReedRaw();
     stStageStartAt = now;
+
+    if (stSkipSolenoid) {
+      // ── Reed-only mode: active delivery in progress ──
+      stStage = 254; // Jump straight to final reed verify
+      Serial.println(F("[SELFTEST] Reed-only mode — solenoid pulses SKIPPED (active delivery)"));
+      return SELFTEST_RUNNING;
+    }
+
+    // ── Normal boot: run full solenoid diagnostic ──
     energise(now);
     stStage = 1;
     Serial.printf("[SELFTEST] Pulse %u/%u — energise\n",
                   stPulsesDone + 1, (unsigned int)SELFTEST_PULSE_COUNT);
     return SELFTEST_RUNNING;
   }
+
+
+  // From here on, only reachable during normal (non-skip) boot.
+
 
   // Odd stages (1, 3, 5): solenoid is ON — wait for pulse duration.
   if (stStage % 2 == 1) {

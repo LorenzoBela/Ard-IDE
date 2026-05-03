@@ -3833,36 +3833,28 @@ void handleCameraClient() {
       delPart = "NO_DELIVERY";
       Serial.printf("[AP] OTP suppressed — theft state: %s\n",
                     theftGuardStateStr());
-    } else if (destCoordsValid && gpsFix) {
-      // During return mode the geofence target is already swapped to pickup
-      // coords (see EC-32 target swap). Use isNearAnyTarget() so the OTP gate
-      // correctly evaluates against whichever target is active.
-      bool atTarget = returnActive
-                        ? geoProxy.isNearAnyTarget(gpsLat, gpsLon)
-                        : geoProxy.isNearDropoff(gpsLat, gpsLon);
-      insideGeo = atTarget;
-      distMeters = (int)geoProxy.snap.distanceM;
-
-      if (atTarget) {
-        // Inside geofence — serve OTP (return OTP during return mode).
-        if (returnActive) {
-          otpPart = returnOtpCacheValid ? String(cachedReturnOtp) : "NO_OTP";
-        } else {
-          otpPart = otpCacheValid ? String(cachedOtp) : "NO_OTP";
-        }
-        delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
-      } else {
-        // Outside geofence — suppress OTP, controller shows distance.
-        otpPart = "NO_OTP";
-        delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
-        Serial.printf("[AP] OTP suppressed — outside geofence (%dm)\n", distMeters);
-      }
     } else {
-      // Fail closed: no GPS fix or invalid coords — suppress OTP.
-      otpPart = "NO_OTP";
+      // ALWAYS serve the OTP to the ESP32 so it can cache it for offline drops.
+      // Security is maintained because the Web Portal hides the OTP from the 
+      // customer until arrival, and only the customer types it in.
+      if (returnActive) {
+        otpPart = returnOtpCacheValid ? String(cachedReturnOtp) : "NO_OTP";
+      } else {
+        otpPart = otpCacheValid ? String(cachedOtp) : "NO_OTP";
+      }
       delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
-      Serial.printf("[AP] OTP suppressed — geofence unavailable (gpsFix=%d destValid=%d)\n",
-                    gpsFix ? 1 : 0, destCoordsValid ? 1 : 0);
+
+      // Still calculate geofence status for the response fields (LCD distance display)
+      if (destCoordsValid && gpsFix) {
+        // During return mode the geofence target is already swapped to pickup
+        // coords (see EC-32 target swap). Use isNearAnyTarget() so the distance
+        // correctly evaluates against whichever target is active.
+        bool atTarget = returnActive
+                          ? geoProxy.isNearAnyTarget(gpsLat, gpsLon)
+                          : geoProxy.isNearDropoff(gpsLat, gpsLon);
+        insideGeo = atTarget;
+        distMeters = (int)geoProxy.snap.distanceM;
+      }
     }
 
     String body = otpPart + "," + delPart;
