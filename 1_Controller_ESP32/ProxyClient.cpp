@@ -24,11 +24,34 @@ char  currentOtp[8]          = "";
 char  activeDeliveryId[64]   = "";
 bool  hasActiveDelivery      = false;
 String lastStatusCommand     = "";
+int16_t geoDistMeters        = -1;
+bool    geoInsideFence       = false;
+bool    isReturning          = false;
 
 // ── WiFi backoff state ──
 static unsigned long wifiRetryAt    = 0;
 static unsigned long wifiBackoffMs  = WIFI_RETRY_BASE_MS;
 static unsigned long wifiRescanAt   = 0;
+
+// ── Fetch reliability controls ──
+static const uint16_t FETCH_HTTP_TIMEOUT_MS = 3000;
+
+static void hardResetDeliveryContext(const char *reason) {
+  if (!hasActiveDelivery && currentOtp[0] == '\0' && activeDeliveryId[0] == '\0' &&
+      lastStatusCommand.length() == 0) {
+    return;
+  }
+
+  currentOtp[0] = '\0';
+  activeDeliveryId[0] = '\0';
+  hasActiveDelivery = false;
+  lastStatusCommand = "";
+  geoDistMeters = -1;
+  geoInsideFence = false;
+  isReturning = false;
+  netLog("[FETCH] Hard reset delivery context (%s)\n",
+         reason ? reason : "unknown");
+}
 
 static String normalizeStatusToken(const String &rawToken) {
   String token = rawToken;
@@ -40,9 +63,7 @@ static String normalizeStatusToken(const String &rawToken) {
     token.trim();
   }
 
-  if (token == "UNLOCKING" || token == "LOCKED" || token == "REBOOT_ALL" ||
-      token == "GEO_PICKUP" || token == "GEO_TRANSIT_PICK" ||
-      token == "GEO_TRANSIT_DROP" || token == "RETURNING") {
+  if (token == "UNLOCKING" || token == "LOCKED" || token == "REBOOT_ALL") {
     return token;
   }
 
@@ -139,6 +160,9 @@ void startWiFiConnection() {
   wifiBackoffMs = WIFI_RETRY_BASE_MS;
 }
 
+// Forward declaration — defined below with persistent connection helpers.
+static void closePersistentConnection();
+
 void maintainWiFiConnection(unsigned long now) {
   if (WiFi.status() == WL_CONNECTED) {
     wifiBackoffMs = WIFI_RETRY_BASE_MS;
@@ -156,6 +180,7 @@ void maintainWiFiConnection(unsigned long now) {
   if (now < wifiRetryAt) return;
 
   netLog("[WIFI] Retry (backoff %lums)...\n", wifiBackoffMs);
+  closePersistentConnection(); // Kill stale TCP before WiFi reset
   WiFi.disconnect();
   if (WIFI_SSID[0] == '\0') {
     scanForProxy();
@@ -174,65 +199,217 @@ void maintainWiFiConnection(unsigned long now) {
   }
 }
 
-// ==================== FETCH DELIVERY CONTEXT ====================
+// ── Persistent connection for high-frequency /otp polling ──
+// Reusing the TCP socket across polls eliminates ~100-200ms of
+// TCP handshake overhead per request on the local SoftAP link.
+static WiFiClient persistentClient;
+static bool       persistentConnected = false;
+
+static void closePersistentConnection() {
+  if (persistentConnected) {
+    persistentClient.stop();
+    persistentConnected = false;
+  }
+}
+
+static bool ensurePersistentConnection() {
+  if (persistentConnected && persistentClient.connected()) {
+    return true;
+  }
+  // Tear down stale socket before reconnecting.
+  persistentClient.stop();
+  persistentConnected = false;
+
+  persistentClient.setTimeout(FETCH_HTTP_TIMEOUT_MS / 1000); // seconds
+  if (!persistentClient.connect(PROXY_HOST, PROXY_PORT)) {
+    netLog("[FETCH] TCP connect failed\n");
+    return false;
+  }
+  persistentConnected = true;
+  return true;
+}
+
+/** Read one complete HTTP response from the persistent socket.
+ *  Returns the HTTP status code (e.g. 200), or -1 on error.
+ *  Writes the response body into bodyOut. */
+static int readHttpResponse(String &bodyOut, unsigned long timeoutMs) {
+  unsigned long deadline = millis() + timeoutMs;
+  int statusCode = -1;
+  int contentLength = -1;
+  bool headersDone = false;
+  bodyOut = "";
+
+  // ── Read status line + headers ──
+  while (millis() < deadline) {
+    if (!persistentClient.connected()) return -1;
+    if (!persistentClient.available()) {
+      yield();
+      continue;
+    }
+    String line = persistentClient.readStringUntil('\n');
+    line.trim();
+
+    if (statusCode < 0) {
+      // Parse "HTTP/1.1 200 OK"
+      if (line.startsWith("HTTP/")) {
+        int spaceIdx = line.indexOf(' ');
+        if (spaceIdx > 0) {
+          statusCode = line.substring(spaceIdx + 1).toInt();
+        }
+      }
+      continue;
+    }
+
+    if (line.length() == 0) {
+      headersDone = true;
+      break;
+    }
+
+    // Parse Content-Length header
+    if (line.startsWith("Content-Length:") || line.startsWith("content-length:")) {
+      contentLength = line.substring(line.indexOf(':') + 1).toInt();
+    }
+  }
+
+  if (!headersDone || statusCode < 0) return -1;
+
+  // ── Read body ──
+  if (contentLength > 0) {
+    char buf[256];
+    int toRead = (contentLength < (int)sizeof(buf) - 1) ? contentLength : (int)sizeof(buf) - 1;
+    int rd = 0;
+    while (rd < toRead && millis() < deadline) {
+      if (persistentClient.available()) {
+        buf[rd++] = persistentClient.read();
+      } else {
+        yield();
+      }
+    }
+    buf[rd] = '\0';
+    bodyOut = String(buf);
+  } else if (contentLength == 0) {
+    bodyOut = "";
+  } else {
+    // No Content-Length header — read until timeout or connection close.
+    // This is a fallback; the proxy should always send Content-Length.
+    while (millis() < deadline && persistentClient.connected()) {
+      if (persistentClient.available()) {
+        bodyOut += (char)persistentClient.read();
+      } else {
+        // Brief idle gap — if we already have data, assume body is done.
+        if (bodyOut.length() > 0) break;
+        yield();
+      }
+    }
+  }
+
+  return statusCode;
+}
+
 void fetchDeliveryContext() {
   if (WiFi.status() != WL_CONNECTED) {
     netLog("[FETCH] Skip — WiFi not connected\n");
+    closePersistentConnection();
     return;
   }
 
-  char url[64];
-  snprintf(url, sizeof(url), "http://%s:%d/otp", PROXY_HOST, PROXY_PORT);
-  netLog("[FETCH] GET %s\n", url);
+  // Ensure persistent TCP socket is alive.
+  if (!ensurePersistentConnection()) {
+    hardResetDeliveryContext("tcp_connect_failed");
+    return;
+  }
 
-  auto doGet = [&](String &bodyOut) -> int {
-    WiFiClient client;
-    HTTPClient http;
-    http.setTimeout(2000);
-    http.setReuse(false); // Do not keep-alive; prevents stale connection issues
-    // You can optionally pass client: http.begin(client, url);
-    char url[64];
-    snprintf(url, sizeof(url), "http://%s:%d/otp", PROXY_HOST, PROXY_PORT);
-    http.begin(client, url);
-    int httpCode = http.GET();
-    if (httpCode > 0) {
-      bodyOut = http.getString();
-    }
-    http.end();
-    return httpCode;
-  };
+  // Send raw HTTP/1.1 GET with keep-alive.
+  persistentClient.printf(
+      "GET /otp HTTP/1.1\r\n"
+      "Host: %s:%d\r\n"
+      "Connection: keep-alive\r\n"
+      "\r\n",
+      PROXY_HOST, PROXY_PORT);
 
   String body = "";
-  int code = doGet(body);
+  int code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
+
   if (code < 0) {
-    // If it fails, maybe LilyGO is overloaded. Wait briefly before fallback or just return.
-    // By returning early and not retrying immediately, we keep loop() insanely fast.
-    netLog("[FETCH] GET failed (%d)\n", code);
-    return; // Don't block. Try again next time cleanly.
+    netLog("[FETCH] Read failed — reconnecting\n");
+    closePersistentConnection();
+    // One retry with fresh connection
+    if (!ensurePersistentConnection()) {
+      hardResetDeliveryContext("tcp_retry_failed");
+      return;
+    }
+    persistentClient.printf(
+        "GET /otp HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        PROXY_HOST, PROXY_PORT);
+    body = "";
+    code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
+    if (code < 0) {
+      netLog("[FETCH] Retry failed\n");
+      closePersistentConnection();
+      hardResetDeliveryContext("http_get_failed");
+      return;
+    }
   }
+
   netLog("[FETCH] HTTP %d\n", code);
+  if (code != 200) {
+    hardResetDeliveryContext("http_non_200");
+    return;
+  }
 
   bool wasActive = hasActiveDelivery;
   lastStatusCommand = "";
+  geoDistMeters = -1;
+  geoInsideFence = false;
+  isReturning = false;
 
   if (code == 200) {
     netLog("[FETCH] Body: '%s'\n", body.c_str());
 
-    // Format: "123456,deliv_abc123" OR "123456,deliv_abc123,UNLOCKING"
+    // New format: OTP,DELIVERY_ID,STATUS,DIST:N,GEO:0|1,RET:0|1
+    // Fields are comma-separated. STATUS may be empty. DIST/GEO/RET are
+    // key:value pairs appended after the first 3 positional fields.
     int firstComma  = body.indexOf(',');
-    int secondComma = body.indexOf(',', firstComma + 1);
+    int secondComma = (firstComma > 0) ? body.indexOf(',', firstComma + 1) : -1;
+    int thirdComma  = (secondComma > 0) ? body.indexOf(',', secondComma + 1) : -1;
 
     if (firstComma > 0) {
-      String otpPart = "";
-      String delPart = "";
+      String otpPart = body.substring(0, firstComma);
+      String delPart;
+      String statusPart = "";
 
       if (secondComma > 0) {
-        otpPart = body.substring(0, firstComma);
         delPart = body.substring(firstComma + 1, secondComma);
-        lastStatusCommand = normalizeStatusToken(body.substring(secondComma + 1));
+        if (thirdComma > 0) {
+          statusPart = body.substring(secondComma + 1, thirdComma);
+        } else {
+          statusPart = body.substring(secondComma + 1);
+        }
       } else {
-        otpPart = body.substring(0, firstComma);
         delPart = body.substring(firstComma + 1);
+      }
+
+      // Parse admin command from STATUS field
+      lastStatusCommand = normalizeStatusToken(statusPart);
+
+      // Parse structured fields (DIST:N, GEO:0|1, RET:0|1) from remaining body
+      int distIdx = body.indexOf("DIST:");
+      if (distIdx >= 0) {
+        int valStart = distIdx + 5;
+        int valEnd = body.indexOf(',', valStart);
+        if (valEnd < 0) valEnd = body.length();
+        geoDistMeters = (int16_t)body.substring(valStart, valEnd).toInt();
+      }
+      int geoIdx = body.indexOf("GEO:");
+      if (geoIdx >= 0) {
+        geoInsideFence = (body.charAt(geoIdx + 4) == '1');
+      }
+      int retIdx = body.indexOf("RET:");
+      if (retIdx >= 0) {
+        isReturning = (body.charAt(retIdx + 4) == '1');
       }
 
       bool validOtp = (otpPart != "NO_OTP" && otpPart != "null" &&
@@ -253,10 +430,10 @@ void fetchDeliveryContext() {
         activeDeliveryId[0] = '\0';
       }
 
-      hasActiveDelivery = validDel; // Active even if NO_OTP (e.g. at pickup / transit)
-      netLog("[FETCH] validOtp=%d validDel=%d hasActive=%d OTP='%s' ID='%s' Status='%s'\n",
-             validOtp, validDel, hasActiveDelivery, currentOtp,
-             activeDeliveryId, lastStatusCommand.c_str());
+      hasActiveDelivery = validDel;
+      netLog("[FETCH] otp=%d del=%d dist=%d geo=%d ret=%d cmd='%s'\n",
+             validOtp, validDel, geoDistMeters, geoInsideFence ? 1 : 0,
+             isReturning ? 1 : 0, lastStatusCommand.c_str());
     } else {
       // Legacy format (just OTP, no delivery_id)
       if (body != "NO_OTP" && body != "null" && body.length() > 0 &&
@@ -393,6 +570,49 @@ bool fetchDiagnostics(ControllerDiagData &out) {
   return true;
 }
 
+// ── Generic raw POST through persistent connection ──
+// Reuses the keep-alive socket for fire-and-forget POSTs during the
+// unlock flow, avoiding ~150ms TCP handshake per call.
+static int sendRawPost(const char *path, const char *json) {
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  if (!ensurePersistentConnection()) return -1;
+
+  int jsonLen = strlen(json);
+  persistentClient.printf(
+      "POST %s HTTP/1.1\r\n"
+      "Host: %s:%d\r\n"
+      "Connection: keep-alive\r\n"
+      "Content-Type: application/json\r\n"
+      "Content-Length: %d\r\n"
+      "\r\n"
+      "%s",
+      path, PROXY_HOST, PROXY_PORT, jsonLen, json);
+
+  String body;
+  int code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
+
+  if (code < 0) {
+    netLog("[POST] %s failed — reconnecting\n", path);
+    closePersistentConnection();
+    if (!ensurePersistentConnection()) return -1;
+    persistentClient.printf(
+        "POST %s HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Connection: keep-alive\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "\r\n"
+        "%s",
+        path, PROXY_HOST, PROXY_PORT, jsonLen, json);
+    code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
+    if (code < 0) {
+      closePersistentConnection();
+      return -1;
+    }
+  }
+  return code;
+}
+
 // ==================== REPORT EVENT ====================
 bool reportEventToProxy(bool otpValid,
                         bool faceDetected,
@@ -405,10 +625,6 @@ bool reportEventToProxy(bool otpValid,
                         unsigned long unlockLatencyMs) {
   if (WiFi.status() != WL_CONNECTED)
     return false;
-
-  HTTPClient http;
-  char url[64];
-  snprintf(url, sizeof(url), "http://%s:%d/event", PROXY_HOST, PROXY_PORT);
 
   const char *safeReason =
       (failureReason != NULL && failureReason[0] != '\0') ? failureReason : "";
@@ -427,13 +643,8 @@ bool reportEventToProxy(bool otpValid,
            fallbackRequired ? "true" : "false", safeReason,
            unlockLatencyMs);
 
-  http.setTimeout(5000);
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST((uint8_t *)json, strlen(json));
-
-  Serial.printf("[EVENT] POST %s → HTTP %d\n", json, code);
-  http.end();
+  int code = sendRawPost("/event", json);
+  Serial.printf("[EVENT] POST → HTTP %d\n", code);
 
   return (code == 200 || code == 201);
 }
@@ -443,23 +654,14 @@ bool reportAlertToProxy(const char *alertType, const char *details) {
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
-  HTTPClient http;
-  char url[64];
-  snprintf(url, sizeof(url), "http://%s:%d/event", PROXY_HOST, PROXY_PORT);
-
   char json[256];
   snprintf(json, sizeof(json),
            "{\"alert_type\":\"%s\",\"details\":\"%s\","
            "\"box_id\":\"%s\",\"delivery_id\":\"%s\"}",
            alertType, details, HARDWARE_ID, activeDeliveryId);
 
-  http.setTimeout(5000);
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST((uint8_t *)json, strlen(json));
-
+  int code = sendRawPost("/event", json);
   Serial.printf("[ALERT] %s → HTTP %d\n", alertType, code);
-  http.end();
 
   return (code == 200 || code == 201);
 }
@@ -469,23 +671,14 @@ bool reportTamperToProxy() {
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
-  HTTPClient http;
-  char url[64];
-  snprintf(url, sizeof(url), "http://%s:%d/event", PROXY_HOST, PROXY_PORT);
-
   char json[256];
   snprintf(json, sizeof(json),
            "{\"alert_type\":\"REED_TAMPER\",\"details\":\"lid_opened_no_unlock\","
            "\"box_id\":\"%s\",\"delivery_id\":\"%s\",\"tamper\":true}",
            HARDWARE_ID, activeDeliveryId);
 
-  http.setTimeout(5000);
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST((uint8_t *)json, strlen(json));
-
+  int code = sendRawPost("/event", json);
   Serial.printf("[TAMPER] Report → HTTP %d\n", code);
-  http.end();
 
   return (code == 200 || code == 201);
 }
@@ -495,10 +688,6 @@ bool reportCommandAckToProxy(const char *command, const char *status, const char
   if (WiFi.status() != WL_CONNECTED)
     return false;
 
-  HTTPClient http;
-  char url[72];
-  snprintf(url, sizeof(url), "http://%s:%d/command-ack", PROXY_HOST, PROXY_PORT);
-
   char json[320];
   snprintf(json, sizeof(json),
            "{\"command\":\"%s\",\"status\":\"%s\",\"details\":\"%s\","
@@ -506,13 +695,8 @@ bool reportCommandAckToProxy(const char *command, const char *status, const char
            command ? command : "", status ? status : "", details ? details : "",
            HARDWARE_ID, activeDeliveryId);
 
-  http.setTimeout(5000);
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST((uint8_t *)json, strlen(json));
-
+  int code = sendRawPost("/command-ack", json);
   Serial.printf("[CMD_ACK] %s/%s -> HTTP %d\n", command ? command : "", status ? status : "", code);
-  http.end();
 
   return (code == 200 || code == 201);
 }
@@ -569,7 +753,7 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
   if (code != 200) {
     Serial.printf("[PIN] verify HTTP %d\n", code);
     http.end();
-    return 0;
+    return -2;
   }
 
   String body = http.getString();
@@ -581,6 +765,11 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
   }
   if (body.indexOf("ALLOW_RELOCK") >= 0) {
     return 2;
+  }
+  if (body.indexOf("DENY:disabled") >= 0 ||
+      body.indexOf("DENY:missing_pin") >= 0 ||
+      body.indexOf("DENY:invalid") >= 0) {
+    return -1;
   }
   return 0;
 }

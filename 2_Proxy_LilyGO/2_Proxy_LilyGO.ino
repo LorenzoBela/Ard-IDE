@@ -70,7 +70,7 @@ uint8_t boxNum       = 0;
 // Timing (ms)
 #define GPS_INTERVAL_ACQUIRING 500 // Fast polling while seeking fix
 #define GPS_INTERVAL_LOCKED 2000   // Normal polling once fix acquired
-#define FIREBASE_INTERVAL 3000
+#define FIREBASE_INTERVAL 5000      // Stagger writes to free modem for faster context reads
 #define SIGNAL_INTERVAL 10000
 #define IDLE_POLL_MULTIPLIER 2
 #define IDLE_GPS_POLL_MULTIPLIER 3
@@ -78,7 +78,9 @@ uint8_t boxNum       = 0;
 
 // Reliability
 #define WDT_TIMEOUT_S 30            // Watchdog reboot after 30s hang
-#define MODEM_HEALTH_INTERVAL 30000 // Check modem alive every 30s
+#define MODEM_HEALTH_INTERVAL 30000       // Check modem alive every 30s
+#define TAMPER_CHECK_INTERVAL 15000        // Check tamper-clear command every 15s (rare admin action)
+#define STALE_DELIVERY_CHECK_DIVISOR 5     // Only verify delivery still active every Nth context poll
 #define MEM_REPORT_INTERVAL 60000   // Print heap stats every 60s
 #define MAX_CONSECUTIVE_FAILURES 5  // Hard-reset modem after 5 AT timeouts
 #define MAX_FB_FAILURES 3           // Reconnect LTE after 3 Firebase fails
@@ -96,6 +98,7 @@ bool gpsEnabled = false;
 bool modemOK = false;
 unsigned long lastGps = 0, lastFB = 0, lastSig = 0, lastTimeSync = 0;
 unsigned long lastModemHealth = 0, lastMemReport = 0;
+unsigned long lastTamperCheckAt = 0;
 
 double gpsLat = 0, gpsLon = 0;
 double gpsHdop = 99.9; // Horizontal Dilution of Precision (99.9 = unknown)
@@ -108,6 +111,10 @@ unsigned long dataBytesOut = 0; // Total bytes sent to Firebase
 
 // Hotspot / camera proxy
 WiFiServer camServer(CAM_SERVER_PORT);
+// Persistent keep-alive socket from the controller ESP32.
+// WiFiServer::available() only returns NEW connections; this tracks
+// the existing one so we can read subsequent requests on the same TCP pipe.
+static WiFiClient keepAliveController;
 bool apStarted = false;
 String relayDiag =
     ""; // Diagnostics forwarded to ESP32-CAM via HTTP response body
@@ -163,6 +170,15 @@ bool pickupCoordsValid = false;
 unsigned long lastDeliveryContextRead = 0;
 #define DELIVERY_CONTEXT_READ_INTERVAL 3000 // Re-read Firebase every 3s
 
+// Delivery context validation / fail-closed controls
+unsigned long deliveryContextBootAtMs = 0;
+unsigned long lastDeliveryIdSeenAtMs = 0;
+unsigned long lastContextFetchOkAtMs = 0;
+bool deliveryContextValidated = false;
+uint8_t contextFetchFailCount = 0;
+#define DELIVERY_CONTEXT_VALIDATE_GRACE_MS 20000
+#define CONTEXT_FETCH_FAIL_RESET_COUNT 2
+
 // UDP log receiver
 WiFiUDP udpServer;
 #define UDP_LOG_PORT 5114
@@ -196,6 +212,7 @@ static bool extractJsonStringValue(const char *json, const char *key,
   out[len] = '\0';
   return out[0] != '\0';
 }
+
 bool camClientKnown = false;
 #define CAM_FACE_PORT 80 // ESP32-CAM runs a tiny HTTP server on port 80
 static unsigned long camLastSeenAt = 0;
@@ -244,8 +261,54 @@ static bool persistedContextHashReady = false;
 static uint32_t lastPersistedPinContextHash = 0;
 static bool persistedPinContextHashReady = false;
 
+static void clearDeliveryContextCaches(const char *reason, bool patchHardware) {
+  otpCacheValid = false;
+  cachedOtp[0] = '\0';
+  returnOtpCacheValid = false;
+  cachedReturnOtp[0] = '\0';
+  returnActive = false;
+  lastReturnActive = false;
+
+  deliveryIdCacheValid = false;
+  cachedDeliveryId[0] = '\0';
+  cachedDeliveryStatus[0] = '\0';
+
+  destLat = 0.0;
+  destLon = 0.0;
+  destCoordsValid = false;
+  pickupLat = 0.0;
+  pickupLon = 0.0;
+  pickupCoordsValid = false;
+
+  lastDeliveryIdSeenAtMs = 0;
+  deliveryContextValidated = true;
+  contextFetchFailCount = 0;
+
+  dpClearDeliveryContext();
+  persistedContextHashReady = false;
+  lastPersistedContextHash = 0;
+  clearPersonalPinRuntimeCache(false);
+
+  if (patchHardware) {
+    if (lteConnected) {
+      char hwPath[64];
+      snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
+      httpPatchWithRetry(
+          hwPath,
+          "{\"otp_code\":null,\"delivery_id\":null,\"return_otp\":null,\"return_active\":false}");
+    } else {
+      Serial.println("[CONTEXT] Clear requested but LTE not connected");
+    }
+  }
+
+  Serial.printf("[CONTEXT] Cleared delivery context (%s)\n",
+                reason ? reason : "unknown");
+}
+
 unsigned long lastPersonalPinFlushAt = 0;
 #define PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS 5000
+static unsigned long lastPinRuntimeRefreshAt = 0;
+#define PIN_RUNTIME_REFRESH_MIN_MS 15000
 
 // Reliability counters
 uint8_t consecutiveModemFailures = 0;
@@ -287,6 +350,7 @@ unsigned long dateTimeToEpoch(int year, int month, int day, int hour, int min,
 String httpGetFromFirebase(const char *path);
 bool writeCommandAckToFirebase(const char *command, const char *status,
                                const char *details);
+static bool refreshPersonalPinRuntimeFromFirebase(bool logDetails, bool force);
 void scheduleModemRecovery(const char *reason);
 void modemRecoveryTask(void *);
 void maybeEvaluateConnectivityMatrix(unsigned long now);
@@ -2024,10 +2088,18 @@ static bool isDeliveryStillActiveInFirebase(const char *deliveryId) {
   String statusBody = httpGetFromFirebase(statusPath);
   statusBody.trim();
 
-if (statusBody.length() == 0) {
-      Serial.printf("[CONTEXT] Network failure checking %s (empty body). Assuming active.\n", deliveryId);
-      return true;
-    }
+  if (statusBody.length() == 0) {
+    Serial.printf("[CONTEXT] Empty status for %s; retrying once...\n", deliveryId);
+    statusBody = httpGetFromFirebase(statusPath);
+    statusBody.trim();
+  }
+
+  if (statusBody.length() == 0) {
+    Serial.printf("[CONTEXT] Status check failed for %s (empty). Treating as inactive.\n",
+                  deliveryId);
+    cachedDeliveryStatus[0] = '\0';
+    return false;
+  }
 
     if (statusBody == "null") {
     Serial.printf("[CONTEXT] Delivery %s missing in /deliveries -> stale context\n",
@@ -2670,6 +2742,15 @@ void refreshDeliveryContextFromFirebase() {
     return;
   }
 
+  unsigned long nowMs = millis();
+  bool contextCleared = false;
+  bool prevDeliveryValid = deliveryIdCacheValid;
+  char prevDeliveryId[64] = "";
+  if (prevDeliveryValid) {
+    strncpy(prevDeliveryId, cachedDeliveryId, sizeof(prevDeliveryId) - 1);
+    prevDeliveryId[sizeof(prevDeliveryId) - 1] = '\0';
+  }
+
   Serial.printf("[CONTEXT] Fetching /hardware/%s from Firebase...\n",
                 HARDWARE_ID);
   // Fetch the entire hardware node since it contains both OTP and delivery_id
@@ -2678,7 +2759,7 @@ void refreshDeliveryContextFromFirebase() {
 
   String resp;
   sendATAndWait("+HTTPTERM", 1000);
-  delay(200);
+  delay(100);
 
   modem.sendAT("+HTTPINIT");
   if (modem.waitResponse(5000L, resp) != 1)
@@ -2725,6 +2806,20 @@ void refreshDeliveryContextFromFirebase() {
   Serial.printf("[CONTEXT] Firebase HTTP status: %d (actionOK=%d)\n",
                 httpStatus, actionOK);
 
+  if (!actionOK || httpStatus != 200) {
+    contextFetchFailCount++;
+    if (!deliveryContextValidated &&
+        (nowMs - deliveryContextBootAtMs) > DELIVERY_CONTEXT_VALIDATE_GRACE_MS) {
+      clearDeliveryContextCaches("boot_validate_timeout", false);
+    } else if (contextFetchFailCount >= CONTEXT_FETCH_FAIL_RESET_COUNT) {
+      clearDeliveryContextCaches("context_fetch_failed", false);
+    }
+    return;
+  }
+
+  contextFetchFailCount = 0;
+  lastContextFetchOkAtMs = nowMs;
+
   if (actionOK && httpStatus == 200) {
     // A7670E/A7672X caps each AT+HTTPREAD at 1024 bytes.
     // Firebase returns JSON keys alphabetically, so "background_location_status"
@@ -2737,7 +2832,12 @@ void refreshDeliveryContextFromFirebase() {
     body.reserve(CTX_MAX); // Pre-allocate to avoid realloc fragmentation
     int offset = 0;
 
-    while (offset < CTX_MAX) {
+    int targetLen = CTX_MAX;
+    if (totalResponseLen > 0 && totalResponseLen < CTX_MAX) {
+      targetLen = totalResponseLen;
+    }
+
+    while (offset < targetLen) {
       // Request next chunk from modem
       char readCmd[40];
       snprintf(readCmd, sizeof(readCmd), "AT+HTTPREAD=%d,%d\r\n", offset, CTX_CHUNK);
@@ -2780,14 +2880,11 @@ void refreshDeliveryContextFromFirebase() {
       }
 
       // Drain trailing OK / CRLF after this chunk
-      delay(100);
+      delay(50);
       while (modem.stream.available())
         modem.stream.read();
 
       offset += chunkLen;
-
-      // If modem returned fewer bytes than requested, we've read everything
-      if (chunkLen < CTX_CHUNK) break;
     }
 
     #undef CTX_CHUNK
@@ -2800,6 +2897,7 @@ void refreshDeliveryContextFromFirebase() {
           "[CONTEXT] WARNING: Response %d > CTX_MAX window (%d bytes read) — fields near the end may be truncated!\n",
           totalResponseLen, (int)body.length());
     }
+    bool responseTruncated = (totalResponseLen > 0 && totalResponseLen > (int)body.length());
 
     // EC-32: Parse top-level return_active (ignore nested historical fields).
     {
@@ -2852,6 +2950,14 @@ void refreshDeliveryContextFromFirebase() {
       }
     }
 
+    if (!contextCleared && prevDeliveryValid && !deliveryIdCacheValid) {
+      dpClearDeliveryContext();
+      persistedContextHashReady = false;
+      lastPersistedContextHash = 0;
+      Serial.printf("[CONTEXT] Delivery cleared in hardware (prev=%s) -> NVS cleared\n",
+                    prevDeliveryId[0] ? prevDeliveryId : "unknown");
+    }
+
     // Parse Personal PIN runtime metadata (top-level only).
     // Fail-closed: if payload is incomplete during rider swaps, clear stale cache.
     {
@@ -2885,7 +2991,18 @@ void refreshDeliveryContextFromFirebase() {
       bool riderChanged = riderValid && previousRider[0] != '\0' &&
                           strcmp(previousRider, parsedRider) != 0;
 
-      if (!hasAnyPersonalPinRuntimeField) {
+      bool pinRuntimeMissing = (!hasAnyPersonalPinRuntimeField || !riderValid ||
+                               !hashValid || !saltValid);
+      bool pinRuntimeDisabled = (parsedEnabled && !enabledVal);
+      bool pinRuntimeRefreshed = false;
+      if (pinRuntimeMissing && !pinRuntimeDisabled) {
+        pinRuntimeRefreshed =
+            refreshPersonalPinRuntimeFromFirebase(responseTruncated, false);
+      }
+
+      if (pinRuntimeRefreshed) {
+        // Runtime refresh already updated caches.
+      } else if (!hasAnyPersonalPinRuntimeField) {
         if (personalPinEnabled || cachedPersonalPinHashMcu[0] ||
             cachedPersonalPinSalt[0] || cachedPersonalPinRiderId[0]) {
           Serial.println("[PIN] Personal PIN runtime fields missing; clearing stale cache");
@@ -2964,79 +3081,69 @@ void refreshDeliveryContextFromFirebase() {
       }
     }
 
-    // Guard against stale /hardware context (e.g., deliveries node was wiped).
+    // Guard against stale /hardware context (delivery_id can exist without otp_code).
     // If the referenced delivery no longer exists or is terminal, clear caches
     // and self-heal /hardware to stop serving old OTP/delivery over GET /otp.
-    if (otpCacheValid && deliveryIdCacheValid) {
+    // Throttled: only check every STALE_DELIVERY_CHECK_DIVISOR polls to avoid
+    // burning an extra HTTP session (5-10s on LTE) on every single context read.
+    static uint8_t staleCheckCounter = 0;
+    staleCheckCounter++;
+    if (deliveryIdCacheValid && (staleCheckCounter % STALE_DELIVERY_CHECK_DIVISOR) == 0) {
       if (!isDeliveryStillActiveInFirebase(cachedDeliveryId)) {
-        otpCacheValid = false;
-        cachedOtp[0] = '\0';
-        deliveryIdCacheValid = false;
-        cachedDeliveryId[0] = '\0';
-        returnOtpCacheValid = false;
-        cachedReturnOtp[0] = '\0';
-        returnActive = false;
-
-        dpClearDeliveryContext();
-        persistedContextHashReady = false;
-        lastPersistedContextHash = 0;
-        clearPersonalPinRuntimeCache(false);
-
-        char hwPath[64];
-        snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
-        bool clearOk = httpPatchWithRetry(
-            hwPath,
-            "{\"otp_code\":null,\"delivery_id\":null,\"return_otp\":null,\"return_active\":false}");
-        Serial.printf("[CONTEXT] Cleared stale hardware delivery context: %s\n",
-                      clearOk ? "OK" : "FAIL");
+        contextCleared = true;
+        clearDeliveryContextCaches("stale_delivery", true);
       }
     }
 
     // Parse destination coords for geofence + theft guard targeting.
     // Mobile app writes "target_lat"/"target_lng"; accept both that and
     // the legacy "dest_lat"/"dest_lon" so either naming convention works.
-    int dLatIdx = body.indexOf("\"dest_lat\":");
-    int dLonIdx = body.indexOf("\"dest_lon\":");
-    if (dLatIdx < 0) dLatIdx = body.indexOf("\"target_lat\":");
-    if (dLonIdx < 0) dLonIdx = body.indexOf("\"target_lng\":");
-    int dLatValOffset = (body.indexOf("\"target_lat\":") == dLatIdx) ? 13 : 11;
-    int dLonValOffset = (body.indexOf("\"target_lng\":") == dLonIdx) ? 13 : 11;
-    if (dLatIdx >= 0 && dLonIdx >= 0) {
-      double dLa = body.substring(dLatIdx + dLatValOffset).toDouble();
-      double dLo = body.substring(dLonIdx + dLonValOffset).toDouble();
-      if (dLa != 0.0 || dLo != 0.0) {
-        bool changed = (dLa != destLat || dLo != destLon);
-        destLat = dLa;
-        destLon = dLo;
-        destCoordsValid = true;
-        if (changed) {
-          geoProxy.setTarget(destLat, destLon);
-          theftGuardSetGeofence((float)destLat, (float)destLon,
-                               TG_GEOFENCE_RADIUS_KM);
-          Serial.printf("[GEO] Target set: %.6f, %.6f\n", destLat, destLon);
+    if (deliveryIdCacheValid) {
+      int dLatIdx = body.indexOf("\"dest_lat\":");
+      int dLonIdx = body.indexOf("\"dest_lon\":");
+      if (dLatIdx < 0) dLatIdx = body.indexOf("\"target_lat\":");
+      if (dLonIdx < 0) dLonIdx = body.indexOf("\"target_lng\":");
+      int dLatValOffset = (body.indexOf("\"target_lat\":") == dLatIdx) ? 13 : 11;
+      int dLonValOffset = (body.indexOf("\"target_lng\":") == dLonIdx) ? 13 : 11;
+      if (dLatIdx >= 0 && dLonIdx >= 0) {
+        double dLa = body.substring(dLatIdx + dLatValOffset).toDouble();
+        double dLo = body.substring(dLonIdx + dLonValOffset).toDouble();
+        if (dLa != 0.0 || dLo != 0.0) {
+          bool changed = (dLa != destLat || dLo != destLon);
+          destLat = dLa;
+          destLon = dLo;
+          destCoordsValid = true;
+          if (changed) {
+            geoProxy.setTarget(destLat, destLon);
+            theftGuardSetGeofence((float)destLat, (float)destLon,
+                                 TG_GEOFENCE_RADIUS_KM);
+            Serial.printf("[GEO] Target set: %.6f, %.6f\n", destLat, destLon);
+          }
         }
       }
-    } else if (!deliveryIdCacheValid) {
+    } else {
       destCoordsValid = false;
     }
 
     // Parse pickup coords (pickup_lat / pickup_lng) for dual-geofence gating
-    int pLatIdx = body.indexOf("\"pickup_lat\":");
-    int pLonIdx = body.indexOf("\"pickup_lng\":");
-    if (pLatIdx >= 0 && pLonIdx >= 0) {
-      double pLa = body.substring(pLatIdx + 13).toDouble();
-      double pLo = body.substring(pLonIdx + 13).toDouble();
-      if (pLa != 0.0 || pLo != 0.0) {
-        bool changed = (pLa != pickupLat || pLo != pickupLon);
-        pickupLat = pLa;
-        pickupLon = pLo;
-        pickupCoordsValid = true;
-        if (changed) {
-          geoProxy.setPickup(pickupLat, pickupLon);
-          Serial.printf("[GEO] Pickup set: %.6f, %.6f\n", pickupLat, pickupLon);
+    if (deliveryIdCacheValid) {
+      int pLatIdx = body.indexOf("\"pickup_lat\":");
+      int pLonIdx = body.indexOf("\"pickup_lng\":");
+      if (pLatIdx >= 0 && pLonIdx >= 0) {
+        double pLa = body.substring(pLatIdx + 13).toDouble();
+        double pLo = body.substring(pLonIdx + 13).toDouble();
+        if (pLa != 0.0 || pLo != 0.0) {
+          bool changed = (pLa != pickupLat || pLo != pickupLon);
+          pickupLat = pLa;
+          pickupLon = pLo;
+          pickupCoordsValid = true;
+          if (changed) {
+            geoProxy.setPickup(pickupLat, pickupLon);
+            Serial.printf("[GEO] Pickup set: %.6f, %.6f\n", pickupLat, pickupLon);
+          }
         }
       }
-    } else if (!deliveryIdCacheValid) {
+    } else {
       pickupCoordsValid = false;
     }
 
@@ -3140,7 +3247,13 @@ void refreshDeliveryContextFromFirebase() {
           strncpy(parsedCommand, body.c_str() + start, len);
           parsedCommand[len] = '\0';
 
-          if (strcmp(parsedCommand, "NONE") == 0) {
+          if (strcmp(parsedCommand, "CLEAR_CONTEXT") == 0) {
+            clearDeliveryContextCaches("remote_command", true);
+            char hwPath[64];
+            snprintf(hwPath, sizeof(hwPath), "/hardware/%s.json", HARDWARE_ID);
+            httpPatchWithRetry(hwPath, "{\"command\":\"NONE\"}");
+            Serial.println("[CONTEXT] Remote command CLEAR_CONTEXT executed");
+          } else if (strcmp(parsedCommand, "NONE") == 0) {
             if (cachedStatusStage == CMD_STAGE_ACK_SENT) {
               Serial.println("[CONTEXT] command=NONE ignored while ACK upload pending");
             } else {
@@ -3187,6 +3300,13 @@ void refreshDeliveryContextFromFirebase() {
     } else if ((!hasTopLevelLockdown || !lockdownRequested) &&
                theftGuardIsLockdown()) {
       theftGuardDeactivateLockdown();
+    }
+
+    deliveryContextValidated = true;
+    if (deliveryIdCacheValid) {
+      lastDeliveryIdSeenAtMs = nowMs;
+    } else if (!contextCleared) {
+      lastDeliveryIdSeenAtMs = 0;
     }
 
     Serial.printf(
@@ -3630,24 +3750,33 @@ void triggerRebootAllIfScheduled(unsigned long now) {
 
 // ==================== HOTSPOT HTTP ROUTER ====================
 void handleCameraClient() {
-  WiFiClient client = camServer.available();
-  if (!client)
-    return;
+  WiFiClient client;
 
-  Serial.println("[AP] Client connected");
+  // Priority 1: check persistent keep-alive connection for new request data.
+  // WiFiServer::available() only returns NEW connections, so we must track
+  // the existing controller socket separately for keep-alive to work.
+  if (keepAliveController.connected() && keepAliveController.available()) {
+    client = keepAliveController;
+  } else {
+    // Priority 2: accept a new incoming connection.
+    client = camServer.available();
+    if (!client)
+      return;
+
+    // New connection: wait for headers to arrive.
+    unsigned long headerTimeout = millis() + 500;
+    while (!client.available() && millis() < headerTimeout) {
+      delay(10);
+      esp_task_wdt_reset();
+    }
+    if (!client.available()) {
+      client.stop();
+      return;
+    }
+  }
+
   esp_task_wdt_reset();
-
   IPAddress clientAddr = client.remoteIP();
-
-  unsigned long headerTimeout = millis() + 500;
-  while (!client.available() && millis() < headerTimeout) {
-    delay(10);
-    esp_task_wdt_reset();
-  }
-  if (!client.available()) {
-    client.stop();
-    return;
-  }
 
   client.setTimeout(2000);
   String requestLine = client.readStringUntil('\n');
@@ -3694,7 +3823,10 @@ void handleCameraClient() {
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/otp")) {
     controllerLastSeenAt = millis();
     String otpPart, delPart;
-    String geoOverride = "";
+
+    // Compute geofence state for structured response fields.
+    bool insideGeo = false;
+    int distMeters = -1;  // -1 = unknown (no GPS fix or no target coords)
 
     if (theftGuardShouldBlockOtp()) {
       otpPart = "NO_OTP";
@@ -3702,56 +3834,44 @@ void handleCameraClient() {
       Serial.printf("[AP] OTP suppressed — theft state: %s\n",
                     theftGuardStateStr());
     } else if (destCoordsValid && gpsFix) {
-      bool atPickup = geoProxy.isNearPickup(gpsLat, gpsLon);
-      bool atDropoff = geoProxy.isNearDropoff(gpsLat, gpsLon);
+      // During return mode the geofence target is already swapped to pickup
+      // coords (see EC-32 target swap). Use isNearAnyTarget() so the OTP gate
+      // correctly evaluates against whichever target is active.
+      bool atTarget = returnActive
+                        ? geoProxy.isNearAnyTarget(gpsLat, gpsLon)
+                        : geoProxy.isNearDropoff(gpsLat, gpsLon);
+      insideGeo = atTarget;
+      distMeters = (int)geoProxy.snap.distanceM;
 
-      if (atDropoff) {
-        // At dropoff: serve normally (Controller shows Enter PIN)
+      if (atTarget) {
+        // Inside geofence — serve OTP (return OTP during return mode).
         if (returnActive) {
           otpPart = returnOtpCacheValid ? String(cachedReturnOtp) : "NO_OTP";
         } else {
           otpPart = otpCacheValid ? String(cachedOtp) : "NO_OTP";
         }
         delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
-      } else if (atPickup) {
-        // At pickup: NO OTP, tell Controller we are at pickup -> Ongoing Pickup
-        otpPart = "NO_OTP";
-        delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
-        geoOverride = "GEO_PICKUP";
       } else {
-        // In transit
+        // Outside geofence — suppress OTP, controller shows distance.
         otpPart = "NO_OTP";
         delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
-        if (String(cachedDeliveryStatus) == "PICKED_UP" || String(cachedDeliveryStatus) == "IN_TRANSIT" || String(cachedDeliveryStatus) == "\"PICKED_UP\"") {
-          geoOverride = "GEO_TRANSIT_DROP";
-        } else {
-          geoOverride = "GEO_TRANSIT_PICK";
-        }
-        Serial.printf("[AP] OTP suppressed — outside geofence (%.0fm) Status: %s\n",
-                      geoProxy.snap.distanceM, geoOverride.c_str());
+        Serial.printf("[AP] OTP suppressed — outside geofence (%dm)\n", distMeters);
       }
     } else {
-      // Fail closed when geofence cannot be evaluated (no GPS fix / invalid coords).
-      // This keeps OTP/PIN strictly gated by location verification.
+      // Fail closed: no GPS fix or invalid coords — suppress OTP.
       otpPart = "NO_OTP";
       delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
-      if (String(cachedDeliveryStatus) == "PICKED_UP" || String(cachedDeliveryStatus) == "IN_TRANSIT" || String(cachedDeliveryStatus) == "\"PICKED_UP\"") {
-        geoOverride = "GEO_TRANSIT_DROP";
-      } else {
-        geoOverride = "GEO_TRANSIT_PICK";
-      }
-      Serial.printf("[AP] OTP suppressed — geofence unavailable (gpsFix=%d destValid=%d) Status: %s\n",
-                    gpsFix ? 1 : 0, destCoordsValid ? 1 : 0, geoOverride.c_str());
+      Serial.printf("[AP] OTP suppressed — geofence unavailable (gpsFix=%d destValid=%d)\n",
+                    gpsFix ? 1 : 0, destCoordsValid ? 1 : 0);
     }
 
     String body = otpPart + "," + delPart;
-    // EC-FIX: Append remote status command (UNLOCKING/LOCKED) if present.
-    // Keep command available for a short retry window so controller can catch it.
+
+    // Append remote status command (UNLOCKING/LOCKED/REBOOT_ALL) if pending.
     unsigned long nowMs = millis();
     bool statusActive =
         cachedStatusStage == CMD_STAGE_PENDING && cachedStatus[0] != '\0';
 
-    // Priority: status command > geo override > return mode (they are mutually exclusive actions).
     if (statusActive) {
       maybeRearmPendingCommand(nowMs);
       body += "," + String(cachedStatus);
@@ -3759,32 +3879,29 @@ void handleCameraClient() {
         cachedStatusServesRemaining--;
       }
       if (cachedStatusServesRemaining == 0) {
-        // Keep pending command alive until controller ACK arrives.
         maybeRearmPendingCommand(nowMs);
       }
-    } else if (geoOverride != "") {
-      body += "," + geoOverride;
-    } else if (returnActive) {
-      body += ",RETURNING";
+    } else {
+      // No admin command — leave status field empty.
+      body += ",";
     }
+
+    // Append structured geofence fields: DIST:N,GEO:0|1,RET:0|1
+    char geoFields[48];
+    snprintf(geoFields, sizeof(geoFields), ",DIST:%d,GEO:%d,RET:%d",
+             distMeters, insideGeo ? 1 : 0, returnActive ? 1 : 0);
+    body += String(geoFields);
+
     Serial.printf("[AP] -> GET /otp  serving: '%s'\n", body.c_str());
     String resp =
         "HTTP/1.1 200 OK\r\n"
-        "Connection: close\r\n"
+        "Connection: keep-alive\r\n"
         "Content-Type: text/plain\r\n"
         "Content-Length: " + String(body.length()) + "\r\n\r\n" + body;
     client.print(resp);
-    // Increased delay before closing to ensure ESP32 proxy client receives data
     client.flush();
-    delay(150);
-
-    // PURGE REMAINING BYTES to prevent ghost connections
-    unsigned long _purgeLimit = millis() + 500;
-    while (client.available() && millis() < _purgeLimit) {
-      client.read();
-    }
-
-    client.stop();
+    // Keep-alive: store client reference for subsequent requests on same socket.
+    keepAliveController = client;
     return;
   }
 
@@ -3832,12 +3949,13 @@ void handleCameraClient() {
       }
     }
 
-    // Send HTTP 200 OK before blocking on Firebase write
-    String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+    // Send HTTP 200 OK — keep-alive so controller can reuse socket.
+    // Content-Length ensures controller knows body is complete even though
+    // we continue with a slow Firebase write on our side.
+    String resp = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK";
     client.print(resp);
     client.flush();
-    delay(10);
-    client.stop(); // Disconnect ESP32 immediately to prevent -11 timeout
+    keepAliveController = client;
     
     // Now write to Firebase (takes a few seconds)
     bool ackWritten = writeCommandAckToFirebase(cmd, status, details);
@@ -3847,6 +3965,30 @@ void handleCameraClient() {
       } else {
         lastCommandAckRetryAt = millis() + COMMAND_ACK_RETRY_INTERVAL_MS;
       }
+    }
+
+    // EC-32: Handle return completion signal from controller.
+    // When a return OTP unlock succeeds, the controller sends RETURN_COMPLETE.
+    // Clear local return state and write completion flag to Firebase so the
+    // web API mark-retrieved logic can finalize the RETURNED transition.
+    if (strcmp(cmd, "RETURN_COMPLETE") == 0 && strcmp(status, "executed") == 0) {
+      Serial.println("[CMD_ACK] Return completed — clearing return state");
+      returnActive = false;
+      lastReturnActive = false;
+      cachedReturnOtp[0] = '\0';
+      returnOtpCacheValid = false;
+
+      // Write return_completed flag + clear return_active on Firebase.
+      char patchPath[64];
+      snprintf(patchPath, sizeof(patchPath), "/hardware/%s.json", HARDWARE_ID);
+      const char *patchBody =
+          "{\"return_completed\":true,\"return_active\":false,"
+          "\"return_completed_at\":{\".sv\":\"timestamp\"}}";
+
+      Serial.printf("[CMD_ACK] Firebase PATCH: %s\n", patchPath);
+      bool patchOk = httpPatchWithRetry(patchPath, patchBody);
+      Serial.printf("[CMD_ACK] Return completion write: %s\n",
+                    patchOk ? "OK" : "FAIL");
     }
     return;
   }
@@ -3939,6 +4081,12 @@ void handleCameraClient() {
 
     const char *resultBody = "DENY:invalid";
     bool verified = false;
+    bool refreshed = false;
+
+    if (!personalPinEnabled || cachedPersonalPinHashMcu[0] == '\0' ||
+        cachedPersonalPinSalt[0] == '\0' || cachedPersonalPinRiderId[0] == '\0') {
+      refreshed = refreshPersonalPinRuntimeFromFirebase(true, true);
+    }
 
     if (!personalPinEnabled) {
       resultBody = "DENY:disabled";
@@ -3946,12 +4094,21 @@ void handleCameraClient() {
       resultBody = "DENY:missing_pin";
     } else {
       verified = verifyPersonalPinLocal(pin);
+      if (!verified && !refreshed) {
+        if (refreshPersonalPinRuntimeFromFirebase(true, true)) {
+          refreshed = true;
+          verified = verifyPersonalPinLocal(pin);
+        }
+      }
       if (verified) {
         resultBody = currentlyLocked ? "ALLOW_UNLOCK" : "ALLOW_RELOCK";
       } else {
         resultBody = "DENY:mismatch";
       }
     }
+
+    Serial.printf("[PIN] Verify result: %s (enabled=%d)\n",
+                  resultBody, personalPinEnabled ? 1 : 0);
 
     String resp =
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
@@ -3984,12 +4141,11 @@ void handleCameraClient() {
     }
     Serial.printf("[AP] Event: %s\n", jsonBuf);
 
-    // Send HTTP 200 OK before blocking on Firebase write
-    String resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+    // Send HTTP 200 OK — keep-alive so controller can reuse socket
+    String resp = "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK";
     client.print(resp);
     client.flush();
-    delay(10);
-    client.stop(); // Disconnect ESP32 immediately to prevent -11 timeout
+    keepAliveController = client;
 
     // Reed switch tamper: Controller detected unauthorized lid-open
     if (strstr(jsonBuf, "\"tamper\":true") != NULL) {
@@ -4194,7 +4350,7 @@ void handleCameraClient() {
 String httpGetFromFirebase(const char *path) {
   String resp;
   sendATAndWait("+HTTPTERM", 1000);
-  delay(200);
+  delay(100);
 
   modem.sendAT("+HTTPINIT");
   if (modem.waitResponse(5000L, resp) != 1)
@@ -4269,13 +4425,147 @@ String httpGetFromFirebase(const char *path) {
       }
       esp_task_wdt_reset();
     }
-    delay(100);
+    delay(50);
     while (modem.stream.available())
       modem.stream.read();
   }
 
   sendATAndWait("+HTTPTERM", 1000);
   return body;
+}
+
+static bool parseFirebaseStringValue(const String &body, char *out, size_t outLen) {
+  if (!out || outLen == 0) return false;
+  out[0] = '\0';
+
+  String value = body;
+  value.trim();
+  if (value.length() == 0 || value == "null") {
+    return false;
+  }
+  if (value.length() >= 2 && value[0] == '"' && value[value.length() - 1] == '"') {
+    value = value.substring(1, value.length() - 1);
+    value.trim();
+  }
+  if (value.length() == 0) {
+    return false;
+  }
+  size_t len = (value.length() >= outLen) ? (outLen - 1) : value.length();
+  memcpy(out, value.c_str(), len);
+  out[len] = '\0';
+  return true;
+}
+
+static bool parseFirebaseBoolValue(const String &body, bool &out, bool &hasValue) {
+  String value = body;
+  value.trim();
+  hasValue = false;
+  if (value.length() == 0 || value == "null") {
+    return false;
+  }
+  if (value == "true" || value == "1") {
+    out = true;
+    hasValue = true;
+    return true;
+  }
+  if (value == "false" || value == "0") {
+    out = false;
+    hasValue = true;
+    return true;
+  }
+  return false;
+}
+
+static bool fetchFirebaseStringValue(const char *path, char *out, size_t outLen) {
+  String body = httpGetFromFirebase(path);
+  return parseFirebaseStringValue(body, out, outLen);
+}
+
+static bool fetchFirebaseBoolValue(const char *path, bool &out, bool &hasValue) {
+  String body = httpGetFromFirebase(path);
+  return parseFirebaseBoolValue(body, out, hasValue);
+}
+
+static bool refreshPersonalPinRuntimeFromFirebase(bool logDetails, bool force) {
+  if (!lteConnected) return false;
+
+  unsigned long nowMs = millis();
+  if (!force && nowMs - lastPinRuntimeRefreshAt < PIN_RUNTIME_REFRESH_MIN_MS) {
+    return false;
+  }
+  lastPinRuntimeRefreshAt = nowMs;
+
+  char path[96];
+  bool enabledVal = false;
+  bool hasEnabled = false;
+  snprintf(path, sizeof(path), "/hardware/%s/personal_pin_enabled.json", HARDWARE_ID);
+  if (!fetchFirebaseBoolValue(path, enabledVal, hasEnabled) || !hasEnabled) {
+    if (logDetails) {
+      Serial.println("[PIN] Runtime refresh failed: missing enabled flag");
+    }
+    return false;
+  }
+
+  if (!enabledVal) {
+    clearPersonalPinRuntimeCache(true);
+    if (logDetails) {
+      Serial.println("[PIN] Runtime refresh: personal PIN disabled");
+    }
+    return true;
+  }
+
+  char hash[65] = "";
+  char salt[33] = "";
+  char rider[64] = "";
+  snprintf(path, sizeof(path), "/hardware/%s/personal_pin_hash_mcu.json", HARDWARE_ID);
+  bool hashOk = fetchFirebaseStringValue(path, hash, sizeof(hash));
+  snprintf(path, sizeof(path), "/hardware/%s/personal_pin_salt.json", HARDWARE_ID);
+  bool saltOk = fetchFirebaseStringValue(path, salt, sizeof(salt));
+  snprintf(path, sizeof(path), "/hardware/%s/current_rider_id.json", HARDWARE_ID);
+  bool riderOk = fetchFirebaseStringValue(path, rider, sizeof(rider));
+
+  if (!hashOk || !saltOk || !riderOk || strlen(hash) != 64) {
+    if (logDetails) {
+      Serial.printf("[PIN] Runtime refresh failed: hash=%d salt=%d rider=%d\n",
+                    hashOk ? 1 : 0, saltOk ? 1 : 0, riderOk ? 1 : 0);
+    }
+    return false;
+  }
+
+  bool riderChanged = cachedPersonalPinRiderId[0] != '\0' &&
+                      strcmp(cachedPersonalPinRiderId, rider) != 0;
+  if (riderChanged && logDetails) {
+    Serial.printf("[PIN] Runtime refresh rider changed (%s -> %s)\n",
+                  cachedPersonalPinRiderId, rider);
+  }
+
+  personalPinEnabled = true;
+  strncpy(cachedPersonalPinHashMcu, hash, sizeof(cachedPersonalPinHashMcu) - 1);
+  cachedPersonalPinHashMcu[sizeof(cachedPersonalPinHashMcu) - 1] = '\0';
+  strncpy(cachedPersonalPinSalt, salt, sizeof(cachedPersonalPinSalt) - 1);
+  cachedPersonalPinSalt[sizeof(cachedPersonalPinSalt) - 1] = '\0';
+  strncpy(cachedPersonalPinRiderId, rider, sizeof(cachedPersonalPinRiderId) - 1);
+  cachedPersonalPinRiderId[sizeof(cachedPersonalPinRiderId) - 1] = '\0';
+
+  uint32_t nextPinHash =
+      buildPersonalPinContextHash(true,
+                                  cachedPersonalPinHashMcu,
+                                  cachedPersonalPinSalt,
+                                  cachedPersonalPinRiderId);
+  if (!persistedPinContextHashReady || nextPinHash != lastPersistedPinContextHash) {
+    dpSavePersonalPinEnabled(true);
+    dpSavePersonalPinHash(cachedPersonalPinHashMcu);
+    dpSavePersonalPinSalt(cachedPersonalPinSalt);
+    dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+    lastPersistedPinContextHash = nextPinHash;
+    persistedPinContextHashReady = true;
+  }
+
+  if (logDetails) {
+    Serial.printf("[PIN] Runtime refresh OK (rider=%s)\n",
+                  cachedPersonalPinRiderId);
+  }
+  return true;
 }
 
 // Register this board's MAC address in Firebase and return its box number.
@@ -4459,6 +4749,11 @@ void setup() {
   geoProxy.reset();
   reassign.clear();
   dpBegin();
+  deliveryContextBootAtMs = millis();
+  deliveryContextValidated = false;
+  contextFetchFailCount = 0;
+  lastDeliveryIdSeenAtMs = 0;
+  lastContextFetchOkAtMs = 0;
 
   // Restore persisted delivery context (survives brown-out / reboot)
   char restoredOtp[8] = "";
@@ -4497,6 +4792,10 @@ void setup() {
        cachedPersonalPinRiderId[0] == '\0')) {
     Serial.println("[PIN] Incomplete persisted Personal PIN cache; forcing disable");
     clearPersonalPinRuntimeCache(true);
+  }
+
+  if (lteConnected) {
+    refreshPersonalPinRuntimeFromFirebase(true, true);
   }
 
   lastPersistedContextHash =
@@ -4549,9 +4848,9 @@ void loop() {
     unsigned long firebaseInterval = idlePowerMode
                        ? (FIREBASE_INTERVAL * IDLE_POLL_MULTIPLIER)
                        : FIREBASE_INTERVAL;
-    unsigned long deliveryReadInterval =
-      idlePowerMode ? (DELIVERY_CONTEXT_READ_INTERVAL * IDLE_POLL_MULTIPLIER)
-            : DELIVERY_CONTEXT_READ_INTERVAL;
+    // Context reads always run at full speed — new delivery detection must be fast
+    // even when idle. IDLE_POLL_MULTIPLIER only slows sendToFirebase + signal checks.
+    unsigned long deliveryReadInterval = DELIVERY_CONTEXT_READ_INTERVAL;
 
   // Handle incoming camera image upload (non-blocking when idle)
   if (apStarted) {
@@ -4692,8 +4991,14 @@ void loop() {
   // endpoint)
   if (lteConnected && now - lastDeliveryContextRead >= deliveryReadInterval) {
     refreshDeliveryContextFromFirebase();
-    checkAndClearTamperFromFirebase();
     lastDeliveryContextRead = now;
+  }
+
+  // Tamper-clear is a rare admin action; check at its own slower cadence
+  // to avoid burning an HTTP session on every context read cycle.
+  if (lteConnected && now - lastTamperCheckAt >= TAMPER_CHECK_INTERVAL) {
+    checkAndClearTamperFromFirebase();
+    lastTamperCheckAt = now;
   }
 
   if (lteConnected) {
@@ -4707,5 +5012,5 @@ void loop() {
 
   maybePublishDurabilityMetrics(now);
 
-  delay(100);
+  delay(10);
 }

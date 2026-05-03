@@ -215,25 +215,22 @@ static bool hasLoadedOtp() {
   return currentOtp[0] != '\0';
 }
 
-static bool isGeoTransitStatus() {
-  return lastStatusCommand == "GEO_TRANSIT_DROP" ||
-         lastStatusCommand == "GEO_TRANSIT_PICK";
-}
-
-static bool isGeoPickupStatus() {
-  return lastStatusCommand == "GEO_PICKUP";
-}
-
 static bool isPinEligibleNow() {
-  if (!hasActiveDelivery || !hasLoadedOtp()) {
-    return false;
+  // PIN entry is allowed only when inside the geofence with an active OTP.
+  return hasActiveDelivery && hasLoadedOtp() && geoInsideFence;
+}
+
+// Format distance for LCD: >9999m → "10km", >999m → "1.2km", else "450m"
+static void formatDistance(int16_t meters, char *buf, size_t bufLen) {
+  if (meters < 0) {
+    snprintf(buf, bufLen, "No GPS");
+  } else if (meters >= 10000) {
+    snprintf(buf, bufLen, "%dkm", meters / 1000);
+  } else if (meters >= 1000) {
+    snprintf(buf, bufLen, "%d.%dkm", meters / 1000, (meters % 1000) / 100);
+  } else {
+    snprintf(buf, bufLen, "%dm", meters);
   }
-  // GEO transit/pickup statuses are never PIN-eligible.
-  if (isGeoTransitStatus() || isGeoPickupStatus()) {
-    return false;
-  }
-  // Dropoff-arrived and return mode remain PIN-eligible.
-  return true;
 }
 
 static uint32_t computeCheckpointCrc(const char *deliveryId,
@@ -582,23 +579,9 @@ static void renderIdleJourneyStatus() {
     return;
   }
 
-  if (lastStatusCommand == "GEO_TRANSIT_DROP") {
-    updateDisplay("In Transit", "Head to Dropoff");
-    return;
-  }
-
-  if (lastStatusCommand == "GEO_PICKUP") {
-    updateDisplay("Ongoing Pickup", "Please wait...");
-    return;
-  }
-
-  if (lastStatusCommand == "GEO_TRANSIT_PICK") {
-    updateDisplay("In Transit", "Head to Pickup");
-    return;
-  }
-
+  // PIN-ready: inside geofence with loaded OTP.
   if (isPinEligibleNow()) {
-    if (lastStatusCommand == "RETURNING") {
+    if (isReturning) {
       updateDisplay("Return PIN:", "PIN: ");
     } else {
       updateDisplay("Enter PIN:", "PIN: ");
@@ -606,8 +589,17 @@ static void renderIdleJourneyStatus() {
     return;
   }
 
-  // Newly assigned or status-missing phase defaults to pickup guidance.
-  updateDisplay("Head to Pickup", "Await geofence");
+  // Outside geofence — show live distance to current target.
+  char distStr[10];
+  formatDistance(geoDistMeters, distStr, sizeof(distStr));
+  char line1[17];
+  if (isReturning) {
+    snprintf(line1, sizeof(line1), "Pickup: %s", distStr);
+    updateDisplay("Returning", line1);
+  } else {
+    snprintf(line1, sizeof(line1), "Dropoff: %s", distStr);
+    updateDisplay("Delivery", line1);
+  }
 }
 
 static bool isUtilityKey(char key) {
@@ -1102,6 +1094,20 @@ void handleStateMachine(unsigned long now) {
 
   // ── BOOT RIDER AUTH ──
   case STATE_BOOT_AUTH: {
+    // Clear temporary messages (e.g. "Wrong PIN") after LCD_MESSAGE_DURATION
+    if (messageStartAt > 0 && now - messageStartAt >= LCD_MESSAGE_DURATION) {
+      messageStartAt = 0;
+      if (!isDisplayFailed()) {
+        char masked[17] = "";
+        uint8_t i;
+        for (i = 0; i < bootAuthLen && i < 15; i++) {
+          masked[i] = (i == bootAuthLen - 1) ? bootAuthCode[i] : '*';
+        }
+        masked[i] = '\0';
+        updateDisplay("Rider PIN:", masked);
+      }
+    }
+
     // Idle timeout — dim LCD after 5 minutes of no input.
     if (BOOT_AUTH_IDLE_TIMEOUT_MS > 0 &&
         bootAuthLastInputAt > 0 &&
@@ -1117,11 +1123,17 @@ void handleStateMachine(unsigned long now) {
     displayBacklightOn();
 
     if (key == '*') {
-      // Clear input but cannot exit — must authenticate.
       bootAuthLen = 0;
       bootAuthCode[0] = '\0';
-      if (!isDisplayFailed()) {
-        updateDisplay("Rider PIN:", "");
+      if (bootPhaseComplete) {
+        // Post-boot voluntary auth: allow exiting
+        enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
+        break;
+      } else {
+        // Clear input but cannot exit — must authenticate.
+        if (!isDisplayFailed()) {
+          updateDisplay("Rider PIN:", "");
+        }
       }
     } else if (key == '#') {
       if (bootAuthLen == 0) break;
@@ -1164,10 +1176,15 @@ void handleStateMachine(unsigned long now) {
         }
 
         if (!isDisplayFailed()) {
-          updateDisplay("Auth OK!", "Starting up...");
+          updateDisplay("Auth OK!", "Ready");
         }
         messageStartAt = now;
         currentState = STATE_SHOW_MESSAGE;
+      } else if (decision < 0) {
+        if (!isDisplayFailed()) {
+          updateDisplay("PIN not ready", "Syncing...");
+        }
+        messageStartAt = now;
       } else {
         // Invalid PIN.
         recordFailedAttempt(now);
@@ -1289,11 +1306,7 @@ void handleStateMachine(unsigned long now) {
     if (standbyKey == '6') {
       displayBacklightOn();
       if (!bootAuthDone) {
-        if (!isDisplayFailed()) {
-          updateDisplay("Auth required", "Enter Rider PIN");
-        }
-        messageStartAt = now;
-        currentState = STATE_SHOW_MESSAGE;
+        enterState(STATE_BOOT_AUTH);
         break;
       }
       stopUtilityMode(now);
@@ -1387,14 +1400,10 @@ void handleStateMachine(unsigned long now) {
       } else if (key == '6' && currentState == STATE_IDLE && inputLen == 0 && !isPinEligibleNow()) {
         // Key '6' — Unjam utility (guarded: auth + geofence)
         if (!bootAuthDone) {
-          if (!isDisplayFailed()) {
-            updateDisplay("Auth required", "Enter Rider PIN");
-          }
-          messageStartAt = now;
-          currentState = STATE_SHOW_MESSAGE;
+          enterState(STATE_BOOT_AUTH);
           break;
         }
-        if (isGeoTransitStatus() || isGeoPickupStatus()) {
+        if (!geoInsideFence && hasActiveDelivery) {
           if (!isDisplayFailed()) {
             updateDisplay("Not available", "In transit");
           }
@@ -1461,7 +1470,7 @@ void handleStateMachine(unsigned long now) {
 
             char display[17];
             snprintf(display, sizeof(display), "PIN: %s", masked);
-            if (lastStatusCommand == "RETURNING") {
+            if (isReturning) {
               updateDisplay("Return PIN:", display);
             } else {
               updateDisplay("Enter PIN:", display);
@@ -1528,6 +1537,12 @@ void handleStateMachine(unsigned long now) {
             messageStartAt = now;
             currentState = STATE_SHOW_MESSAGE;
           }
+        } else if (decision < 0) {
+          if (!isDisplayFailed()) {
+            updateDisplay("PIN not ready", "Syncing...");
+          }
+          messageStartAt = now;
+          currentState = STATE_SHOW_MESSAGE;
         } else {
           recordFailedAttempt(now);
           if (!isDisplayFailed()) {
@@ -1751,7 +1766,13 @@ void handleStateMachine(unsigned long now) {
           // It will stay retracted/unlocked until App sends "LOCKED" or '*' is pressed.
         }
         if (!isDisplayFailed()) {
-          updateDisplay("Box Unlocked!", "* = Relock");
+          if (isReturning) {
+            updateDisplay("Return Complete", "Close lid");
+            // EC-32: Signal proxy to mark return as completed.
+            reportCommandAckToProxy("RETURN_COMPLETE", "executed", "return_unlock_ok");
+          } else {
+            updateDisplay("Box Unlocked!", "* = Relock");
+          }
         } else {
           fallbackSuccess();
         }

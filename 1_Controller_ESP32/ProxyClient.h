@@ -23,6 +23,11 @@ extern bool  hasActiveDelivery;
 // ── Last parsed status command from proxy ("UNLOCKING" / "LOCKED" / "") ──
 extern String lastStatusCommand;
 
+// ── Live geofence state (parsed from proxy response) ──
+extern int16_t geoDistMeters;    // Distance in meters to current target (-1 = unknown)
+extern bool    geoInsideFence;   // True if inside the outer geofence radius
+extern bool    isReturning;      // True if return-to-sender mode is active
+
 struct ControllerDiagData {
 	int battPct;
 	float battVoltage;
