@@ -132,6 +132,10 @@ static const uint8_t KP_COLS = 3;
 #define DOOR_OPEN_LCD_WARN_INTERVAL_MS 30000  // LCD warning flash every 30 s
 #define DOOR_OPEN_CRITICAL_MS          300000 // 5 min → escalated DOOR_OPEN_CRITICAL alert
 
+// ==================== LCD AUTO-RECOVERY ====================
+#define LCD_RECOVERY_POST_SOLENOID_MS  200    // Re-init LCD 200ms after solenoid de-energise (EMI settle)
+#define LCD_PERIODIC_RESYNC_MS         60000  // Watchdog: re-init LCD every 60s to prevent gibberish
+
 // ==================== UDP LOGGING ====================
 #define UDP_LOG_PORT 5114
 

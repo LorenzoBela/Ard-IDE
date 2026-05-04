@@ -1,12 +1,15 @@
 /**
  * BatteryMonitor.cpp — Dual-channel battery voltage monitoring
  *
- * Channel A (GPIO34): 7.5V 2S Li-ion pack
- * Channel B (GPIO35): 12V  3S Li-ion pack
+ * Channel A (GPIO35): 7.5V 2S Li-ion pack
+ * Channel B (GPIO34): 12V  3S Li-ion pack
  * Both via standard "DC 0-25V Voltage Sensor Module" (ratio 5.0).
  */
 
 #include "BatteryMonitor.h"
+#include "LogTee.h"
+
+#define Serial LogSerial
 
 // ── Per-channel state ──
 struct BattState {
@@ -93,6 +96,8 @@ static float readChannelAveraged(BattChannel idx) {
   uint32_t sumRaw = 0;
   uint32_t sumMv  = 0;
 
+  (void)analogRead(ch[idx].pin);
+
   for (int i = 0; i < BATT_SAMPLES; i++) {
     int raw = analogRead(ch[idx].pin);
     int mv  = analogReadMilliVolts(ch[idx].pin);
@@ -107,8 +112,9 @@ static float readChannelAveraged(BattChannel idx) {
 
   float pinV = (float)ch[idx].lastPinMv / 1000.0f;
 
-  // Fallback for cores where analogReadMilliVolts returns 0.
-  if (ch[idx].lastPinMv <= 0) {
+  // Fallback for cores where analogReadMilliVolts is missing or uncalibrated.
+  if (ch[idx].lastPinMv <= 0 ||
+      (ch[idx].lastPinMv < BATT_SENSOR_MIN_PIN_MV && ch[idx].lastAdcRaw > 0)) {
     pinV = ((float)ch[idx].lastAdcRaw / 4095.0f) * BATT_ADC_REF;
     ch[idx].lastPinMv = (int)(pinV * 1000.0f + 0.5f);
   }
@@ -120,7 +126,7 @@ static float readChannelAveraged(BattChannel idx) {
 // ── Public API ──
 
 void batteryBegin() {
-  // Channel A — 7.5V on GPIO34
+  // Channel A — 7.5V on GPIO35
   ch[BATT_CH_A].pin     = BATT_PIN_A;
   ch[BATT_CH_A].minV    = BATT_A_MIN_VOLTAGE;
   ch[BATT_CH_A].maxV    = BATT_A_MAX_VOLTAGE;
@@ -130,7 +136,7 @@ void batteryBegin() {
   ch[BATT_CH_A].lastPinMv  = 0;
   ch[BATT_CH_A].emaInit    = false;
 
-  // Channel B — 12V on GPIO35
+  // Channel B — 12V on GPIO34
   ch[BATT_CH_B].pin     = BATT_PIN_B;
   ch[BATT_CH_B].minV    = BATT_B_MIN_VOLTAGE;
   ch[BATT_CH_B].maxV    = BATT_B_MAX_VOLTAGE;
@@ -140,12 +146,15 @@ void batteryBegin() {
   ch[BATT_CH_B].lastPinMv  = 0;
   ch[BATT_CH_B].emaInit    = false;
 
+  analogReadResolution(12);
+  analogSetAttenuation(BATT_ADC_ATTEN);
+
   // Configure both ADC pins
   for (int i = 0; i < BATT_CH_COUNT; i++) {
+    adcAttachPin(ch[i].pin);
     pinMode(ch[i].pin, INPUT);
     analogSetPinAttenuation(ch[i].pin, BATT_ADC_ATTEN);
   }
-  analogReadResolution(12);
 
   // Prime readings
   for (int i = 0; i < BATT_CH_COUNT; i++) {

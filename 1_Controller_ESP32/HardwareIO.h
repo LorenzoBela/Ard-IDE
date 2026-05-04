@@ -26,6 +26,9 @@ void displayBacklightOn();
 /** Disable LCD backlight to reduce idle power draw. */
 void displayBacklightOff();
 
+/** Re-initialize LCD quickly after electrical noise events. */
+void recoverDisplay();
+
 /** Toggle manual backlight override feature. Returns true if override is active. */
 bool toggleBacklightOverride();
 

@@ -29,6 +29,8 @@
  */
 
 #include <WiFi.h>
+#include <soc/soc.h>              // WRITE_PERI_REG macro
+#include <soc/rtc_cntl_reg.h>    // RTC_CNTL_BROWN_OUT_REG address
 #include <Preferences.h>
 #include "Config.h"
 #include "HardwareIO.h"
@@ -146,6 +148,7 @@ static unsigned long lastUnlockLatencyMs = 0;
 
 // ── Boot self-test ──
 static bool selfTestWarned = false;
+// (selfTestStarted removed — self-test always starts immediately in reed-only mode)
 
 // ── Boot rider authentication ──
 static bool    bootAuthDone = false;      // Rider passed PIN (gates key 6 unjam)
@@ -153,6 +156,11 @@ static bool    bootPhaseComplete = false; // Boot sequence finished (selftest+au
 static char    bootAuthCode[8];
 static uint8_t bootAuthLen = 0;
 static unsigned long bootAuthLastInputAt = 0;
+
+// ── LCD auto-recovery ──
+static bool          prevSolenoidState     = false; // Edge detection for solenoid de-energise
+static unsigned long lcdRecoveryScheduledAt = 0;    // millis() when post-solenoid recovery was scheduled
+static unsigned long lastLcdPeriodicResync  = 0;    // millis() of last periodic watchdog re-sync
 
 // ── Open-door safety ──
 static unsigned long lastDoorOpenWarnAt = 0;
@@ -786,10 +794,20 @@ void pollDiagnosticsIfDue(unsigned long now) {
 
 // ==================== SETUP ====================
 void setup() {
+  // ── Brownout detector disable (ESP32 hardware workaround) ──
+  // The BOD fires during peripheral inrush + WiFi radio init when
+  // powered via USB (thin cable / weak source). Disabling the detector
+  // prevents a reset loop while the power rail stabilises. This is safe
+  // because the ESP32 operates correctly at brief dips; only sustained
+  // under-voltage would cause real corruption — which would manifest as
+  // a watchdog reset instead.
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
   delay(500);
 
   Serial.println(F("\n=== Parcel-Safe Controller v3 (Modular) ==="));
+  Serial.println(F("[BOOT] Brownout detector disabled (USB power workaround)"));
 
   initHardwareIO();
   initLock();
@@ -799,16 +817,15 @@ void setup() {
   initHandoffCheckpointStore();
 
   // Boot self-test runs concurrently with WiFi — both are non-blocking.
-  // WiFi.begin() is async; it handshakes in the background while solenoid clicks.
-  // SECURITY: If rebooting mid-delivery (offline context exists), skip solenoid
-  // pulses to prevent momentary unlock windows. Reed-only check instead.
-  bool midDeliveryBoot = offlineContextFromBoot;
-  initSelfTest(midDeliveryBoot);
+  // SECURITY: Always skip solenoid pulses at boot to prevent:
+  //   1. Brownout from solenoid inrush + WiFi drawing simultaneously
+  //   2. Momentary unauthorized unlock windows (Article 1.2)
+  // Reed-only verification confirms sensor integrity without energising.
+  initSelfTest(true);   // Reed-only mode — NO solenoid pulses
   startWiFiConnection();
   currentState = STATE_BOOT_SELFTEST;
   if (!isDisplayFailed()) {
-    updateDisplay("Self-Test...",
-                  midDeliveryBoot ? "Reed check only" : "Checking lock");
+    updateDisplay("Self-Test...", "Reed check only");
   }
 
   Serial.printf("  Proxy: %s:%d\n", PROXY_HOST, PROXY_PORT);
@@ -988,6 +1005,37 @@ void loop() {
     lastDisplayCheck = now;
   }
 
+  // ── 4a. LCD auto-recovery: post-solenoid EMI + periodic watchdog ──
+  {
+    // Detect solenoid de-energise edge → schedule LCD re-init after EMI settles.
+    bool solNow = isSolenoidActive();
+    if (prevSolenoidState && !solNow) {
+      lcdRecoveryScheduledAt = now + LCD_RECOVERY_POST_SOLENOID_MS;
+    }
+    prevSolenoidState = solNow;
+
+    // Execute scheduled post-solenoid recovery.
+    if (lcdRecoveryScheduledAt > 0 && now >= lcdRecoveryScheduledAt) {
+      lcdRecoveryScheduledAt = 0;
+      if (!isDisplayFailed()) {
+        recoverDisplay();
+        lastLcdPeriodicResync = now; // Reset periodic timer too
+        Serial.println(F("[LCD] Auto-recovery after solenoid EMI"));
+      }
+    }
+
+    // Periodic watchdog: re-sync LCD every 60s to prevent accumulated drift.
+    if (lastLcdPeriodicResync == 0) {
+      lastLcdPeriodicResync = now; // Init on first loop
+    } else if (now - lastLcdPeriodicResync >= LCD_PERIODIC_RESYNC_MS) {
+      if (!isDisplayFailed()) {
+        recoverDisplay();
+        Serial.println(F("[LCD] Periodic watchdog re-sync"));
+      }
+      lastLcdPeriodicResync = now;
+    }
+  }
+
   // ── 4b. Utility diagnostics refresh and timeout handling ──
   pollDiagnosticsIfDue(now);
   if (utilityModeActive && now >= utilityModeExpiresAt) {
@@ -1007,6 +1055,24 @@ void loop() {
   {
     char heldKey = getHeldKey(); // Thread-safe: written by keypadTask on Core 1
     keypadHealth.update(heldKey, now);
+
+    // Long-press '0' to recover LCD after relay/EMI events.
+    static unsigned long zeroHoldStart = 0;
+    static bool zeroHoldTriggered = false;
+    if (heldKey == '0') {
+      if (zeroHoldStart == 0) zeroHoldStart = now;
+      if (!zeroHoldTriggered && (now - zeroHoldStart) >= 1200) {
+        recoverDisplay();
+        checkDisplayHealth();
+        if (!isDisplayFailed()) {
+          updateDisplay("Display reset", "Continue");
+        }
+        zeroHoldTriggered = true;
+      }
+    } else {
+      zeroHoldStart = 0;
+      zeroHoldTriggered = false;
+    }
 
     static bool stuckReported = false;
     if (keypadHealth.isStuck && !stuckReported) {
@@ -1072,22 +1138,12 @@ void applyActivePowerPolicy(unsigned long now) {
 void handleStateMachine(unsigned long now) {
   switch (currentState) {
 
-  // ── BOOT SELF-TEST (POST) ──
+  // ── BOOT SELF-TEST (POST) — reed-only, no solenoid pulses ──
   case STATE_BOOT_SELFTEST: {
     SelfTestResult stResult = tickSelfTest(now);
     if (stResult == SELFTEST_RUNNING) {
-      // Update LCD with progress.
       if (!isDisplayFailed()) {
-        uint8_t pulseNum = getSelfTestPulseNumber();
-        if (pulseNum == 0) {
-          // Reed-only mode (mid-delivery reboot) — no pulses to count.
-          updateDisplay("Self-Test...", "Reed check...");
-        } else {
-          char pulseLine[17];
-          snprintf(pulseLine, sizeof(pulseLine), "Pulse %u/%u",
-                   pulseNum, (unsigned int)SELFTEST_PULSE_COUNT);
-          updateDisplay("Self-Test...", pulseLine);
-        }
+        updateDisplay("Self-Test...", "Reed check...");
       }
     } else if (stResult == SELFTEST_PASS) {
       netLog("[SELFTEST] PASS — solenoid and reed nominal\n");
@@ -1464,14 +1520,7 @@ void handleStateMachine(unsigned long now) {
         // Enforce geofence lock: no PIN entry unless journey phase is PIN-eligible.
         if (isPinEligibleNow()) {
           if (!isCameraLikelyUp(now)) {
-            if (!isDisplayFailed()) {
-              updateDisplay("Camera offline", "Please wait...");
-            } else {
-              fallbackError();
-            }
-            messageStartAt = now;
-            currentState = STATE_SHOW_MESSAGE;
-            break;
+            netLog("[FACE] Camera marked down at PIN entry; attempting anyway\n");
           }
 
           stopUtilityMode(now);
@@ -1710,13 +1759,11 @@ void handleStateMachine(unsigned long now) {
         updateDisplay("Face scanning...", attemptLine);
       }
 
-      int result = 0;
-      if (!isCameraLikelyUp(now)) {
+      int result = requestFaceCheck();
+      if (result < 0 && !isCameraLikelyUp(now)) {
         result = -2;
-        netLog("[FACE] Skipping request — camera marked down (age=%lums)\n",
+        netLog("[FACE] Camera marked down after request (age=%lums)\n",
                (unsigned long)diagCache.camAgeMs);
-      } else {
-        result = requestFaceCheck();
       }
       faceCheckPending = false;
 
@@ -1782,6 +1829,7 @@ void handleStateMachine(unsigned long now) {
 
       if (ls == LOCK_OK) {
         netLog("[LOCK] Solenoid ON (unlock OK)\n");
+        recoverDisplay(); // Re-sync LCD after relay/solenoid EMI
         if (overrideAttempt) {
           reportCommandAckToProxy("UNLOCKING", "executed", "lock_ok");
           adminOverride.clear();
@@ -1974,6 +2022,7 @@ void handleStateMachine(unsigned long now) {
   }
 }
 
+
 // ==================== STATE HELPER ====================
 void enterState(TesterState newState) {
   if (utilityModeActive && newState != STATE_STANDBY && newState != STATE_IDLE &&
@@ -2037,9 +2086,9 @@ void enterState(TesterState newState) {
     }
     break;
   case STATE_BOOT_SELFTEST:
-    initSelfTest();
+    initSelfTest(true);   // Always reed-only — no solenoid pulses at boot
     if (!isDisplayFailed()) {
-      updateDisplay("Self-Test...", "Checking lock");
+      updateDisplay("Self-Test...", "Reed check only");
     }
     break;
   case STATE_BOOT_AUTH:

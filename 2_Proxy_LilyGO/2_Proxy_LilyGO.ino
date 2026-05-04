@@ -13,6 +13,11 @@
 #include <WiFiUdp.h>
 #include "mbedtls/sha256.h"
 
+#include "LogTee.h"
+
+SerialTee LogSerial(Serial);
+#define Serial LogSerial
+
 // TinyGSM - MUST define modem BEFORE include
 #define TINY_GSM_MODEM_A7672X
 #define TINY_GSM_RX_BUFFER 1024
@@ -105,6 +110,7 @@ double gpsHdop = 99.9; // Horizontal Dilution of Precision (99.9 = unknown)
 float  gpsSpeed = 0.0f; // Speed in knots from CGNSSINFO, converted to m/s
 float  gpsCourse = -1.0f; // Course over ground in degrees (0-360), -1 = invalid/stationary
 bool gpsFix = false;
+int gpsSats = 0;
 int cachedSignalRssi = -999;
 int cachedSignalCsq = -1;
 unsigned long dataBytesOut = 0; // Total bytes sent to Firebase
@@ -183,6 +189,45 @@ uint8_t contextFetchFailCount = 0;
 WiFiUDP udpServer;
 #define UDP_LOG_PORT 5114
 
+// TCP log mirror (wireless Serial)
+#define LOG_TCP_PORT 7777
+static WiFiServer logServer(LOG_TCP_PORT);
+static WiFiClient logClient;
+static bool logServerStarted = false;
+
+static void startLogServer() {
+  if (logServerStarted) return;
+  logServer.begin();
+  logServer.setNoDelay(true);
+  logServerStarted = true;
+  Serial.printf("[LOG] TCP server on %s:%d\n",
+                WiFi.softAPIP().toString().c_str(), LOG_TCP_PORT);
+}
+
+static void pollLogServer() {
+  if (!logServerStarted) return;
+
+  if (!logClient || !logClient.connected()) {
+    WiFiClient next = logServer.available();
+    if (next) {
+      logClient.stop();
+      logClient = next;
+      logClient.setNoDelay(true);
+      LogSerial.setMirrorClient(&logClient);
+      Serial.println("[LOG] Client connected");
+    }
+  }
+
+  if (logClient && !logClient.connected()) {
+    LogSerial.setMirrorClient(NULL);
+    logClient.stop();
+  }
+
+  while (logClient && logClient.connected() && logClient.available()) {
+    logClient.read();
+  }
+}
+
 // ESP32-CAM IP tracking (for face-check forwarding)
 IPAddress camClientIP;
 static bool extractJsonStringValue(const char *json, const char *key,
@@ -216,9 +261,20 @@ static bool extractJsonStringValue(const char *json, const char *key,
 bool camClientKnown = false;
 #define CAM_FACE_PORT 80 // ESP32-CAM runs a tiny HTTP server on port 80
 static unsigned long camLastSeenAt = 0;
-#define CAM_LIVENESS_STALE_MS 30000
+#define CAM_LIVENESS_STALE_MS 120000
 static unsigned long controllerLastSeenAt = 0;
 #define CONTROLLER_LIVENESS_STALE_MS 30000
+#define PHONE_LOC_FETCH_INTERVAL_MS 3000UL
+#define PHONE_LOC_MAX_AGE_SEC 30UL
+
+static double phoneLat = 0.0;
+static double phoneLon = 0.0;
+static float phoneAccuracy = -1.0f;
+static uint64_t phoneTimestampMs = 0;
+static unsigned long phoneFetchedAtMs = 0;
+static bool phoneFixValid = false;
+static unsigned long lastPhoneFetchAtMs = 0;
+static unsigned long lastPhoneFallbackLogAtMs = 0;
 
 enum ConnectivityMatrixState : uint8_t {
   CONN_ALL_UP = 0,
@@ -283,6 +339,13 @@ static void clearDeliveryContextCaches(const char *reason, bool patchHardware) {
   lastDeliveryIdSeenAtMs = 0;
   deliveryContextValidated = true;
   contextFetchFailCount = 0;
+
+  phoneLat = 0.0;
+  phoneLon = 0.0;
+  phoneAccuracy = -1.0f;
+  phoneTimestampMs = 0;
+  phoneFetchedAtMs = 0;
+  phoneFixValid = false;
 
   dpClearDeliveryContext();
   persistedContextHashReady = false;
@@ -589,6 +652,7 @@ void readGPS() {
   String resp = "";
   if (modem.waitResponse(2000L, resp) != 1) {
     gpsFix = false;
+    gpsSats = 0;
     Serial.println("GPS: No response from +CGNSSINFO");
     return;
   }
@@ -596,6 +660,7 @@ void readGPS() {
   int idx = resp.indexOf("+CGNSSINFO: ");
   if (idx < 0) {
     gpsFix = false;
+    gpsSats = 0;
     Serial.println("GPS: No +CGNSSINFO in response");
     Serial.println("  Raw: " + resp);
     return;
@@ -613,6 +678,7 @@ void readGPS() {
 
   if (data.length() < 10 || data.startsWith(",,,")) {
     gpsFix = false;
+    gpsSats = 0;
     return;
   }
 
@@ -631,9 +697,22 @@ void readGPS() {
 
   if (commaCount < 8) {
     gpsFix = false;
+    gpsSats = 0;
     Serial.println("GPS: Not enough fields in response");
     return;
   }
+
+  int gpsSat = 0;
+  int gnssSat = 0;
+  if (commaCount >= 3) {
+    String gpsSatStr = data.substring(commas[0] + 1, commas[1]);
+    String gnssSatStr = data.substring(commas[1] + 1, commas[2]);
+    gpsSatStr.trim();
+    gnssSatStr.trim();
+    gpsSat = gpsSatStr.toInt();
+    gnssSat = gnssSatStr.toInt();
+  }
+  gpsSats = (gnssSat > gpsSat) ? gnssSat : gpsSat;
 
   // Extract fields: latitude is field 5, longitude is field 7
   String latStr = data.substring(commas[4] + 1, commas[5]);
@@ -693,11 +772,13 @@ void readGPS() {
 
     static unsigned long lastFixDebug = 0;
     if (millis() - lastFixDebug >= 30000) {
-      Serial.printf("GPS Parsed: %.6f, %.6f (Fix acquired!)\n", gpsLat, gpsLon);
+      Serial.printf("GPS Parsed: %.6f, %.6f (Fix acquired, sats=%d)\n",
+                    gpsLat, gpsLon, gpsSats);
       lastFixDebug = millis();
     }
   } else {
     gpsFix = false;
+    gpsSats = 0;
   }
 }
 
@@ -2318,6 +2399,139 @@ static bool readTopLevelJsonInt(const String &json, const char *key, int &outVal
   return false;
 }
 
+static bool readTopLevelJsonDouble(const String &json, const char *key, double &outVal) {
+  String token = "\"" + String(key) + "\":";
+  int depth = 0;
+  bool inString = false;
+  bool escaped = false;
+
+  for (int i = 0; i < json.length(); i++) {
+    char c = json[i];
+
+    if (!inString && c == '{') {
+      depth++;
+    } else if (!inString && c == '}') {
+      depth--;
+    }
+
+    if (!inString && depth == 1 && c == '"' && json.startsWith(token, i)) {
+      int v = i + token.length();
+      while (v < json.length() &&
+             (json[v] == ' ' || json[v] == '\t' || json[v] == '\r' ||
+              json[v] == '\n')) {
+        v++;
+      }
+      if (v >= json.length()) {
+        return false;
+      }
+
+      bool quoted = (json[v] == '"');
+      if (quoted) {
+        v++;
+      }
+
+      String value = "";
+      bool valEscaped = false;
+      for (; v < json.length(); v++) {
+        char ch = json[v];
+        if (quoted) {
+          if (valEscaped) {
+            value += ch;
+            valEscaped = false;
+          } else if (ch == '\\') {
+            valEscaped = true;
+          } else if (ch == '"') {
+            break;
+          } else {
+            value += ch;
+          }
+        } else {
+          if (ch == ',' || ch == '}' || ch == '\r' || ch == '\n' ||
+              ch == ' ' || ch == '\t') {
+            break;
+          }
+          value += ch;
+        }
+      }
+
+      value.trim();
+      if (value.length() == 0 || value == "null") {
+        return false;
+      }
+      outVal = value.toDouble();
+      return true;
+    }
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (c == '\\') {
+        escaped = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (c == '"') {
+      inString = true;
+      continue;
+    }
+  }
+
+  return false;
+}
+
+static double haversineMeters(double lat1, double lon1, double lat2, double lon2) {
+  const double R = 6371000.0;
+  double dLat = (lat2 - lat1) * PI / 180.0;
+  double dLon = (lon2 - lon1) * PI / 180.0;
+  double a = sin(dLat / 2.0) * sin(dLat / 2.0) +
+             cos(lat1 * PI / 180.0) * cos(lat2 * PI / 180.0) *
+             sin(dLon / 2.0) * sin(dLon / 2.0);
+  return R * 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+}
+
+static bool refreshPhoneLocationIfNeeded() {
+  unsigned long nowMs = millis();
+  if (nowMs - lastPhoneFetchAtMs < PHONE_LOC_FETCH_INTERVAL_MS) {
+    return phoneFixValid;
+  }
+  lastPhoneFetchAtMs = nowMs;
+
+  char phonePath[64];
+  snprintf(phonePath, sizeof(phonePath), "/locations/%s/phone.json", HARDWARE_ID);
+  String body = httpGetFromFirebase(phonePath);
+  body.trim();
+
+  if (body.length() == 0 || body == "null") {
+    phoneFixValid = false;
+    return false;
+  }
+
+  double lat = 0.0, lon = 0.0, acc = 0.0, ts = 0.0;
+  bool latOk = readTopLevelJsonDouble(body, "latitude", lat) ||
+               readTopLevelJsonDouble(body, "lat", lat);
+  bool lonOk = readTopLevelJsonDouble(body, "longitude", lon) ||
+               readTopLevelJsonDouble(body, "lon", lon) ||
+               readTopLevelJsonDouble(body, "lng", lon);
+  bool accOk = readTopLevelJsonDouble(body, "accuracy", acc);
+  bool tsOk = readTopLevelJsonDouble(body, "timestamp", ts);
+
+  if (!latOk || !lonOk) {
+    phoneFixValid = false;
+    return false;
+  }
+
+  phoneLat = lat;
+  phoneLon = lon;
+  phoneAccuracy = accOk ? (float)acc : -1.0f;
+  phoneTimestampMs = (tsOk && ts > 0) ? (uint64_t)ts : 0;
+  phoneFetchedAtMs = nowMs;
+  phoneFixValid = true;
+  return true;
+}
+
 static bool constantTimeEquals(const char *a, const char *b) {
   if (!a || !b) return false;
   size_t lenA = strlen(a);
@@ -3823,6 +4037,7 @@ void handleCameraClient() {
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/otp")) {
     controllerLastSeenAt = millis();
     String otpPart, delPart;
+    unsigned long nowMs = millis();
 
     // Compute geofence state for structured response fields.
     bool insideGeo = false;
@@ -3845,6 +4060,11 @@ void handleCameraClient() {
       delPart = deliveryIdCacheValid ? String(cachedDeliveryId) : "NO_DELIVERY";
 
       // Still calculate geofence status for the response fields (LCD distance display)
+      // Diagnostic: log preconditions for geofence so serial monitor reveals why
+      // the controller is seeing "No GPS" when it shouldn't be.
+      Serial.printf("[AP] GEO pre: destValid=%d gpsFix=%d delStatus='%s'\n",
+                    destCoordsValid, gpsFix, cachedDeliveryStatus);
+
       if (destCoordsValid && gpsFix) {
         // During return mode the geofence target is already swapped to pickup
         // coords (see EC-32 target swap). Use isNearAnyTarget() so the distance
@@ -3854,13 +4074,100 @@ void handleCameraClient() {
                           : geoProxy.isNearDropoff(gpsLat, gpsLon);
         insideGeo = atTarget;
         distMeters = (int)geoProxy.snap.distanceM;
+      } else if (destCoordsValid && !gpsFix) {
+        // GPS-loss fallback: preserve the last confirmed geofence state.
+        // The GeofenceProxy hysteresis state machine (EC-94) retains its
+        // stableState across GPS outages — if arrival was previously
+        // confirmed with 3 consecutive inner-radius samples, losing GPS
+        // does not invalidate that (the box hasn't physically moved).
+        // This prevents "No GPS / Not at destination" lockout indoors.
+        insideGeo = geoProxy.isArrived();
+        bool usedLastConfirmed = insideGeo;
+        bool usedPhoneFallback = false;
+        distMeters = (int)geoProxy.snap.distanceM;
+
+        bool phoneOk = phoneFixValid;
+        bool phoneFresh = false;
+        unsigned long phoneAgeSec = 0;
+        if (phoneOk) {
+          unsigned long nowEpoch = getCurrentEpoch();
+          if (phoneTimestampMs > 0 && nowEpoch > 0) {
+            unsigned long phoneEpochSec = (unsigned long)(phoneTimestampMs / 1000ULL);
+            if (nowEpoch >= phoneEpochSec) {
+              phoneAgeSec = nowEpoch - phoneEpochSec;
+            }
+            phoneFresh = (phoneAgeSec <= PHONE_LOC_MAX_AGE_SEC);
+          } else {
+            phoneAgeSec = (nowMs - phoneFetchedAtMs) / 1000UL;
+            phoneFresh = (phoneAgeSec <= PHONE_LOC_MAX_AGE_SEC);
+          }
+        }
+
+        if (phoneOk && phoneFresh) {
+          double distDrop = haversineMeters(phoneLat, phoneLon,
+                                            geoProxy.targetLat, geoProxy.targetLon);
+          double distPick = distDrop;
+          if (geoProxy.pickupSet) {
+            distPick = haversineMeters(phoneLat, phoneLon,
+                                       geoProxy.pickupLat, geoProxy.pickupLon);
+          }
+          double distActive = distDrop;
+          if (returnActive && geoProxy.pickupSet && distPick < distActive) {
+            distActive = distPick;
+          }
+
+          bool atTarget = returnActive
+                            ? geoProxy.isNearAnyTarget(phoneLat, phoneLon)
+                            : geoProxy.isNearDropoff(phoneLat, phoneLon);
+          if (!insideGeo) {
+            insideGeo = atTarget;
+          }
+          distMeters = (int)(distActive + 0.5);
+          usedPhoneFallback = true;
+
+          if (nowMs - lastPhoneFallbackLogAtMs >= 10000) {
+            Serial.printf("[AP] Phone fallback: age=%lus dist=%dm acc=%.1fm\n",
+                          phoneAgeSec, distMeters, phoneAccuracy);
+            lastPhoneFallbackLogAtMs = nowMs;
+          }
+        } else if (phoneOk && !phoneFresh) {
+          if (nowMs - lastPhoneFallbackLogAtMs >= 10000) {
+            Serial.printf("[AP] Phone fallback stale: age=%lus (max %lus)\n",
+                          phoneAgeSec, PHONE_LOC_MAX_AGE_SEC);
+            lastPhoneFallbackLogAtMs = nowMs;
+          }
+        }
+
+        // Secondary fallback: if the box NEVER had a GPS fix (booted indoors),
+        // geoProxy.isArrived() will be false (default GEO_OUTSIDE). Check the
+        // Firebase delivery status — if the mobile app reports ARRIVED, the
+        // rider's phone GPS already confirmed the geofence. Trust that signal.
+        if (!insideGeo && strcmp(cachedDeliveryStatus, "ARRIVED") == 0) {
+          insideGeo = true;
+          distMeters = 0;
+          Serial.println("[AP] GPS-loss fallback: Firebase status ARRIVED, granting GEO:1");
+        } else if (insideGeo && usedLastConfirmed && !usedPhoneFallback) {
+          Serial.println("[AP] GPS-loss fallback: using last confirmed ARRIVED state");
+        }
+      } else if (!destCoordsValid && deliveryIdCacheValid) {
+        // Destination coords missing (Firebase JSON truncated, field not yet
+        // written, or response parsing failure). Fall back to Firebase delivery
+        // status from the mobile app — if it says ARRIVED, the phone GPS has
+        // already verified the geofence.
+        if (strcmp(cachedDeliveryStatus, "ARRIVED") == 0) {
+          insideGeo = true;
+          distMeters = 0;
+          Serial.println("[AP] No dest coords — Firebase ARRIVED override, granting GEO:1");
+        } else {
+          Serial.printf("[AP] No dest coords, delivery active but status='%s' — GEO:0\n",
+                        cachedDeliveryStatus);
+        }
       }
     }
 
     String body = otpPart + "," + delPart;
 
     // Append remote status command (UNLOCKING/LOCKED/REBOOT_ALL) if pending.
-    unsigned long nowMs = millis();
     bool statusActive =
         cachedStatusStage == CMD_STAGE_PENDING && cachedStatus[0] != '\0';
 
@@ -4702,6 +5009,7 @@ void setup() {
                   CAM_SERVER_PORT);
     Serial.printf("[AP] ESP32-CAM should connect to SSID '%s' / '%s'\n",
                   AP_SSID, AP_PASS);
+    startLogServer();
   }
 
   // â”€â”€ POST-LTE: Retry AGPS + XTRA now that data is available â”€â”€
@@ -4847,6 +5155,7 @@ void loop() {
   // Handle incoming camera image upload (non-blocking when idle)
   if (apStarted) {
     handleCameraClient();
+    pollLogServer();
 
     // Check for incoming UDP logs
     int packetSize = udpServer.parsePacket();
@@ -4941,7 +5250,7 @@ void loop() {
 
   // ── Geofence + Theft updates (piggyback on GPS fix) ──
   if (gpsFix) {
-    geoProxy.update(gpsLat, gpsLon, gpsHdop, 0);
+    geoProxy.update(gpsLat, gpsLon, gpsHdop, gpsSats);
 
     bool ignitionOn = (deliveryIdCacheValid && cachedDeliveryId[0] != '\0');
     theftGuardUpdate((float)gpsLat, (float)gpsLon, gpsSpeed, ignitionOn, now);
@@ -4952,6 +5261,10 @@ void loop() {
                     theftGuardStateStr());
       prevTheftState = curTheft;
     }
+  }
+
+  if (lteConnected && deliveryIdCacheValid) {
+    refreshPhoneLocationIfNeeded();
   }
 
   // ── EC-78: Reassignment auto-ack ──

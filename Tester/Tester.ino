@@ -163,8 +163,14 @@ void setup() {
 
   // LCD init — reliable sequence for ESP32 + I2C HD44780 backpack
   Wire.begin(21, 22); // Explicit SDA/SCL pins for ESP32 DevKit
-  delay(500);         // Allow LCD Vcc rail to fully stabilise before any I2C
-  lcd.begin();        // <-- Changed from begin() to init()!
+  Wire.setClock(100000);
+  delay(800);         // Allow LCD Vcc rail to fully stabilise before any I2C
+  for (int i = 0; i < 2; i++) {
+    lcd.begin();
+    delay(50);
+    lcd.clear();
+    lcd.home();
+  }
   lcd.backlight();
   updateDisplay("Parcel-Safe v2", "Connecting WiFi");
 

@@ -31,36 +31,63 @@ static QueueHandle_t keyQueue = NULL;
 // read by main loop on Core 0 for EC-82 stuck detection).
 static volatile char heldKeyAtomic = 0;
 
+static void initLcdSequence(bool fast) {
+  Wire.begin(21, 22);
+  Wire.setClock(100000);
+  delay(fast ? 20 : 800); // Fast re-sync after noise vs cold-boot settle
+  for (int i = 0; i < 2; i++) {
+    lcd.begin();
+    delay(fast ? 20 : 50);
+    lcd.clear();
+    lcd.home();
+  }
+  lcd.backlight();
+  lcdBacklightEnabled = true;
+}
+
 static void keypadTask(void *pvParameters) {
   while (true) {
-    char k = keypad.getKey();
-    if (k) {
-      xQueueSend(keyQueue, &k, 0); // Non-blocking send
-      Serial.printf("[KEYPAD] Buffered: %c\n", k);
+    // getKeys() scans all keys and advances each key's state machine
+    // (IDLE → PRESSED → HOLD → RELEASED). Unlike getKey(), it does NOT
+    // consume the event — allowing HOLD to be detected reliably.
+    if (keypad.getKeys()) {
+      for (int i = 0; i < LIST_MAX; i++) {
+        if (!keypad.key[i].stateChanged) continue;
+
+        KeyState st = keypad.key[i].kstate;
+        char     kc = keypad.key[i].kchar;
+
+        if (st == PRESSED && kc != 0) {
+          xQueueSend(keyQueue, &kc, 0);
+          Serial.printf("[KEYPAD] Buffered: %c\n", kc);
+        }
+      }
     }
-    // Track held key for EC-82 stuck detection (same core as getKey).
-    KeyState st = keypad.getState();
-    if (st == HOLD && keypad.key[0].kchar != 0) {
-      heldKeyAtomic = keypad.key[0].kchar;
-    } else if (st == IDLE) {
-      heldKeyAtomic = 0;
+
+    // Track held key for EC-82 stuck detection + long-press '0' LCD recovery.
+    // Scan all key slots — the first one in HOLD state wins.
+    char held = 0;
+    for (int i = 0; i < LIST_MAX; i++) {
+      if (keypad.key[i].kstate == HOLD && keypad.key[i].kchar != 0) {
+        held = keypad.key[i].kchar;
+        break;
+      }
     }
-    vTaskDelay(pdMS_TO_TICKS(20)); // Poll every 20ms
+    heldKeyAtomic = held;
+
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
 // ==================== INIT ====================
 void initHardwareIO() {
   keypad.setDebounceTime(50);
+  keypad.setHoldTime(500);  // HOLD state after 500ms (long-press '0' checks 1200ms separately)
   
   keyQueue = xQueueCreate(10, sizeof(char));
   xTaskCreatePinnedToCore(keypadTask, "KeypadTask", 2048, NULL, 2, NULL, 1);
 
-  Wire.begin(21, 22);
-  delay(500);           // LCD Vcc rail settle time
-  lcd.begin();
-  lcd.backlight();
-  lcdBacklightEnabled = true;
+  initLcdSequence(false);
   updateDisplay("Parcel-Safe v2", "Connecting WiFi");
 
   Serial2.begin(CAM_UART_BAUD, SERIAL_8N1, CAM_UART_RX, CAM_UART_TX);
@@ -91,6 +118,10 @@ void displayBacklightOff() {
     lcd.noBacklight();
     lcdBacklightEnabled = false;
   }
+}
+
+void recoverDisplay() {
+  initLcdSequence(true);
 }
 
 bool toggleBacklightOverride() {

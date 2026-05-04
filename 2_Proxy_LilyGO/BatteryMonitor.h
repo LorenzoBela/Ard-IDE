@@ -2,8 +2,8 @@
  * BatteryMonitor.h — Dual-channel battery voltage monitoring
  *
  * Hardware (this project setup):
- *   Channel A (GPIO34): 7.5V 2S Li-ion pack via voltage sensor module
- *   Channel B (GPIO35): 12V  3S Li-ion pack via voltage sensor module
+ *   Channel A (GPIO35): 7.5V 2S Li-ion pack via voltage sensor module
+ *   Channel B (GPIO34): 12V  3S Li-ion pack via voltage sensor module
  *
  * Both use standard "DC 0-25V Voltage Sensor Modules" (30kΩ/7.5kΩ divider,
  * multiply-back ratio = 5.0).  The modules output 0–5V proportional to
@@ -17,14 +17,14 @@
 
 // ── Channel identifiers ──
 enum BattChannel : uint8_t {
-  BATT_CH_A = 0,   // 7.5V pack on GPIO34
-  BATT_CH_B = 1,   // 12V pack on GPIO35
+  BATT_CH_A = 0,   // 7.5V pack on GPIO35
+  BATT_CH_B = 1,   // 12V pack on GPIO34
   BATT_CH_COUNT = 2
 };
 
 // ── Pin assignments ──
-#define BATT_PIN_A            34
-#define BATT_PIN_B            35
+#define BATT_PIN_A            35
+#define BATT_PIN_B            34
 
 // ── Voltage sensor module divider ratio ──
 // Module: 30kΩ (R1) + 7.5kΩ (R2) → ratio = (30+7.5)/7.5 = 5.0
