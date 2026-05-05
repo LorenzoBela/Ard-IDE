@@ -147,6 +147,8 @@ char cachedPersonalPinHashMcu[65] = "";
 char cachedPersonalPinSalt[33] = "";
 char cachedPersonalPinRiderId[64] = "";
 bool personalPinEnabled = false;
+static unsigned long lastPairingPinSyncAt = 0;
+#define PIN_PAIRING_SYNC_MIN_MS 10000
 // EC-FIX: Remote lock/unlock status command from Firebase (UNLOCKING/LOCKED)
 char cachedStatus[16] = "";
 unsigned long cachedStatusSetAt = 0;
@@ -436,6 +438,7 @@ String httpGetFromFirebase(const char *path);
 bool writeCommandAckToFirebase(const char *command, const char *status,
                                const char *details);
 static bool refreshPersonalPinRuntimeFromFirebase(bool logDetails, bool force);
+static bool syncPersonalPinRuntimeWithActivePairing(bool logDetails, bool force);
 void scheduleModemRecovery(const char *reason);
 void modemRecoveryTask(void *);
 void maybeEvaluateConnectivityMatrix(unsigned long now);
@@ -4479,25 +4482,42 @@ void handleCameraClient() {
 
     char pin[12] = "";
     extractJsonStringValue(jsonBuf, "pin", pin, sizeof(pin));
+    char reqBoxId[16] = "";
+    extractJsonStringValue(jsonBuf, "box_id", reqBoxId, sizeof(reqBoxId));
     bool currentlyLocked = (strstr(jsonBuf, "\"currently_locked\":true") != NULL);
 
     const char *resultBody = "DENY:invalid";
     bool verified = false;
     bool refreshed = false;
 
-    if (!personalPinEnabled || cachedPersonalPinHashMcu[0] == '\0' ||
-        cachedPersonalPinSalt[0] == '\0' || cachedPersonalPinRiderId[0] == '\0') {
+    if (reqBoxId[0] != '\0' && strcmp(reqBoxId, HARDWARE_ID) != 0) {
+      resultBody = "DENY:box_mismatch";
+    } else if (lteConnected) {
+      if (syncPersonalPinRuntimeWithActivePairing(true, true)) {
+        refreshed = true;
+      } else {
+        resultBody = "DENY:sync_failed";
+      }
+    } else if (!lteConnected &&
+               (!personalPinEnabled || cachedPersonalPinHashMcu[0] == '\0' ||
+                cachedPersonalPinSalt[0] == '\0' || cachedPersonalPinRiderId[0] == '\0')) {
       refreshed = refreshPersonalPinRuntimeFromFirebase(true, true);
     }
 
-    if (!personalPinEnabled) {
+    if (strncmp(resultBody, "DENY:", 5) == 0 &&
+        strcmp(resultBody, "DENY:invalid") != 0) {
+      // A specific denial reason was already selected above.
+    } else if (!personalPinEnabled) {
       resultBody = "DENY:disabled";
     } else if (pin[0] == '\0') {
       resultBody = "DENY:missing_pin";
     } else {
       verified = verifyPersonalPinLocal(pin);
       if (!verified && !refreshed) {
-        if (refreshPersonalPinRuntimeFromFirebase(true, true)) {
+        bool retryRefreshOk = lteConnected
+                                  ? syncPersonalPinRuntimeWithActivePairing(true, true)
+                                  : refreshPersonalPinRuntimeFromFirebase(true, true);
+        if (retryRefreshOk) {
           refreshed = true;
           verified = verifyPersonalPinLocal(pin);
         }
@@ -4978,6 +4998,388 @@ static bool fetchFirebaseBoolValue(const char *path, bool &out, bool &hasValue) 
   return parseFirebaseBoolValue(body, out, hasValue);
 }
 
+static bool httpGetSupabaseRest(const String &pathAndQuery, String &bodyOut,
+                                int &httpStatus) {
+  bodyOut = "";
+  httpStatus = 0;
+  if (!lteConnected) return false;
+
+  String resp;
+  sendATAndWait("+HTTPTERM", 1000);
+  delay(100);
+
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(5000L, resp) != 1) return false;
+
+  modem.sendAT("+HTTPPARA=\"CID\",1");
+  modem.waitResponse(3000L);
+
+  String url = String(SUPABASE_URL) + "/rest/v1/" + pathAndQuery;
+  modem.sendAT(("+HTTPPARA=\"URL\",\"" + url + "\"").c_str());
+  modem.waitResponse(3000L);
+
+  String hdrs = String("apikey: ") + SUPABASE_ANON_KEY +
+                "\r\nAuthorization: Bearer " + SUPABASE_ANON_KEY;
+  modem.sendAT(("+HTTPPARA=\"USERDATA\",\"" + hdrs + "\"").c_str());
+  modem.waitResponse(3000L);
+
+  modem.sendAT("+CSSLCFG=\"sslversion\",1,4");
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"ignorertctime\",1,1");
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"authmode\",1,0");
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"enableSNI\",1,1");
+  modem.waitResponse(2000L);
+  modem.sendAT("+HTTPPARA=\"SSLCFG\",1");
+  modem.waitResponse(2000L);
+  modem.sendAT("+HTTPSSL=1");
+  modem.waitResponse(3000L);
+
+  modem.sendAT("+HTTPACTION=0");
+  unsigned long waitStart = millis();
+  bool actionOK = false;
+  int totalResponseLen = 0;
+  while (millis() - waitStart < 15000) {
+    if (apStarted) handleCameraClient();
+    if (modem.stream.available()) {
+      String line = modem.stream.readStringUntil('\n');
+      line.trim();
+      if (line.indexOf("+HTTPACTION:") >= 0) {
+        int c1 = line.indexOf(',');
+        int c2 = line.indexOf(',', c1 + 1);
+        if (c1 > 0 && c2 > 0) {
+          httpStatus = line.substring(c1 + 1, c2).toInt();
+          totalResponseLen = line.substring(c2 + 1).toInt();
+        }
+        actionOK = true;
+        break;
+      }
+    }
+    delay(50);
+    esp_task_wdt_reset();
+  }
+
+  if (actionOK && httpStatus >= 200 && httpStatus <= 299) {
+    int readLen = totalResponseLen > 0 ? min(totalResponseLen, 1024) : 1024;
+    char readCmd[40];
+    snprintf(readCmd, sizeof(readCmd), "AT+HTTPREAD=0,%d\r\n", readLen);
+    modem.stream.print(readCmd);
+
+    int dataLen = -1;
+    unsigned long t0 = millis();
+    while (millis() - t0 < 6000) {
+      if (apStarted) handleCameraClient();
+      if (modem.stream.available()) {
+        String line = modem.stream.readStringUntil('\n');
+        line.trim();
+        if (line.indexOf("+HTTPREAD:") >= 0) {
+          int comma = line.lastIndexOf(',');
+          if (comma >= 0) {
+            dataLen = line.substring(comma + 1).toInt();
+          } else {
+            int colon = line.lastIndexOf(':');
+            if (colon >= 0) dataLen = line.substring(colon + 1).toInt();
+          }
+          break;
+        }
+      }
+      esp_task_wdt_reset();
+    }
+
+    int toRead = (dataLen > 0 && dataLen <= readLen) ? dataLen : readLen;
+    unsigned long t1 = millis();
+    while ((int)bodyOut.length() < toRead && millis() - t1 < 5000) {
+      while (modem.stream.available() && (int)bodyOut.length() < toRead) {
+        bodyOut += (char)modem.stream.read();
+      }
+      esp_task_wdt_reset();
+    }
+
+    delay(50);
+    while (modem.stream.available()) modem.stream.read();
+  }
+
+  sendATAndWait("+HTTPTERM", 1000);
+  return actionOK && httpStatus >= 200 && httpStatus <= 299;
+}
+
+static void saveDisabledPersonalPinForRider(const char *riderId) {
+  clearPersonalPinRuntimeCache(true);
+  if (!riderId || riderId[0] == '\0') return;
+
+  strncpy(cachedPersonalPinRiderId, riderId, sizeof(cachedPersonalPinRiderId) - 1);
+  cachedPersonalPinRiderId[sizeof(cachedPersonalPinRiderId) - 1] = '\0';
+
+  uint32_t nextPinHash =
+      buildPersonalPinContextHash(false, "", "", cachedPersonalPinRiderId);
+  if (!persistedPinContextHashReady || nextPinHash != lastPersistedPinContextHash) {
+    dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+    lastPersistedPinContextHash = nextPinHash;
+    persistedPinContextHashReady = true;
+  }
+}
+
+static void patchPersonalPinRuntimeToHardware(bool enabled,
+                                              const char *riderId,
+                                              const char *hashHex,
+                                              const char *salt) {
+  if (!lteConnected) return;
+
+  char path[64];
+  snprintf(path, sizeof(path), "/hardware/%s.json", HARDWARE_ID);
+
+  char json[360];
+  unsigned long updatedAt = getCurrentEpoch();
+  if (updatedAt == 0) updatedAt = millis() / 1000UL;
+
+  if (enabled && riderId && riderId[0] != '\0' && hashHex && hashHex[0] != '\0' &&
+      salt && salt[0] != '\0') {
+    snprintf(json, sizeof(json),
+             "{\"personal_pin_enabled\":true,"
+             "\"personal_pin_hash_mcu\":\"%s\","
+             "\"personal_pin_salt\":\"%s\","
+             "\"current_rider_id\":\"%s\","
+             "\"personal_pin_updated_at\":%lu}",
+             hashHex, salt, riderId, updatedAt);
+  } else if (riderId && riderId[0] != '\0') {
+    snprintf(json, sizeof(json),
+             "{\"personal_pin_enabled\":false,"
+             "\"personal_pin_hash_mcu\":null,"
+             "\"personal_pin_salt\":null,"
+             "\"current_rider_id\":\"%s\","
+             "\"personal_pin_updated_at\":%lu}",
+             riderId, updatedAt);
+  } else {
+    snprintf(json, sizeof(json),
+             "{\"personal_pin_enabled\":false,"
+             "\"personal_pin_hash_mcu\":null,"
+             "\"personal_pin_salt\":null,"
+             "\"current_rider_id\":null,"
+             "\"personal_pin_updated_at\":%lu}",
+             updatedAt);
+  }
+
+  httpPatchWithRetry(path, json);
+}
+
+static bool fetchActivePairingRiderFromFirebase(char *riderOut, size_t riderLen,
+                                                bool &hasActivePairing) {
+  if (!riderOut || riderLen == 0) return false;
+  riderOut[0] = '\0';
+  hasActivePairing = false;
+  if (!lteConnected) return false;
+
+  char path[96];
+  snprintf(path, sizeof(path), "/pairings/%s.json", HARDWARE_ID);
+  String body = httpGetFromFirebase(path);
+  body.trim();
+  if (body.length() == 0) return false;
+  if (body == "null") return true;
+
+  char status[16] = "";
+  if (!readTopLevelJsonString(body, "status", status, sizeof(status))) {
+    return true;
+  }
+
+  if (strcmp(status, "ACTIVE") != 0 && strcmp(status, "active") != 0) {
+    return true;
+  }
+
+  if (!readTopLevelJsonString(body, "rider_id", riderOut, riderLen) ||
+      riderOut[0] == '\0') {
+    return true;
+  }
+
+  hasActivePairing = true;
+  return true;
+}
+
+static int8_t refreshPersonalPinRuntimeFromSupabaseProfile(const char *riderId,
+                                                           bool logDetails) {
+  if (!riderId || riderId[0] == '\0') return -1;
+
+  String body;
+  int httpStatus = 0;
+  String query = "profiles?id=eq." + String(riderId) +
+                 "&select=personal_pin_enabled%2Cpersonal_pin_hash_mcu%2Cpersonal_pin_salt";
+  if (!httpGetSupabaseRest(query, body, httpStatus)) {
+    if (logDetails) {
+      Serial.printf("[PIN] Supabase profile refresh failed HTTP %d\n", httpStatus);
+    }
+    return -1;
+  }
+
+  body.trim();
+  if (body.length() == 0 || body == "[]") {
+    if (logDetails) {
+      Serial.println("[PIN] Supabase profile has no Personal PIN row");
+    }
+    return 0;
+  }
+
+  int objStart = body.indexOf('{');
+  int objEnd = body.lastIndexOf('}');
+  if (objStart < 0 || objEnd <= objStart) {
+    if (logDetails) {
+      Serial.println("[PIN] Supabase profile response malformed");
+    }
+    return -1;
+  }
+  String profileJson = body.substring(objStart, objEnd + 1);
+
+  bool enabledVal = false;
+  bool parsedEnabled =
+      readTopLevelJsonBool(profileJson, "personal_pin_enabled", enabledVal);
+  if (!parsedEnabled || !enabledVal) {
+    return 0;
+  }
+
+  char hash[65] = "";
+  char salt[33] = "";
+  bool hashOk = readTopLevelJsonString(profileJson, "personal_pin_hash_mcu",
+                                       hash, sizeof(hash));
+  bool saltOk = readTopLevelJsonString(profileJson, "personal_pin_salt",
+                                       salt, sizeof(salt));
+  if (!hashOk || !saltOk || strlen(hash) != 64 || strlen(salt) == 0) {
+    if (logDetails) {
+      Serial.println("[PIN] Supabase profile PIN fields incomplete");
+    }
+    return 0;
+  }
+
+  bool runtimeChanged =
+      !personalPinEnabled ||
+      strcmp(cachedPersonalPinHashMcu, hash) != 0 ||
+      strcmp(cachedPersonalPinSalt, salt) != 0 ||
+      strcmp(cachedPersonalPinRiderId, riderId) != 0;
+
+  personalPinEnabled = true;
+  strncpy(cachedPersonalPinHashMcu, hash, sizeof(cachedPersonalPinHashMcu) - 1);
+  cachedPersonalPinHashMcu[sizeof(cachedPersonalPinHashMcu) - 1] = '\0';
+  strncpy(cachedPersonalPinSalt, salt, sizeof(cachedPersonalPinSalt) - 1);
+  cachedPersonalPinSalt[sizeof(cachedPersonalPinSalt) - 1] = '\0';
+  strncpy(cachedPersonalPinRiderId, riderId, sizeof(cachedPersonalPinRiderId) - 1);
+  cachedPersonalPinRiderId[sizeof(cachedPersonalPinRiderId) - 1] = '\0';
+
+  uint32_t nextPinHash =
+      buildPersonalPinContextHash(true,
+                                  cachedPersonalPinHashMcu,
+                                  cachedPersonalPinSalt,
+                                  cachedPersonalPinRiderId);
+  if (!persistedPinContextHashReady || nextPinHash != lastPersistedPinContextHash) {
+    dpSavePersonalPinEnabled(true);
+    dpSavePersonalPinHash(cachedPersonalPinHashMcu);
+    dpSavePersonalPinSalt(cachedPersonalPinSalt);
+    dpSavePersonalPinRiderId(cachedPersonalPinRiderId);
+    lastPersistedPinContextHash = nextPinHash;
+    persistedPinContextHashReady = true;
+  }
+
+  if (runtimeChanged) {
+    patchPersonalPinRuntimeToHardware(true,
+                                      cachedPersonalPinRiderId,
+                                      cachedPersonalPinHashMcu,
+                                      cachedPersonalPinSalt);
+  }
+  if (logDetails) {
+    Serial.printf("[PIN] Supabase profile runtime OK (rider=%s)\n",
+                  cachedPersonalPinRiderId);
+  }
+  return 1;
+}
+
+static bool syncPersonalPinRuntimeWithActivePairing(bool logDetails, bool force) {
+  if (!lteConnected) return false;
+
+  unsigned long nowMs = millis();
+  if (!force && nowMs - lastPairingPinSyncAt < PIN_PAIRING_SYNC_MIN_MS) {
+    return true;
+  }
+  lastPairingPinSyncAt = nowMs;
+
+  char activeRider[64] = "";
+  bool hasActivePairing = false;
+  if (!fetchActivePairingRiderFromFirebase(activeRider, sizeof(activeRider),
+                                           hasActivePairing)) {
+    if (logDetails) {
+      Serial.println("[PIN] Pairing rider lookup failed");
+    }
+    return false;
+  }
+
+  if (!hasActivePairing) {
+    if (personalPinEnabled || cachedPersonalPinHashMcu[0] ||
+        cachedPersonalPinSalt[0] || cachedPersonalPinRiderId[0]) {
+      Serial.println("[PIN] No active pairing; clearing Personal PIN runtime");
+    }
+    clearPersonalPinRuntimeCache(true);
+    patchPersonalPinRuntimeToHardware(false, "", "", "");
+    return true;
+  }
+
+  bool cacheMatchesPairing =
+      personalPinEnabled &&
+      cachedPersonalPinHashMcu[0] != '\0' &&
+      cachedPersonalPinSalt[0] != '\0' &&
+      cachedPersonalPinRiderId[0] != '\0' &&
+      strcmp(cachedPersonalPinRiderId, activeRider) == 0;
+  if (cacheMatchesPairing) {
+    return true;
+  }
+
+  if (refreshPersonalPinRuntimeFromFirebase(logDetails, true) &&
+      personalPinEnabled &&
+      cachedPersonalPinHashMcu[0] != '\0' &&
+      cachedPersonalPinSalt[0] != '\0' &&
+      cachedPersonalPinRiderId[0] != '\0' &&
+      strcmp(cachedPersonalPinRiderId, activeRider) == 0) {
+    return true;
+  }
+
+  if (force) {
+    int8_t profileResult =
+        refreshPersonalPinRuntimeFromSupabaseProfile(activeRider, logDetails);
+    if (profileResult > 0) {
+      return true;
+    }
+    if (profileResult == 0) {
+      saveDisabledPersonalPinForRider(activeRider);
+      patchPersonalPinRuntimeToHardware(false, activeRider, "", "");
+      if (logDetails) {
+        Serial.printf("[PIN] Active rider has no enabled Personal PIN (%s)\n",
+                      activeRider);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  if (cachedPersonalPinRiderId[0] != '\0' &&
+      strcmp(cachedPersonalPinRiderId, activeRider) != 0) {
+    Serial.printf("[PIN] Hardware PIN rider stale (%s != active %s); replacing\n",
+                  cachedPersonalPinRiderId, activeRider);
+  }
+
+  int8_t profileResult =
+      refreshPersonalPinRuntimeFromSupabaseProfile(activeRider, logDetails);
+  if (profileResult > 0) {
+    return true;
+  }
+
+  if (profileResult == 0) {
+    saveDisabledPersonalPinForRider(activeRider);
+    patchPersonalPinRuntimeToHardware(false, activeRider, "", "");
+    if (logDetails) {
+      Serial.printf("[PIN] Active rider has no enabled Personal PIN (%s)\n",
+                    activeRider);
+    }
+    return true;
+  }
+
+  return false;
+}
+
 static bool refreshPersonalPinRuntimeFromFirebase(bool logDetails, bool force) {
   if (!lteConnected) return false;
 
@@ -5016,7 +5418,8 @@ static bool refreshPersonalPinRuntimeFromFirebase(bool logDetails, bool force) {
   snprintf(path, sizeof(path), "/hardware/%s/current_rider_id.json", HARDWARE_ID);
   bool riderOk = fetchFirebaseStringValue(path, rider, sizeof(rider));
 
-  if (!hashOk || !saltOk || !riderOk || strlen(hash) != 64) {
+  if (!hashOk || !saltOk || !riderOk || strlen(hash) != 64 ||
+      strlen(salt) == 0 || strlen(rider) == 0) {
     if (logDetails) {
       Serial.printf("[PIN] Runtime refresh failed: hash=%d salt=%d rider=%d\n",
                     hashOk ? 1 : 0, saltOk ? 1 : 0, riderOk ? 1 : 0);
@@ -5288,7 +5691,7 @@ void setup() {
   }
 
   if (lteConnected) {
-    refreshPersonalPinRuntimeFromFirebase(true, true);
+    syncPersonalPinRuntimeWithActivePairing(true, true);
   }
 
   lastPersistedContextHash =

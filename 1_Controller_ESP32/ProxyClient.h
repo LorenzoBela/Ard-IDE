@@ -115,7 +115,8 @@ bool reportTamperToProxy();
 bool reportCommandAckToProxy(const char *command, const char *status, const char *details);
 
 /** Verify personal PIN and request lock toggle authorization from proxy.
- *  Returns: 1 = allow unlock, 2 = allow relock, 0 = denied/error. */
+ *  Returns: 1 = allow unlock, 2 = allow relock, 0 = wrong PIN,
+ *           -1 = PIN unavailable/stale context, -2 = HTTP error. */
 int requestPersonalPinToggle(const char *pin, bool currentlyLocked);
 
 #endif // PROXY_CLIENT_H

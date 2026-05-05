@@ -794,7 +794,7 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
            "\"currently_locked\":%s,\"source\":\"controller_keypad\"}",
            pin, HARDWARE_ID, activeDeliveryId, currentlyLocked ? "true" : "false");
 
-  http.setTimeout(4000);
+  http.setTimeout(30000);
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST((uint8_t *)json, strlen(json));
@@ -816,7 +816,9 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
   }
   if (body.indexOf("DENY:disabled") >= 0 ||
       body.indexOf("DENY:missing_pin") >= 0 ||
-      body.indexOf("DENY:invalid") >= 0) {
+      body.indexOf("DENY:invalid") >= 0 ||
+      body.indexOf("DENY:sync_failed") >= 0 ||
+      body.indexOf("DENY:box_mismatch") >= 0) {
     return -1;
   }
   return 0;

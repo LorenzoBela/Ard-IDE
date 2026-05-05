@@ -109,6 +109,7 @@ static uint8_t camMissCount = 0;
 static uint8_t camRecoveryCount = 0;
 static bool camDownNotified = false;
 static bool offlineModeAnnounced = false;
+static unsigned long wifiDisconnectedSince = 0;
 
 static ControllerDiagData diagCache = {
   0,
@@ -923,23 +924,31 @@ void loop() {
   unsigned long now = millis();
 
   // ── 1. WiFi monitoring (runs in all states except boot self-test) ──
-  if (WiFi.status() != WL_CONNECTED && currentState != STATE_CONNECTING_WIFI &&
-      currentState != STATE_BOOT_SELFTEST) {
-    if (isOfflineOtpEligible(now)) {
-      // Keep keypad flow alive in degraded mode while reconnecting in background.
-      if (!offlineModeAnnounced) {
-        netLog("[WIFI] Offline degraded mode active (cached OTP policy)\n");
-        offlineModeAnnounced = true;
-      }
-    } else {
-      offlineModeAnnounced = false;
-      netLog("[WIFI] Connection lost, reconnecting...\n");
-      enterState(STATE_CONNECTING_WIFI);
-      WiFi.disconnect();
-      WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
-    }
-  } else if (WiFi.status() == WL_CONNECTED) {
+  wl_status_t wifiStatus = WiFi.status();
+  if (wifiStatus == WL_CONNECTED) {
+    wifiDisconnectedSince = 0;
     offlineModeAnnounced = false;
+  } else {
+    if (wifiDisconnectedSince == 0) {
+      wifiDisconnectedSince = now;
+    }
+
+    bool wifiDownLongEnough =
+        (now - wifiDisconnectedSince) >= WIFI_UI_DISCONNECT_GRACE_MS;
+    if (wifiDownLongEnough && currentState != STATE_CONNECTING_WIFI &&
+        currentState != STATE_BOOT_SELFTEST) {
+      if (isOfflineOtpEligible(now)) {
+        // Keep keypad flow alive in degraded mode while reconnecting in background.
+        if (!offlineModeAnnounced) {
+          netLog("[WIFI] Offline degraded mode active (cached OTP policy)\n");
+          offlineModeAnnounced = true;
+        }
+      } else {
+        offlineModeAnnounced = false;
+        netLog("[WIFI] Connection lost, reconnecting...\n");
+        enterState(STATE_CONNECTING_WIFI);
+      }
+    }
   }
   maintainWiFiConnection(now);
 
