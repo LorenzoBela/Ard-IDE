@@ -90,6 +90,12 @@ uint8_t boxNum       = 0;
 #define MAX_CONSECUTIVE_FAILURES 5  // Hard-reset modem after 5 AT timeouts
 #define MAX_FB_FAILURES 3           // Reconnect LTE after 3 Firebase fails
 
+// Firebase /hardware context reader.
+// The modem is read in 1024-byte windows, but the assembled JSON can be larger.
+#define DELIVERY_CONTEXT_HTTPREAD_CHUNK 1024
+#define DELIVERY_CONTEXT_MAX_BYTES 32768
+#define DELIVERY_CONTEXT_HEAP_HEADROOM 4096
+
 // Philippine Standard Time offset (UTC+8)
 #define PHT_OFFSET_HOURS 8
 #define PHT_OFFSET_QUARTERS 32 // 8 hours * 4 quarter-hours
@@ -264,6 +270,12 @@ static unsigned long camLastSeenAt = 0;
 #define CAM_LIVENESS_STALE_MS 120000
 static unsigned long controllerLastSeenAt = 0;
 #define CONTROLLER_LIVENESS_STALE_MS 30000
+#define MANUAL_REFRESH_BURST_MS 15000UL
+#define MANUAL_REFRESH_READ_INTERVAL_MS 500UL
+#define CONTEXT_STICKY_GRACE_MS 60000UL
+#define CONTEXT_FAIL_RESET_THRESHOLD 3
+#define GEO_LAST_KNOWN_TTL_MS 60000UL
+#define FALLBACK_TARGET_FETCH_INTERVAL_MS 30000UL
 #define PHONE_LOC_FETCH_INTERVAL_MS 3000UL
 #define PHONE_LOC_MAX_AGE_SEC 30UL
 
@@ -275,6 +287,12 @@ static unsigned long phoneFetchedAtMs = 0;
 static bool phoneFixValid = false;
 static unsigned long lastPhoneFetchAtMs = 0;
 static unsigned long lastPhoneFallbackLogAtMs = 0;
+static unsigned long manualRefreshBurstUntil = 0;
+static uint64_t lastManualRefreshAt = 0;
+static unsigned long lastFallbackTargetFetchAtMs = 0;
+static int16_t lastKnownDistMeters = -1;
+static bool lastKnownInside = false;
+static unsigned long lastKnownGeoAtMs = 0;
 
 enum ConnectivityMatrixState : uint8_t {
   CONN_ALL_UP = 0,
@@ -346,6 +364,10 @@ static void clearDeliveryContextCaches(const char *reason, bool patchHardware) {
   phoneTimestampMs = 0;
   phoneFetchedAtMs = 0;
   phoneFixValid = false;
+  lastFallbackTargetFetchAtMs = 0;
+  lastKnownDistMeters = -1;
+  lastKnownInside = false;
+  lastKnownGeoAtMs = 0;
 
   dpClearDeliveryContext();
   persistedContextHashReady = false;
@@ -1548,12 +1570,18 @@ void hardResetModem() {
 
 // Print heap/stack health to Serial for diagnostics
 void printMemoryReport() {
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t minFreeHeap = ESP.getMinFreeHeap();
+  uint32_t largestBlock = ESP.getMaxAllocHeap();
   Serial.printf("[MEM] Free: %u | Min: %u | Largest: %u | Stack HWM: %u\n",
-                ESP.getFreeHeap(), ESP.getMinFreeHeap(), ESP.getMaxAllocHeap(),
+                freeHeap, minFreeHeap, largestBlock,
                 uxTaskGetStackHighWaterMark(NULL));
 
-  if (ESP.getMaxAllocHeap() < 10240) {
-    Serial.println("[MEM] WARNING: Largest free block < 10KB!");
+  uint32_t contextHeapNeeded =
+      DELIVERY_CONTEXT_MAX_BYTES + DELIVERY_CONTEXT_HEAP_HEADROOM;
+  if (largestBlock < contextHeapNeeded) {
+    Serial.printf("[MEM] WARNING: Largest free block < %u bytes; context reads may truncate\n",
+                  contextHeapNeeded);
   }
 }
 
@@ -2967,7 +2995,7 @@ void refreshDeliveryContextFromFirebase() {
 
   Serial.printf("[CONTEXT] Fetching /hardware/%s from Firebase...\n",
                 HARDWARE_ID);
-  // Fetch the entire hardware node since it contains both OTP and delivery_id
+  // Fetch the context-bearing slice of the hardware node.
   char path[64];
   snprintf(path, sizeof(path), "/hardware/%s.json", HARDWARE_ID);
 
@@ -2983,8 +3011,11 @@ void refreshDeliveryContextFromFirebase() {
   modem.waitResponse(3000L);
 
   String url = "https://" + String(FIREBASE_HOST) + path;
+  // Context parsing only needs command, current, delivery, personal PIN,
+  // pickup, return, and target fields. Skip bulky early telemetry keys.
+  url += "?orderBy=%22%24key%22&startAt=%22command%22";
   if (strlen(FIREBASE_AUTH) > 0) {
-    url += "?auth=" + String(FIREBASE_AUTH);
+    url += "&auth=" + String(FIREBASE_AUTH);
   }
   modem.sendAT(("+HTTPPARA=\"URL\",\"" + url + "\"").c_str());
   modem.waitResponse(3000L);
@@ -3022,11 +3053,17 @@ void refreshDeliveryContextFromFirebase() {
 
   if (!actionOK || httpStatus != 200) {
     contextFetchFailCount++;
+    bool withinSticky =
+        (lastContextFetchOkAtMs > 0) &&
+        ((nowMs - lastContextFetchOkAtMs) <= CONTEXT_STICKY_GRACE_MS);
     if (!deliveryContextValidated &&
         (nowMs - deliveryContextBootAtMs) > DELIVERY_CONTEXT_VALIDATE_GRACE_MS) {
       clearDeliveryContextCaches("boot_validate_timeout", false);
-    } else if (contextFetchFailCount >= CONTEXT_FETCH_FAIL_RESET_COUNT) {
+    } else if (!withinSticky &&
+               contextFetchFailCount >= CONTEXT_FAIL_RESET_THRESHOLD) {
       clearDeliveryContextCaches("context_fetch_failed", false);
+    } else if (withinSticky) {
+      Serial.println("[CONTEXT] Fetch failed but within sticky grace window");
     }
     return;
   }
@@ -3035,26 +3072,26 @@ void refreshDeliveryContextFromFirebase() {
   lastContextFetchOkAtMs = nowMs;
 
   if (actionOK && httpStatus == 200) {
-    // A7670E/A7672X caps each AT+HTTPREAD at 1024 bytes.
-    // Firebase returns JSON keys alphabetically, so "background_location_status"
-    // fills the first chunk, pushing "delivery_id" and "otp_code" past 1024.
-    // Solution: read in 1024-byte chunks with increasing offsets.
-    #define CTX_CHUNK  1024
-    #define CTX_MAX    16384
-
+    // A7670E/A7672X caps each AT+HTTPREAD at 1024 bytes, so page the
+    // Firebase hardware node with increasing offsets and assemble locally.
     String body = "";
-    body.reserve(CTX_MAX); // Pre-allocate to avoid realloc fragmentation
-    int offset = 0;
-
-    int targetLen = CTX_MAX;
-    if (totalResponseLen > 0 && totalResponseLen < CTX_MAX) {
+    int targetLen = DELIVERY_CONTEXT_MAX_BYTES;
+    if (totalResponseLen > 0 && totalResponseLen < DELIVERY_CONTEXT_MAX_BYTES) {
       targetLen = totalResponseLen;
     }
+    if (!body.reserve(targetLen + 1)) {
+      Serial.printf(
+          "[CONTEXT] WARNING: Could not reserve %d bytes; largest free block=%u\n",
+          targetLen + 1, ESP.getMaxAllocHeap());
+    }
+
+    int offset = 0;
 
     while (offset < targetLen) {
       // Request next chunk from modem
       char readCmd[40];
-      snprintf(readCmd, sizeof(readCmd), "AT+HTTPREAD=%d,%d\r\n", offset, CTX_CHUNK);
+      int requestLen = min(DELIVERY_CONTEXT_HTTPREAD_CHUNK, targetLen - offset);
+      snprintf(readCmd, sizeof(readCmd), "AT+HTTPREAD=%d,%d\r\n", offset, requestLen);
       modem.stream.print(readCmd);
 
       // Phase 1: wait for "+HTTPREAD: <len>" header (up to 6 s)
@@ -3101,17 +3138,35 @@ void refreshDeliveryContextFromFirebase() {
       offset += chunkLen;
     }
 
-    #undef CTX_CHUNK
-    #undef CTX_MAX
-
     Serial.printf("[CONTEXT] totalBytes=%d body(120): %.120s\n", (int)body.length(),
                   body.c_str());
     if (totalResponseLen > 0 && totalResponseLen > (int)body.length()) {
-      Serial.printf(
-          "[CONTEXT] WARNING: Response %d > CTX_MAX window (%d bytes read) — fields near the end may be truncated!\n",
-          totalResponseLen, (int)body.length());
+      if (totalResponseLen > DELIVERY_CONTEXT_MAX_BYTES) {
+        Serial.printf(
+            "[CONTEXT] WARNING: Response %d > max context window %d (%d bytes read). Shrink /hardware/%s or raise DELIVERY_CONTEXT_MAX_BYTES.\n",
+            totalResponseLen, DELIVERY_CONTEXT_MAX_BYTES, (int)body.length(),
+            HARDWARE_ID);
+      } else {
+        Serial.printf(
+            "[CONTEXT] WARNING: Short HTTPREAD (%d expected, %d bytes read). Fields near the end may be truncated.\n",
+            totalResponseLen, (int)body.length());
+      }
     }
     bool responseTruncated = (totalResponseLen > 0 && totalResponseLen > (int)body.length());
+
+    // Manual refresh: if mobile app bumped refresh_context_at, speed up polls.
+    {
+      double refreshAt = 0.0;
+      if (readTopLevelJsonDouble(body, "refresh_context_at", refreshAt) && refreshAt > 0.0) {
+        uint64_t refreshEpoch = (uint64_t)(refreshAt + 0.5);
+        if (refreshEpoch > lastManualRefreshAt) {
+          lastManualRefreshAt = refreshEpoch;
+          manualRefreshBurstUntil = nowMs + MANUAL_REFRESH_BURST_MS;
+          lastPhoneFetchAtMs = 0;
+          Serial.println("[CONTEXT] Manual refresh requested — burst polling");
+        }
+      }
+    }
 
     // EC-32: Parse top-level return_active (ignore nested historical fields).
     {
@@ -3162,6 +3217,14 @@ void refreshDeliveryContextFromFirebase() {
         cachedDeliveryId[0] = '\0';
         deliveryIdCacheValid = false;
       }
+    }
+
+    if (prevDeliveryValid && deliveryIdCacheValid &&
+        strcmp(prevDeliveryId, cachedDeliveryId) != 0) {
+      lastKnownDistMeters = -1;
+      lastKnownInside = false;
+      lastKnownGeoAtMs = 0;
+      lastFallbackTargetFetchAtMs = 0;
     }
 
     if (!contextCleared && prevDeliveryValid && !deliveryIdCacheValid) {
@@ -4033,6 +4096,31 @@ void handleCameraClient() {
 
   String reqPathStr = String(reqPath);
 
+  // ── GET /refresh-context ──
+  if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/refresh-context")) {
+    controllerLastSeenAt = millis();
+    bool ok = lteConnected;
+
+    if (ok) {
+      unsigned long nowMs = millis();
+      manualRefreshBurstUntil = nowMs + MANUAL_REFRESH_BURST_MS;
+      lastDeliveryContextRead = 0;
+      lastPhoneFetchAtMs = 0;
+      Serial.println("[CONTEXT] Keypad refresh requested - queued fast context poll");
+    }
+
+    const char *body = ok ? "OK" : "NO_LTE";
+    String resp =
+        "HTTP/1.1 200 OK\r\n"
+        "Connection: keep-alive\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: " + String(strlen(body)) + "\r\n\r\n" + body;
+    client.print(resp);
+    client.flush();
+    keepAliveController = client;
+    return;
+  }
+
   // ── GET /otp ──
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/otp")) {
     controllerLastSeenAt = millis();
@@ -4065,7 +4153,12 @@ void handleCameraClient() {
       Serial.printf("[AP] GEO pre: destValid=%d gpsFix=%d delStatus='%s'\n",
                     destCoordsValid, gpsFix, cachedDeliveryStatus);
 
-      if (destCoordsValid && gpsFix) {
+      bool haveTargets = destCoordsValid;
+      if (!haveTargets && deliveryIdCacheValid) {
+        haveTargets = refreshTargetCoordsFromDelivery(cachedDeliveryId);
+      }
+
+      if (haveTargets && gpsFix) {
         // During return mode the geofence target is already swapped to pickup
         // coords (see EC-32 target swap). Use isNearAnyTarget() so the distance
         // correctly evaluates against whichever target is active.
@@ -4074,7 +4167,7 @@ void handleCameraClient() {
                           : geoProxy.isNearDropoff(gpsLat, gpsLon);
         insideGeo = atTarget;
         distMeters = (int)geoProxy.snap.distanceM;
-      } else if (destCoordsValid && !gpsFix) {
+      } else if (haveTargets && !gpsFix) {
         // GPS-loss fallback: preserve the last confirmed geofence state.
         // The GeofenceProxy hysteresis state machine (EC-94) retains its
         // stableState across GPS outages — if arrival was previously
@@ -4149,7 +4242,7 @@ void handleCameraClient() {
         } else if (insideGeo && usedLastConfirmed && !usedPhoneFallback) {
           Serial.println("[AP] GPS-loss fallback: using last confirmed ARRIVED state");
         }
-      } else if (!destCoordsValid && deliveryIdCacheValid) {
+      } else if (!haveTargets && deliveryIdCacheValid) {
         // Destination coords missing (Firebase JSON truncated, field not yet
         // written, or response parsing failure). Fall back to Firebase delivery
         // status from the mobile app — if it says ARRIVED, the phone GPS has
@@ -4162,6 +4255,16 @@ void handleCameraClient() {
           Serial.printf("[AP] No dest coords, delivery active but status='%s' — GEO:0\n",
                         cachedDeliveryStatus);
         }
+      }
+
+      if (distMeters >= 0) {
+        lastKnownDistMeters = (int16_t)distMeters;
+        lastKnownInside = insideGeo;
+        lastKnownGeoAtMs = nowMs;
+      } else if (lastKnownDistMeters >= 0 &&
+                 (nowMs - lastKnownGeoAtMs) <= GEO_LAST_KNOWN_TTL_MS) {
+        distMeters = lastKnownDistMeters;
+        insideGeo = lastKnownInside;
       }
     }
 
@@ -4596,38 +4699,50 @@ void handleCameraClient() {
              "%s/storage/v1/object/public/%s/%s",
              SUPABASE_URL, SUPABASE_BUCKET, objectPath.c_str());
 
-    char urlJson[320];
-    snprintf(urlJson, sizeof(urlJson),
-             "{\"last_upload_public_url\":\"%s\"}", publicUrl);
-
-    char camPath[64];
-    snprintf(camPath, sizeof(camPath), "/hardware/%s/camera.json", HARDWARE_ID);
-    bool fbOK = httpPatchWithRetry(camPath, urlJson);
-    Serial.printf("[RELAY] Firebase URL writeback: %s\n", fbOK ? "OK" : "FAIL");
-
     if (deliveryIdCacheValid && cachedDeliveryId[0] != '\0') {
-      char auditJson[320];
+      // Write the delivery proof first; ArrivalScreen listens here and can
+      // show the photo as soon as this patch lands.
+      char deliveryJson[768];
+      snprintf(deliveryJson, sizeof(deliveryJson),
+               "{\"proof_photo_url\":\"%s\",\"proof_photo_object_path\":\"%s\","
+               "\"proof_photo_uploaded_at\":{\".sv\":\"timestamp\"}}",
+               publicUrl, objectPath.c_str());
+      char deliveryPath[96];
+      snprintf(deliveryPath, sizeof(deliveryPath),
+               "/deliveries/%s.json", cachedDeliveryId);
+      bool deliveryFbOK = httpPatchWithRetry(deliveryPath, deliveryJson);
+      Serial.printf("[RELAY] Delivery proof writeback: %s\n",
+                    deliveryFbOK ? "OK" : "FAIL");
+
+      char auditJson[768];
       snprintf(auditJson, sizeof(auditJson),
-               "{\"latest_photo_url\":\"%s\"}", publicUrl);
+               "{\"delivery_id\":\"%s\",\"box_id\":\"%s\","
+               "\"latest_photo_url\":\"%s\",\"latest_photo_object_path\":\"%s\","
+               "\"latest_photo_uploaded_at\":{\".sv\":\"timestamp\"}}",
+               cachedDeliveryId, HARDWARE_ID, publicUrl, objectPath.c_str());
       char auditPath[96];
       snprintf(auditPath, sizeof(auditPath),
                "/audit_logs/%s.json", cachedDeliveryId);
       httpPatchWithRetry(auditPath, auditJson);
 
-      // IMPORTANT: Write the proof_photo_url directly to the delivery document
-      // so the web/mobile app sync engines pick it up correctly.
-      char deliveryJson[320];
-      snprintf(deliveryJson, sizeof(deliveryJson),
-               "{\"proof_photo_url\":\"%s\"}", publicUrl);
-      char deliveryPath[96];
-      snprintf(deliveryPath, sizeof(deliveryPath),
-               "/deliveries/%s.json", cachedDeliveryId);
-      httpPatchWithRetry(deliveryPath, deliveryJson);
-
       // CRITICAL: The Web Tracking page Server-Side-Render uses the Supabase 'deliveries' table directly.
       // We must write the proof_photo_url to Supabase via REST API right after upload.
-      httpPatchSupabase("deliveries", cachedDeliveryId, deliveryJson);
+      char supabaseDeliveryJson[320];
+      snprintf(supabaseDeliveryJson, sizeof(supabaseDeliveryJson),
+               "{\"proof_photo_url\":\"%s\"}", publicUrl);
+      httpPatchSupabase("deliveries", cachedDeliveryId, supabaseDeliveryJson);
     }
+
+    char urlJson[384];
+    snprintf(urlJson, sizeof(urlJson),
+             "{\"last_upload_public_url\":\"%s\",\"last_upload_object_path\":\"%s\","
+             "\"last_upload_uploaded_at\":{\".sv\":\"timestamp\"}}",
+             publicUrl, objectPath.c_str());
+
+    char camPath[64];
+    snprintf(camPath, sizeof(camPath), "/hardware/%s/camera.json", HARDWARE_ID);
+    bool fbOK = httpPatchWithRetry(camPath, urlJson);
+    Serial.printf("[RELAY] Firebase URL writeback: %s\n", fbOK ? "OK" : "FAIL");
   }
 
   String body = uploadOK ? ("OK:" + relayDiag) : failReason;
@@ -4773,6 +4888,84 @@ static bool parseFirebaseBoolValue(const String &body, bool &out, bool &hasValue
     return true;
   }
   return false;
+}
+
+static bool fetchFirebaseDouble(const char *path, double &outVal) {
+  if (!path || path[0] == '\0') return false;
+  String body = httpGetFromFirebase(path);
+  body.trim();
+  if (body.length() == 0 || body == "null") {
+    return false;
+  }
+  outVal = body.toDouble();
+  return true;
+}
+
+static bool refreshTargetCoordsFromDelivery(const char *deliveryId) {
+  if (!lteConnected || !deliveryId || deliveryId[0] == '\0') {
+    return destCoordsValid;
+  }
+
+  unsigned long nowMs = millis();
+  if (nowMs - lastFallbackTargetFetchAtMs < FALLBACK_TARGET_FETCH_INTERVAL_MS) {
+    return destCoordsValid;
+  }
+  lastFallbackTargetFetchAtMs = nowMs;
+
+  double dLat = 0.0;
+  double dLon = 0.0;
+  bool gotLat = false;
+  bool gotLon = false;
+
+  char path[128];
+  snprintf(path, sizeof(path), "/deliveries/%s/target_lat.json", deliveryId);
+  gotLat = fetchFirebaseDouble(path, dLat);
+  if (!gotLat) {
+    snprintf(path, sizeof(path), "/deliveries/%s/dest_lat.json", deliveryId);
+    gotLat = fetchFirebaseDouble(path, dLat);
+  }
+
+  snprintf(path, sizeof(path), "/deliveries/%s/target_lng.json", deliveryId);
+  gotLon = fetchFirebaseDouble(path, dLon);
+  if (!gotLon) {
+    snprintf(path, sizeof(path), "/deliveries/%s/dest_lon.json", deliveryId);
+    gotLon = fetchFirebaseDouble(path, dLon);
+  }
+
+  if (gotLat && gotLon && (dLat != 0.0 || dLon != 0.0)) {
+    bool changed = (dLat != destLat || dLon != destLon);
+    destLat = dLat;
+    destLon = dLon;
+    destCoordsValid = true;
+    if (changed) {
+      geoProxy.setTarget(destLat, destLon);
+      theftGuardSetGeofence((float)destLat, (float)destLon, TG_GEOFENCE_RADIUS_KM);
+      Serial.printf("[GEO] Target fallback set: %.6f, %.6f\n", destLat, destLon);
+    }
+  }
+
+  double pLat = 0.0;
+  double pLon = 0.0;
+  bool gotPLat = false;
+  bool gotPLon = false;
+
+  snprintf(path, sizeof(path), "/deliveries/%s/pickup_lat.json", deliveryId);
+  gotPLat = fetchFirebaseDouble(path, pLat);
+  snprintf(path, sizeof(path), "/deliveries/%s/pickup_lng.json", deliveryId);
+  gotPLon = fetchFirebaseDouble(path, pLon);
+
+  if (gotPLat && gotPLon && (pLat != 0.0 || pLon != 0.0)) {
+    bool changed = (pLat != pickupLat || pLon != pickupLon);
+    pickupLat = pLat;
+    pickupLon = pLon;
+    pickupCoordsValid = true;
+    if (changed) {
+      geoProxy.setPickup(pickupLat, pickupLon);
+      Serial.printf("[GEO] Pickup fallback set: %.6f, %.6f\n", pickupLat, pickupLon);
+    }
+  }
+
+  return destCoordsValid;
 }
 
 static bool fetchFirebaseStringValue(const char *path, char *out, size_t outLen) {
@@ -5151,6 +5344,9 @@ void loop() {
     // Context reads always run at full speed — new delivery detection must be fast
     // even when idle. IDLE_POLL_MULTIPLIER only slows sendToFirebase + signal checks.
     unsigned long deliveryReadInterval = DELIVERY_CONTEXT_READ_INTERVAL;
+    if (manualRefreshBurstUntil > now) {
+      deliveryReadInterval = MANUAL_REFRESH_READ_INTERVAL_MS;
+    }
 
   // Handle incoming camera image upload (non-blocking when idle)
   if (apStarted) {

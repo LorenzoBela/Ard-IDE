@@ -453,6 +453,54 @@ void fetchDeliveryContext() {
   //  only updates the shared globals.)
 }
 
+bool requestContextRefresh() {
+  if (WiFi.status() != WL_CONNECTED) {
+    netLog("[REFRESH] Skip — WiFi not connected\n");
+    closePersistentConnection();
+    return false;
+  }
+
+  if (!ensurePersistentConnection()) {
+    netLog("[REFRESH] TCP connect failed\n");
+    return false;
+  }
+
+  persistentClient.printf(
+      "GET /refresh-context HTTP/1.1\r\n"
+      "Host: %s:%d\r\n"
+      "Connection: keep-alive\r\n"
+      "\r\n",
+      PROXY_HOST, PROXY_PORT);
+
+  String body = "";
+  int code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
+  if (code < 0) {
+    netLog("[REFRESH] Read failed — reconnecting\n");
+    closePersistentConnection();
+    if (!ensurePersistentConnection()) {
+      netLog("[REFRESH] TCP retry failed\n");
+      return false;
+    }
+    persistentClient.printf(
+        "GET /refresh-context HTTP/1.1\r\n"
+        "Host: %s:%d\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n",
+        PROXY_HOST, PROXY_PORT);
+    body = "";
+    code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
+    if (code < 0) {
+      netLog("[REFRESH] Retry failed\n");
+      closePersistentConnection();
+      return false;
+    }
+  }
+
+  body.trim();
+  netLog("[REFRESH] HTTP %d body='%s'\n", code, body.c_str());
+  return (code == 200 && body.startsWith("OK"));
+}
+
 bool fetchDiagnostics(ControllerDiagData &out) {
   if (WiFi.status() != WL_CONNECTED) {
     return false;

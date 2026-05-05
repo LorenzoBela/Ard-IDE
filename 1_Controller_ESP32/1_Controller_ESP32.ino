@@ -72,6 +72,11 @@ static unsigned long lastDeliveryContextFetch = 0;
 static unsigned long messageStartAt           = 0;
 static unsigned long lastDisplayCheck         = 0;
 static unsigned long personalPinExpiresAt     = 0;
+static const unsigned long KEYPAD_GEO_CHECK_FIRST_DELAY_MS = 800;
+static const unsigned long KEYPAD_GEO_CHECK_RETRY_DELAY_MS = 900;
+static const uint8_t KEYPAD_GEO_CHECK_ATTEMPTS = 5;
+static unsigned long keypadGeoCheckAt = 0;
+static uint8_t keypadGeoChecksRemaining = 0;
 
 // ── Face check ──
 static bool faceCheckPending = false;
@@ -231,7 +236,7 @@ static bool isPinEligibleNow() {
 // Format distance for LCD: >9999m → "10km", >999m → "1.2km", else "450m"
 static void formatDistance(int16_t meters, char *buf, size_t bufLen) {
   if (meters < 0) {
-    snprintf(buf, bufLen, "No GPS");
+    snprintf(buf, bufLen, "Check");
   } else if (meters >= 10000) {
     snprintf(buf, bufLen, "%dkm", meters / 1000);
   } else if (meters >= 1000) {
@@ -612,17 +617,97 @@ static void renderIdleJourneyStatus() {
     return;
   }
 
-  // Outside geofence — show live distance to current target.
-  char distStr[10];
-  formatDistance(geoDistMeters, distStr, sizeof(distStr));
-  char line1[17];
+  // Outside geofence: show the next action instead of stale distance.
   if (isReturning) {
-    snprintf(line1, sizeof(line1), "Pickup: %s", distStr);
-    updateDisplay("Returning", line1);
+    updateDisplay("Pickup locked", "Hold 9 check");
   } else {
-    snprintf(line1, sizeof(line1), "Dropoff: %s", distStr);
-    updateDisplay("Delivery", line1);
+    updateDisplay("Dropoff locked", "Hold 9 check");
   }
+}
+
+static void clearKeypadGeoCheck() {
+  keypadGeoCheckAt = 0;
+  keypadGeoChecksRemaining = 0;
+}
+
+static void scheduleKeypadGeoCheck(unsigned long now) {
+  keypadGeoCheckAt = now + KEYPAD_GEO_CHECK_FIRST_DELAY_MS;
+  keypadGeoChecksRemaining = KEYPAD_GEO_CHECK_ATTEMPTS;
+}
+
+static void showKeypadGeoCheckFailure(unsigned long now) {
+  clearKeypadGeoCheck();
+  inputLen = 0;
+  inputCode[0] = '\0';
+
+  if (!isDisplayFailed()) {
+    if (!hasActiveDelivery) {
+      updateDisplay("No delivery", "Check app");
+    } else if (!hasLoadedOtp()) {
+      updateDisplay("OTP syncing", "Hold 9 again");
+    } else if (geoDistMeters >= 0) {
+      updateDisplay(isReturning ? "Outside pickup" : "Outside dropoff",
+                    "PIN still locked");
+    } else {
+      updateDisplay("Location stale", "Use app refresh");
+    }
+  } else {
+    fallbackError();
+  }
+
+  messageStartAt = now;
+  currentState = STATE_SHOW_MESSAGE;
+}
+
+static void processKeypadGeoCheck(unsigned long now) {
+  if (keypadGeoChecksRemaining == 0 || now < keypadGeoCheckAt) {
+    return;
+  }
+
+  if (!bootPhaseComplete ||
+      !(currentState == STATE_STANDBY || currentState == STATE_IDLE ||
+        currentState == STATE_ENTERING_PIN || currentState == STATE_SHOW_MESSAGE)) {
+    clearKeypadGeoCheck();
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED || currentState == STATE_CONNECTING_WIFI) {
+    clearKeypadGeoCheck();
+    if (!isDisplayFailed()) {
+      updateDisplay("Offline", "Cannot check");
+    } else {
+      fallbackError();
+    }
+    messageStartAt = now;
+    currentState = STATE_SHOW_MESSAGE;
+    return;
+  }
+
+  fetchDeliveryContext();
+  lastDeliveryContextFetch = now;
+
+  if (isPinEligibleNow()) {
+    clearKeypadGeoCheck();
+    inputLen = 0;
+    inputCode[0] = '\0';
+    enterState(STATE_IDLE);
+    return;
+  }
+
+  keypadGeoChecksRemaining--;
+  if (keypadGeoChecksRemaining > 0) {
+    keypadGeoCheckAt = now + KEYPAD_GEO_CHECK_RETRY_DELAY_MS;
+    if (!isDisplayFailed()) {
+      updateDisplay("Checking area", "Wait...");
+    } else {
+      fallbackKeyFeedback();
+    }
+    messageStartAt = now;
+    currentState = STATE_SHOW_MESSAGE;
+    return;
+  }
+
+  showKeypadGeoCheckFailure(now);
 }
 
 static bool isUtilityKey(char key) {
@@ -997,6 +1082,8 @@ void loop() {
   }
 
   // ── 4. EC-86: Display health check ──
+  processKeypadGeoCheck(now);
+
   if (now - lastDisplayCheck >= DISPLAY_HEALTH_CHECK_MS) {
     if (!checkDisplayHealth()) {
       reportAlertToProxy("DISPLAY_FAILED",
@@ -1072,6 +1159,40 @@ void loop() {
     } else {
       zeroHoldStart = 0;
       zeroHoldTriggered = false;
+    }
+
+    // Long-press '9' to force a delivery context refresh from Firebase.
+    static unsigned long nineHoldStart = 0;
+    static bool nineHoldTriggered = false;
+    if (heldKey == '9') {
+      if (nineHoldStart == 0) nineHoldStart = now;
+      if (!nineHoldTriggered && (now - nineHoldStart) >= 1200) {
+        if (!bootPhaseComplete) {
+          clearKeypadGeoCheck();
+          if (!isDisplayFailed()) {
+            updateDisplay("Auth required", "Enter PIN");
+          }
+          messageStartAt = now;
+          currentState = STATE_SHOW_MESSAGE;
+        } else {
+          bool ok = requestContextRefresh();
+          if (ok) {
+            scheduleKeypadGeoCheck(now);
+          } else {
+            clearKeypadGeoCheck();
+            fetchDeliveryContext();
+            lastDeliveryContextFetch = now;
+          }
+          if (!isDisplayFailed()) {
+            updateDisplay(ok ? "Checking area" : "Refresh failed",
+                          ok ? "Wait..." : "Check network");
+          }
+        }
+        nineHoldTriggered = true;
+      }
+    } else {
+      nineHoldStart = 0;
+      nineHoldTriggered = false;
     }
 
     static bool stuckReported = false;

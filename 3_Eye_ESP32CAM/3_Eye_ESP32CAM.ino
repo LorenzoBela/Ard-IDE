@@ -67,8 +67,8 @@ char DEVICE_ID[24] = "OV3660_CAM_001";
 
 // ===================== DETECTION CONFIG =====================
 #define DETECTION_COOLDOWN_MS 5000     // Min time between uploads
-#define UPLOAD_FRAME_SIZE FRAMESIZE_HD // 1280×720
-#define UPLOAD_JPEG_QUALITY 8
+#define UPLOAD_FRAME_SIZE FRAMESIZE_VGA // 640x480, faster LTE proof upload
+#define UPLOAD_JPEG_QUALITY 12
 #define FACE_DETECT_WINDOW_MS 6000  // Repeated detect window per request
 #define FACE_DETECT_RETRY_GAP_MS 30 // Gap between detect attempts
 #define WIFI_BOOT_CONNECT_TIMEOUT_MS 120000

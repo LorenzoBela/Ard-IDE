@@ -68,6 +68,9 @@ void startWiFiConnection();
  *  Updates currentOtp, activeDeliveryId, hasActiveDelivery, lastStatusCommand. */
 void fetchDeliveryContext();
 
+/** Force proxy to refresh delivery context from Firebase (GET /refresh-context). */
+bool requestContextRefresh();
+
 /** Fetch cached diagnostics from proxy GET /diag (non-blocking budget). */
 bool fetchDiagnostics(ControllerDiagData &out);
 
