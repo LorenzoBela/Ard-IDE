@@ -313,6 +313,11 @@ static int readHttpResponse(String &bodyOut, unsigned long timeoutMs) {
   return statusCode;
 }
 
+// How many consecutive fetch failures before wiping the delivery context.
+// At ~1Hz polling this gives ~5s of tolerance for a brief WiFi blip.
+static uint8_t fetchFailCount = 0;
+static const uint8_t FETCH_FAIL_RESET_THRESHOLD = 5;
+
 void fetchDeliveryContext() {
   if (WiFi.status() != WL_CONNECTED) {
     netLog("[FETCH] Skip — WiFi not connected\n");
@@ -322,7 +327,12 @@ void fetchDeliveryContext() {
 
   // Ensure persistent TCP socket is alive.
   if (!ensurePersistentConnection()) {
-    hardResetDeliveryContext("tcp_connect_failed");
+    fetchFailCount++;
+    netLog("[FETCH] TCP connect failed (%u/%u)\n", fetchFailCount, FETCH_FAIL_RESET_THRESHOLD);
+    if (fetchFailCount >= FETCH_FAIL_RESET_THRESHOLD) {
+      fetchFailCount = 0;
+      hardResetDeliveryContext("tcp_connect_failed");
+    }
     return;
   }
 
@@ -342,7 +352,12 @@ void fetchDeliveryContext() {
     closePersistentConnection();
     // One retry with fresh connection
     if (!ensurePersistentConnection()) {
-      hardResetDeliveryContext("tcp_retry_failed");
+      fetchFailCount++;
+      netLog("[FETCH] TCP retry failed (%u/%u)\n", fetchFailCount, FETCH_FAIL_RESET_THRESHOLD);
+      if (fetchFailCount >= FETCH_FAIL_RESET_THRESHOLD) {
+        fetchFailCount = 0;
+        hardResetDeliveryContext("tcp_retry_failed");
+      }
       return;
     }
     persistentClient.printf(
@@ -354,18 +369,30 @@ void fetchDeliveryContext() {
     body = "";
     code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
     if (code < 0) {
-      netLog("[FETCH] Retry failed\n");
+      fetchFailCount++;
+      netLog("[FETCH] Retry failed (%u/%u)\n", fetchFailCount, FETCH_FAIL_RESET_THRESHOLD);
       closePersistentConnection();
-      hardResetDeliveryContext("http_get_failed");
+      if (fetchFailCount >= FETCH_FAIL_RESET_THRESHOLD) {
+        fetchFailCount = 0;
+        hardResetDeliveryContext("http_get_failed");
+      }
       return;
     }
   }
 
   netLog("[FETCH] HTTP %d\n", code);
   if (code != 200) {
-    hardResetDeliveryContext("http_non_200");
+    fetchFailCount++;
+    netLog("[FETCH] Non-200 response (%u/%u)\n", fetchFailCount, FETCH_FAIL_RESET_THRESHOLD);
+    if (fetchFailCount >= FETCH_FAIL_RESET_THRESHOLD) {
+      fetchFailCount = 0;
+      hardResetDeliveryContext("http_non_200");
+    }
     return;
   }
+
+  // Successful fetch — reset the failure counter.
+  fetchFailCount = 0;
 
   bool wasActive = hasActiveDelivery;
   lastStatusCommand = "";

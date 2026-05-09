@@ -28,7 +28,10 @@ extern char HARDWARE_ID[12];
 #define CAM_UART_BAUD 9600
 
 // ==================== PINS ====================
-#define LOCK_PIN          32    // MOSFET gate for solenoid
+#define LOCK_PIN          32    // Relay / MOSFET control pin
+#define LOCK_PIN_ON       LOW   // Active-Low relay: LOW = ON  (solenoid powered)
+#define LOCK_PIN_OFF      HIGH  // Active-Low relay: HIGH = OFF (solenoid unpowered, safe during boot)
+
 #define REED_SWITCH_PIN   4     // Lock position sensor (input-only GPIO)
 
 // Reed polarity/config:
