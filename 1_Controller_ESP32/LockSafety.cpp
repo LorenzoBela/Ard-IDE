@@ -57,8 +57,8 @@ static void deEnergise() {
 // ==================== PUBLIC API ====================
 
 void initLock() {
-  pinMode(LOCK_PIN, OUTPUT);
   digitalWrite(LOCK_PIN, LOW);
+  pinMode(LOCK_PIN, OUTPUT);
 
 #if REED_USE_INTERNAL_PULLUP
   pinMode(REED_SWITCH_PIN, INPUT_PULLUP);

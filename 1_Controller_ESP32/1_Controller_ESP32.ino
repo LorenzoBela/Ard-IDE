@@ -1496,13 +1496,7 @@ void handleStateMachine(unsigned long now) {
     if (messageStartAt > 0 && now - messageStartAt >= LCD_MESSAGE_DURATION) {
       messageStartAt = 0;
       if (!isDisplayFailed()) {
-        char masked[17] = "";
-        uint8_t i;
-        for (i = 0; i < bootAuthLen && i < 15; i++) {
-          masked[i] = (i == bootAuthLen - 1) ? bootAuthCode[i] : '*';
-        }
-        masked[i] = '\0';
-        updateDisplay("Rider PIN:", masked);
+        updateDisplay("Rider PIN:", bootAuthCode);
       }
     }
 
@@ -1521,17 +1515,16 @@ void handleStateMachine(unsigned long now) {
     displayBacklightOn();
 
     if (key == '*') {
-      bootAuthLen = 0;
-      bootAuthCode[0] = '\0';
-      if (bootPhaseComplete) {
-        // Post-boot voluntary auth: allow exiting
+      if (bootAuthLen > 0) {
+        bootAuthLen--;
+        bootAuthCode[bootAuthLen] = '\0';
+        if (!isDisplayFailed()) {
+          updateDisplay("Rider PIN:", bootAuthCode);
+        }
+      } else if (bootPhaseComplete) {
+        // Post-boot voluntary auth: allow exiting if backspace is pressed when empty
         enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
         break;
-      } else {
-        // Clear input but cannot exit — must authenticate.
-        if (!isDisplayFailed()) {
-          updateDisplay("Rider PIN:", "");
-        }
       }
     } else if (key == '#') {
       if (bootAuthLen == 0) break;
@@ -1600,17 +1593,7 @@ void handleStateMachine(unsigned long now) {
       bootAuthCode[bootAuthLen++] = key;
       bootAuthCode[bootAuthLen] = '\0';
       if (!isDisplayFailed()) {
-        char masked[17] = "";
-        uint8_t i;
-        for (i = 0; i < bootAuthLen && i < 15; i++) {
-          if (i == bootAuthLen - 1) {
-            masked[i] = bootAuthCode[i];
-          } else {
-            masked[i] = '*';
-          }
-        }
-        masked[i] = '\0';
-        updateDisplay("Rider PIN:", masked);
+        updateDisplay("Rider PIN:", bootAuthCode);
       }
     }
     break;
@@ -1810,9 +1793,21 @@ void handleStateMachine(unsigned long now) {
 
       if (key == '*') {
         stopUtilityMode(now);
-        inputLen = 0;
-        inputCode[0] = '\0';
-        enterState(STATE_IDLE);
+        if (inputLen > 0) {
+          inputLen--;
+          inputCode[inputLen] = '\0';
+          if (!isDisplayFailed()) {
+            char display[17];
+            snprintf(display, sizeof(display), "PIN: %s", inputCode);
+            if (isReturnOtpEligibleNow()) {
+              updateDisplay("Return PIN:", display);
+            } else {
+              updateDisplay("Enter PIN:", display);
+            }
+          }
+        } else {
+          enterState(STATE_IDLE);
+        }
       } else if (key == '#') {
         stopUtilityMode(now);
         if (inputLen > 0) enterState(STATE_VERIFYING_OTP);
@@ -1874,19 +1869,8 @@ void handleStateMachine(unsigned long now) {
           if (currentState == STATE_IDLE) currentState = STATE_ENTERING_PIN;
 
           if (!isDisplayFailed()) {
-            char masked[17] = "";
-            uint8_t i;
-            for (i = 0; i < inputLen && i < 15; i++) {
-              if (i == inputLen - 1) {
-                masked[i] = inputCode[i];
-              } else {
-                masked[i] = '*';
-              }
-            }
-            masked[i] = '\0';
-
             char display[17];
-            snprintf(display, sizeof(display), "PIN: %s", masked);
+            snprintf(display, sizeof(display), "PIN: %s", inputCode);
             if (isReturnOtpEligibleNow()) {
               updateDisplay("Return PIN:", display);
             } else {
@@ -1911,10 +1895,16 @@ void handleStateMachine(unsigned long now) {
       personalPinExpiresAt = now + PERSONAL_PIN_TIMEOUT_MS;
 
       if (key == '*') {
-        personalPinLen = 0;
-        personalPinCode[0] = '\0';
-        enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
-        break;
+        if (personalPinLen > 0) {
+          personalPinLen--;
+          personalPinCode[personalPinLen] = '\0';
+          if (!isDisplayFailed()) {
+            updateDisplay("Personal PIN:", personalPinCode);
+          }
+        } else {
+          enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
+          break;
+        }
       }
 
       if (key == '#') {
@@ -1971,17 +1961,7 @@ void handleStateMachine(unsigned long now) {
         personalPinCode[personalPinLen++] = key;
         personalPinCode[personalPinLen] = '\0';
         if (!isDisplayFailed()) {
-          char masked[17] = "";
-          uint8_t i;
-          for (i = 0; i < personalPinLen && i < 15; i++) {
-            if (i == personalPinLen - 1) {
-              masked[i] = personalPinCode[i];
-            } else {
-              masked[i] = '*';
-            }
-          }
-          masked[i] = '\0';
-          updateDisplay("Personal PIN:", masked);
+          updateDisplay("Personal PIN:", personalPinCode);
         }
       }
     }

@@ -3780,6 +3780,20 @@ void refreshDeliveryContextFromFirebase() {
     // ── EC-81: Parse top-level lockdown command only ──
     // Avoid matching nested fields like tamper.lockdown that can re-trigger
     // lockdown after admin clear.
+    char remoteTheftState[16] = {0};
+    bool hasTopLevelTheftState =
+        readTopLevelJsonString(body, "theft_state", remoteTheftState,
+                               sizeof(remoteTheftState));
+    if (hasTopLevelTheftState && strcmp(remoteTheftState, "STOLEN") == 0 &&
+        theftGuardGetState() != TG_STOLEN && !theftGuardIsLockdown() &&
+        !tamperSuppressedByAdmin) {
+      theftGuardReportTheft("admin_remote", millis(), "remote_mark_stolen");
+    } else if (hasTopLevelTheftState &&
+               strcmp(remoteTheftState, "NORMAL") == 0 &&
+               theftGuardIsStolen() && !theftGuardIsLockdown()) {
+      theftGuardReset();
+    }
+
     bool lockdownRequested = false;
     bool hasTopLevelLockdown =
         readTopLevelJsonBool(body, "lockdown", lockdownRequested);
