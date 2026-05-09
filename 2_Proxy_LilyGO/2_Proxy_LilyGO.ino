@@ -130,6 +130,11 @@ static WiFiClient keepAliveController;
 bool apStarted = false;
 String relayDiag =
     ""; // Diagnostics forwarded to ESP32-CAM via HTTP response body
+static bool photoUploadActive = false;
+static int photoUploadProgress = 0;
+static char photoUploadStatus[16] = "IDLE";
+static char photoUploadError[64] = "";
+static unsigned long photoUploadUpdatedAt = 0;
 
 // Cached Delivery Context from Firebase RTDB (served to Tester ESP32 via GET
 // /otp)
@@ -143,6 +148,7 @@ bool lastReturnActive = false;
 char cachedDeliveryId[64] = "";
 bool deliveryIdCacheValid = false;
 char cachedDeliveryStatus[32] = ""; // To track "ASSIGNED", "PICKED_UP", "IN_TRANSIT" etc.
+bool cachedSamePickupDropoff = false;
 char cachedPersonalPinHashMcu[65] = "";
 char cachedPersonalPinSalt[33] = "";
 char cachedPersonalPinRiderId[64] = "";
@@ -1784,6 +1790,50 @@ bool httpPatchWithRetry(const char *path, const char *jsonData) {
   return httpPatchToFirebase(path, String(jsonData));
 }
 
+void publishPhotoUploadState(const char *status, int progress,
+                             const char *deliveryId, size_t originalSize,
+                             const char *errorMessage = "") {
+  const char *safeStatus = status && status[0] ? status : "PENDING";
+  const char *safeDelivery =
+      (deliveryId && deliveryId[0]) ? deliveryId : "UNKNOWN_DELIVERY";
+  int clampedProgress = progress;
+  if (clampedProgress < 0)
+    clampedProgress = 0;
+  if (clampedProgress > 100)
+    clampedProgress = 100;
+
+  photoUploadActive = strcmp(safeStatus, "COMPLETED") != 0 &&
+                      strcmp(safeStatus, "FAILED") != 0;
+  photoUploadProgress = clampedProgress;
+  strncpy(photoUploadStatus, safeStatus, sizeof(photoUploadStatus) - 1);
+  photoUploadStatus[sizeof(photoUploadStatus) - 1] = '\0';
+  strncpy(photoUploadError, errorMessage ? errorMessage : "",
+          sizeof(photoUploadError) - 1);
+  photoUploadError[sizeof(photoUploadError) - 1] = '\0';
+  photoUploadUpdatedAt = millis();
+
+  bool terminalState = strcmp(safeStatus, "COMPLETED") == 0 ||
+                       strcmp(safeStatus, "FAILED") == 0;
+  if (!terminalState || !lteConnected) {
+    return;
+  }
+
+  char json[384];
+  snprintf(json, sizeof(json),
+           "{\"delivery_id\":\"%s\",\"status\":\"%s\","
+           "\"progress_percent\":%d,\"original_size_bytes\":%lu,"
+           "\"compressed_size_bytes\":%lu,\"compression_ratio\":1,"
+           "\"retry_count\":0,\"error_message\":\"%s\","
+           "\"upload_started_at\":{\".sv\":\"timestamp\"}}",
+           safeDelivery, safeStatus, clampedProgress,
+           (unsigned long)originalSize, (unsigned long)originalSize,
+           errorMessage ? errorMessage : "");
+
+  char path[80];
+  snprintf(path, sizeof(path), "/hardware/%s/photo_upload.json", HARDWARE_ID);
+  httpPatchWithRetry(path, json);
+}
+
 // ==================== FIREBASE SEND (snprintf â€” zero String allocs)
 // ====================
 void sendToFirebase() {
@@ -2048,6 +2098,154 @@ bool uploadToSupabaseViaLTE(const uint8_t *data, size_t len,
   modem.waitResponse(writeSec * 1000UL);
 
   // POST (action=1) â€” Supabase Storage accepts POST for object upsert/insert
+  modem.sendAT("+HTTPACTION=1");
+
+  waitStart = millis();
+  bool actionOK = false;
+  int httpStatus = 0;
+  while (millis() - waitStart < 60000) {
+    esp_task_wdt_reset();
+    if (modem.stream.available()) {
+      String line = modem.stream.readStringUntil('\n');
+      if (line.indexOf("+HTTPACTION:") >= 0) {
+        int c1 = line.indexOf(',');
+        int c2 = line.indexOf(',', c1 + 1);
+        if (c1 > 0 && c2 > 0)
+          httpStatus = line.substring(c1 + 1, c2).toInt();
+        actionOK = true;
+        break;
+      }
+    }
+    delay(50);
+  }
+
+  sendATAndWait("+HTTPTERM", 1000);
+
+  char diagBuf[48];
+  snprintf(diagBuf, sizeof(diagBuf), "%s:supabase_http_%d",
+           (actionOK && (httpStatus == 200 || httpStatus == 201)) ? "OK"
+                                                                  : "FAIL",
+           httpStatus);
+  relayDiag = diagBuf;
+  Serial.printf("[RELAY] Modem HTTP status: %d (actionOK=%d)\n", httpStatus,
+                (int)actionOK);
+
+  if (actionOK && (httpStatus == 200 || httpStatus == 201)) {
+    Serial.printf("[RELAY] Supabase upload OK (HTTP %d)\n", httpStatus);
+    dataBytesOut += len;
+    return true;
+  }
+
+  Serial.printf("[RELAY] Supabase upload FAILED (HTTP %d)\n", httpStatus);
+  return false;
+}
+
+// Stream a camera upload directly from the ESP32-CAM socket into the modem.
+// This avoids imposing a product-level JPEG cap just because the proxy heap
+// cannot malloc the whole proof image at once.
+bool uploadClientToSupabaseViaLTE(WiFiClient &source, size_t len,
+                                  const String &objectPath) {
+  relayDiag = "";
+  if (!lteConnected) {
+    relayDiag = "FAIL:lte_not_connected";
+    Serial.println("[RELAY] LTE not connected, cannot upload");
+    return false;
+  }
+  Serial.printf("[RELAY] Streaming %u bytes -> Supabase path: %s\n", len,
+                objectPath.c_str());
+
+  String resp;
+  sendATAndWait("+HTTPTERM", 1000);
+  delay(200);
+
+  modem.sendAT("+HTTPINIT");
+  if (modem.waitResponse(5000L, resp) != 1) {
+    relayDiag = "FAIL:httpinit_failed";
+    Serial.println("[RELAY] HTTPINIT failed");
+    return false;
+  }
+
+  modem.sendAT("+HTTPPARA=\"CID\",1");
+  modem.waitResponse(3000L);
+
+  String url = String(SUPABASE_URL) + "/storage/v1/object/" +
+               String(SUPABASE_BUCKET) + "/" + objectPath;
+  modem.sendAT(("+HTTPPARA=\"URL\",\"" + url + "\"").c_str());
+  modem.waitResponse(3000L);
+
+  modem.sendAT("+HTTPPARA=\"CONTENT\",\"image/jpeg\"");
+  modem.waitResponse(3000L);
+
+  String hdrs = String("Authorization: Bearer ") + SUPABASE_ANON_KEY;
+  modem.sendAT(("+HTTPPARA=\"USERDATA\",\"" + hdrs + "\"").c_str());
+  modem.waitResponse(3000L);
+
+  modem.sendAT("+CSSLCFG=\"sslversion\",1,4");
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"ignorertctime\",1,1");
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"authmode\",1,0");
+  modem.waitResponse(2000L);
+  modem.sendAT("+CSSLCFG=\"enableSNI\",1,1");
+  modem.waitResponse(2000L);
+  modem.sendAT("+HTTPPARA=\"SSLCFG\",1");
+  modem.waitResponse(2000L);
+  modem.sendAT("+HTTPSSL=1");
+  modem.waitResponse(3000L);
+
+  unsigned long dataTimeoutMs = ((unsigned long)(len / 9000UL) + 20UL) * 1000UL;
+  if (dataTimeoutMs < 60000UL) {
+    dataTimeoutMs = 60000UL;
+  }
+  modem.sendAT(("+HTTPDATA=" + String((unsigned long)len) + "," +
+                String(dataTimeoutMs))
+                   .c_str());
+
+  unsigned long waitStart = millis();
+  bool gotDownload = false;
+  while (millis() - waitStart < 5000) {
+    if (modem.stream.available()) {
+      String line = modem.stream.readStringUntil('\n');
+      if (line.indexOf("DOWNLOAD") >= 0) {
+        gotDownload = true;
+        break;
+      }
+    }
+    delay(10);
+    esp_task_wdt_reset();
+  }
+  if (!gotDownload) {
+    relayDiag = "FAIL:no_download_prompt";
+    Serial.println("[RELAY] No DOWNLOAD prompt");
+    sendATAndWait("+HTTPTERM", 1000);
+    return false;
+  }
+
+  source.setTimeout(30000);
+  uint8_t chunk[1024];
+  size_t streamed = 0;
+  while (streamed < len) {
+    size_t remaining = len - streamed;
+    size_t toRead = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+    size_t received = source.readBytes(chunk, toRead);
+    if (received != toRead) {
+      relayDiag = "FAIL:cam_stream_incomplete";
+      Serial.printf("[RELAY] Camera stream incomplete %u/%u\n",
+                    (unsigned int)(streamed + received), (unsigned int)len);
+      sendATAndWait("+HTTPTERM", 1000);
+      return false;
+    }
+
+    modem.stream.write(chunk, received);
+    modem.stream.flush();
+    streamed += received;
+    delay(20);
+    esp_task_wdt_reset();
+  }
+
+  unsigned long writeSec = (len / 11520UL) + 15UL;
+  modem.waitResponse(writeSec * 1000UL);
+
   modem.sendAT("+HTTPACTION=1");
 
   waitStart = millis();
@@ -3222,6 +3420,17 @@ void refreshDeliveryContextFromFirebase() {
       }
     }
 
+    // Same-site demo bookings use one physical location for pickup and dropoff.
+    // Keep this top-level flag close to the delivery context so /otp can expose
+    // the dropoff phase immediately after pickup is confirmed.
+    {
+      bool sameSiteValue = false;
+      cachedSamePickupDropoff =
+          deliveryIdCacheValid &&
+          readTopLevelJsonBool(body, "same_pickup_dropoff", sameSiteValue) &&
+          sameSiteValue;
+    }
+
     if (prevDeliveryValid && deliveryIdCacheValid &&
         strcmp(prevDeliveryId, cachedDeliveryId) != 0) {
       lastKnownDistMeters = -1;
@@ -4079,6 +4288,7 @@ void handleCameraClient() {
   size_t contentLength = 0;
   String objectPath =
       "esp32cam/" + String(CAM_PREFIX) + "/relay_" + String(millis()) + ".jpg";
+  String proofRole = "full";
 
   while (true) {
     String line = client.readStringUntil('\n');
@@ -4094,6 +4304,10 @@ void handleCameraClient() {
     } else if (lower.startsWith("x-object-path:")) {
       objectPath = line.substring(14);
       objectPath.trim();
+    } else if (lower.startsWith("x-proof-role:")) {
+      proofRole = line.substring(13);
+      proofRole.trim();
+      proofRole.toLowerCase();
     }
   }
 
@@ -4133,6 +4347,9 @@ void handleCameraClient() {
     // Compute geofence state for structured response fields.
     bool insideGeo = false;
     int distMeters = -1;  // -1 = unknown (no GPS fix or no target coords)
+    bool pickupInside = false;
+    bool dropoffInside = false;
+    const char *phaseStr = "NONE";
 
     if (theftGuardShouldBlockOtp()) {
       otpPart = "NO_OTP";
@@ -4170,6 +4387,14 @@ void handleCameraClient() {
                           : geoProxy.isNearDropoff(gpsLat, gpsLon);
         insideGeo = atTarget;
         distMeters = (int)geoProxy.snap.distanceM;
+        if (destCoordsValid) {
+          dropoffInside = (haversineMeters(gpsLat, gpsLon, destLat, destLon) <=
+                           GEO_OUTER_RADIUS_M);
+        }
+        if (pickupCoordsValid) {
+          pickupInside = (haversineMeters(gpsLat, gpsLon, pickupLat, pickupLon) <=
+                          GEO_OUTER_RADIUS_M);
+        }
       } else if (haveTargets && !gpsFix) {
         // GPS-loss fallback: preserve the last confirmed geofence state.
         // The GeofenceProxy hysteresis state machine (EC-94) retains its
@@ -4178,6 +4403,11 @@ void handleCameraClient() {
         // does not invalidate that (the box hasn't physically moved).
         // This prevents "No GPS / Not at destination" lockout indoors.
         insideGeo = geoProxy.isArrived();
+        if (returnActive) {
+          pickupInside = insideGeo;
+        } else {
+          dropoffInside = insideGeo;
+        }
         bool usedLastConfirmed = insideGeo;
         bool usedPhoneFallback = false;
         distMeters = (int)geoProxy.snap.distanceM;
@@ -4220,6 +4450,14 @@ void handleCameraClient() {
           }
           distMeters = (int)(distActive + 0.5);
           usedPhoneFallback = true;
+          if (destCoordsValid) {
+            dropoffInside = (haversineMeters(phoneLat, phoneLon, destLat, destLon) <=
+                             GEO_OUTER_RADIUS_M);
+          }
+          if (pickupCoordsValid) {
+            pickupInside = (haversineMeters(phoneLat, phoneLon, pickupLat, pickupLon) <=
+                            GEO_OUTER_RADIUS_M);
+          }
 
           if (nowMs - lastPhoneFallbackLogAtMs >= 10000) {
             Serial.printf("[AP] Phone fallback: age=%lus dist=%dm acc=%.1fm\n",
@@ -4241,6 +4479,7 @@ void handleCameraClient() {
         if (!insideGeo && strcmp(cachedDeliveryStatus, "ARRIVED") == 0) {
           insideGeo = true;
           distMeters = 0;
+          dropoffInside = true;
           Serial.println("[AP] GPS-loss fallback: Firebase status ARRIVED, granting GEO:1");
         } else if (insideGeo && usedLastConfirmed && !usedPhoneFallback) {
           Serial.println("[AP] GPS-loss fallback: using last confirmed ARRIVED state");
@@ -4253,10 +4492,23 @@ void handleCameraClient() {
         if (strcmp(cachedDeliveryStatus, "ARRIVED") == 0) {
           insideGeo = true;
           distMeters = 0;
+          dropoffInside = true;
           Serial.println("[AP] No dest coords — Firebase ARRIVED override, granting GEO:1");
         } else {
           Serial.printf("[AP] No dest coords, delivery active but status='%s' — GEO:0\n",
                         cachedDeliveryStatus);
+        }
+      }
+
+      if (cachedSamePickupDropoff) {
+        if (pickupInside) {
+          dropoffInside = true;
+          insideGeo = true;
+          distMeters = 0;
+        } else if (dropoffInside) {
+          pickupInside = true;
+          insideGeo = true;
+          distMeters = 0;
         }
       }
 
@@ -4269,6 +4521,24 @@ void handleCameraClient() {
         distMeters = lastKnownDistMeters;
         insideGeo = lastKnownInside;
       }
+    }
+
+    if (returnActive) {
+      phaseStr = "RETURN";
+    } else if (!deliveryIdCacheValid) {
+      phaseStr = "NONE";
+    } else if (strcmp(cachedDeliveryStatus, "ARRIVED") == 0 ||
+               (cachedSamePickupDropoff &&
+                (strcmp(cachedDeliveryStatus, "IN_TRANSIT") == 0 ||
+                 strcmp(cachedDeliveryStatus, "PICKED_UP") == 0 ||
+                 strcmp(cachedDeliveryStatus, "PICKEDUP") == 0))) {
+      phaseStr = "DROPOFF";
+    } else if (strcmp(cachedDeliveryStatus, "IN_TRANSIT") == 0 ||
+               strcmp(cachedDeliveryStatus, "PICKED_UP") == 0 ||
+               strcmp(cachedDeliveryStatus, "PICKEDUP") == 0) {
+      phaseStr = "IN_TRANSIT";
+    } else {
+      phaseStr = "PICKUP";
     }
 
     String body = otpPart + "," + delPart;
@@ -4291,10 +4561,13 @@ void handleCameraClient() {
       body += ",";
     }
 
-    // Append structured geofence fields: DIST:N,GEO:0|1,RET:0|1
-    char geoFields[48];
-    snprintf(geoFields, sizeof(geoFields), ",DIST:%d,GEO:%d,RET:%d",
-             distMeters, insideGeo ? 1 : 0, returnActive ? 1 : 0);
+    // Append structured geofence fields: DIST:N,GEO:0|1,RET:0|1,PHASE:*,PUP:0|1,DRO:0|1
+    char geoFields[96];
+    snprintf(geoFields, sizeof(geoFields),
+         ",DIST:%d,GEO:%d,RET:%d,PHASE:%s,PUP:%d,DRO:%d",
+         distMeters, insideGeo ? 1 : 0, returnActive ? 1 : 0,
+         phaseStr ? phaseStr : "NONE", pickupInside ? 1 : 0,
+         dropoffInside ? 1 : 0);
     body += String(geoFields);
 
     Serial.printf("[AP] -> GET /otp  serving: '%s'\n", body.c_str());
@@ -4627,9 +4900,9 @@ void handleCameraClient() {
     bool ctrlUp = controllerLastSeenAt > 0 &&
             (ctrlAgeMs <= CONTROLLER_LIVENESS_STALE_MS);
 
-     char body[640];
+     char body[760];
     snprintf(body, sizeof(body),
-       "batt_pct=%d,batt_v=%.2f,batt_mah=%lu,batt_cap_mah=%lu,batt_pin_mv=%d,batt_adc=%d,batt_ok=%d,batt_b_pct=%d,batt_b_v=%.2f,batt_b_mah=%lu,batt_b_ok=%d,rssi=%d,csq=%d,gps_fix=%d,lte=%d,modem=%d,time=%d,fb_fail=%u,uptime=%lu,cam_up=%d,cam_age=%lu,ctrl_up=%d,ctrl_age=%lu,cmd_stage=%u,cmd_pending=%d,conn_state=%u,lte_reconn_ms=%lu",
+       "batt_pct=%d,batt_v=%.2f,batt_mah=%lu,batt_cap_mah=%lu,batt_pin_mv=%d,batt_adc=%d,batt_ok=%d,batt_b_pct=%d,batt_b_v=%.2f,batt_b_mah=%lu,batt_b_ok=%d,rssi=%d,csq=%d,gps_fix=%d,lte=%d,modem=%d,time=%d,fb_fail=%u,uptime=%lu,cam_up=%d,cam_age=%lu,ctrl_up=%d,ctrl_age=%lu,cmd_stage=%u,cmd_pending=%d,conn_state=%u,lte_reconn_ms=%lu,upload_active=%d,upload_pct=%d,upload_status=%s,upload_age=%lu",
              batteryGetPercentage(BATT_CH_A), batteryGetVoltage(BATT_CH_A),
          (unsigned long)batteryGetRemainingMah(BATT_CH_A),
          (unsigned long)batteryGetCapacityMah(BATT_CH_A),
@@ -4653,7 +4926,11 @@ void handleCameraClient() {
        (unsigned int)cachedStatusStage,
        (cachedStatusStage == CMD_STAGE_PENDING) ? 1 : 0,
        (unsigned int)connectivityState,
-       lastLteReconnectLatencyMs);
+       lastLteReconnectLatencyMs,
+       photoUploadActive ? 1 : 0,
+       photoUploadProgress,
+       photoUploadStatus,
+       photoUploadUpdatedAt > 0 ? (unsigned long)(nowMs - photoUploadUpdatedAt) : 0);
 
     String resp =
         "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\n"
@@ -4690,26 +4967,18 @@ void handleCameraClient() {
 
   bool uploadOK = false;
   String failReason = "";
-  if (contentLength == 0 || contentLength > 400000) {
+  bool isPreviewProof = proofRole == "preview";
+  if (contentLength == 0) {
     failReason = "FAIL:bad_cl:" + String(contentLength);
   } else {
-    uint8_t *buf = (uint8_t *)malloc(contentLength);
-    if (!buf) {
-      failReason = "FAIL:malloc_oom";
-    } else {
-      client.setTimeout(30000);
-      size_t received = client.readBytes(buf, contentLength);
-      esp_task_wdt_reset();
-      if (received == contentLength) {
-        uploadOK = uploadToSupabaseViaLTE(buf, contentLength, objectPath);
-        if (!uploadOK)
-          failReason = relayDiag;
-      } else {
-        failReason =
-            "FAIL:incomplete:" + String(received) + "/" + String(contentLength);
-      }
-      free(buf);
-    }
+    publishPhotoUploadState(isPreviewProof ? "COMPRESSING" : "UPLOADING",
+                            isPreviewProof ? 15 : 45,
+                            deliveryIdCacheValid ? cachedDeliveryId
+                                                 : "UNKNOWN_DELIVERY",
+                            contentLength);
+    uploadOK = uploadClientToSupabaseViaLTE(client, contentLength, objectPath);
+    if (!uploadOK)
+      failReason = relayDiag;
   }
 
   // Write the public URL back to Firebase so web/mobile apps can find the image
@@ -4720,13 +4989,21 @@ void handleCameraClient() {
              SUPABASE_URL, SUPABASE_BUCKET, objectPath.c_str());
 
     if (deliveryIdCacheValid && cachedDeliveryId[0] != '\0') {
-      // Write the delivery proof first; ArrivalScreen listens here and can
-      // show the photo as soon as this patch lands.
+      // Preview photos unlock the app UI quickly; full photos preserve the
+      // existing archival proof fields.
       char deliveryJson[768];
-      snprintf(deliveryJson, sizeof(deliveryJson),
-               "{\"proof_photo_url\":\"%s\",\"proof_photo_object_path\":\"%s\","
-               "\"proof_photo_uploaded_at\":{\".sv\":\"timestamp\"}}",
-               publicUrl, objectPath.c_str());
+      if (isPreviewProof) {
+        snprintf(deliveryJson, sizeof(deliveryJson),
+                 "{\"proof_photo_preview_url\":\"%s\","
+                 "\"proof_photo_preview_object_path\":\"%s\","
+                 "\"proof_photo_preview_uploaded_at\":{\".sv\":\"timestamp\"}}",
+                 publicUrl, objectPath.c_str());
+      } else {
+        snprintf(deliveryJson, sizeof(deliveryJson),
+                 "{\"proof_photo_url\":\"%s\",\"proof_photo_object_path\":\"%s\","
+                 "\"proof_photo_uploaded_at\":{\".sv\":\"timestamp\"}}",
+                 publicUrl, objectPath.c_str());
+      }
       char deliveryPath[96];
       snprintf(deliveryPath, sizeof(deliveryPath),
                "/deliveries/%s.json", cachedDeliveryId);
@@ -4735,11 +5012,20 @@ void handleCameraClient() {
                     deliveryFbOK ? "OK" : "FAIL");
 
       char auditJson[768];
-      snprintf(auditJson, sizeof(auditJson),
-               "{\"delivery_id\":\"%s\",\"box_id\":\"%s\","
-               "\"latest_photo_url\":\"%s\",\"latest_photo_object_path\":\"%s\","
-               "\"latest_photo_uploaded_at\":{\".sv\":\"timestamp\"}}",
-               cachedDeliveryId, HARDWARE_ID, publicUrl, objectPath.c_str());
+      if (isPreviewProof) {
+        snprintf(auditJson, sizeof(auditJson),
+                 "{\"delivery_id\":\"%s\",\"box_id\":\"%s\","
+                 "\"latest_photo_preview_url\":\"%s\","
+                 "\"latest_photo_preview_object_path\":\"%s\","
+                 "\"latest_photo_preview_uploaded_at\":{\".sv\":\"timestamp\"}}",
+                 cachedDeliveryId, HARDWARE_ID, publicUrl, objectPath.c_str());
+      } else {
+        snprintf(auditJson, sizeof(auditJson),
+                 "{\"delivery_id\":\"%s\",\"box_id\":\"%s\","
+                 "\"latest_photo_url\":\"%s\",\"latest_photo_object_path\":\"%s\","
+                 "\"latest_photo_uploaded_at\":{\".sv\":\"timestamp\"}}",
+                 cachedDeliveryId, HARDWARE_ID, publicUrl, objectPath.c_str());
+      }
       char auditPath[96];
       snprintf(auditPath, sizeof(auditPath),
                "/audit_logs/%s.json", cachedDeliveryId);
@@ -4747,22 +5033,38 @@ void handleCameraClient() {
 
       // CRITICAL: The Web Tracking page Server-Side-Render uses the Supabase 'deliveries' table directly.
       // We must write the proof_photo_url to Supabase via REST API right after upload.
-      char supabaseDeliveryJson[320];
-      snprintf(supabaseDeliveryJson, sizeof(supabaseDeliveryJson),
-               "{\"proof_photo_url\":\"%s\"}", publicUrl);
-      httpPatchSupabase("deliveries", cachedDeliveryId, supabaseDeliveryJson);
+      if (!isPreviewProof) {
+        char supabaseDeliveryJson[320];
+        snprintf(supabaseDeliveryJson, sizeof(supabaseDeliveryJson),
+                 "{\"proof_photo_url\":\"%s\"}", publicUrl);
+        httpPatchSupabase("deliveries", cachedDeliveryId, supabaseDeliveryJson);
+      }
     }
 
     char urlJson[384];
     snprintf(urlJson, sizeof(urlJson),
              "{\"last_upload_public_url\":\"%s\",\"last_upload_object_path\":\"%s\","
+             "\"last_upload_role\":\"%s\","
              "\"last_upload_uploaded_at\":{\".sv\":\"timestamp\"}}",
-             publicUrl, objectPath.c_str());
+             publicUrl, objectPath.c_str(), isPreviewProof ? "preview" : "full");
 
     char camPath[64];
     snprintf(camPath, sizeof(camPath), "/hardware/%s/camera.json", HARDWARE_ID);
     bool fbOK = httpPatchWithRetry(camPath, urlJson);
     Serial.printf("[RELAY] Firebase URL writeback: %s\n", fbOK ? "OK" : "FAIL");
+  }
+
+  if (uploadOK) {
+    publishPhotoUploadState("COMPLETED", 100,
+                            deliveryIdCacheValid ? cachedDeliveryId
+                                                 : "UNKNOWN_DELIVERY",
+                            contentLength);
+  } else {
+    publishPhotoUploadState("FAILED", 0,
+                            deliveryIdCacheValid ? cachedDeliveryId
+                                                 : "UNKNOWN_DELIVERY",
+                            contentLength,
+                            failReason.c_str());
   }
 
   String body = uploadOK ? ("OK:" + relayDiag) : failReason;

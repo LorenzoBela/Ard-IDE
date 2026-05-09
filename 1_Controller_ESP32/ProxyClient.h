@@ -27,6 +27,9 @@ extern String lastStatusCommand;
 extern int16_t geoDistMeters;    // Distance in meters to current target (-1 = unknown)
 extern bool    geoInsideFence;   // True if inside the outer geofence radius
 extern bool    isReturning;      // True if return-to-sender mode is active
+extern char    deliveryPhase[12]; // PICKUP | IN_TRANSIT | DROPOFF | RETURN | NONE
+extern bool    pickupInsideFence; // Inside pickup geofence
+extern bool    dropoffInsideFence; // Inside dropoff geofence
 
 struct ControllerDiagData {
 	int battPct;
@@ -43,9 +46,12 @@ struct ControllerDiagData {
 	int firebaseFailures;
 	int commandStage;
 	int connectivityState;
+	bool photoUploadActive;
+	int photoUploadProgress;
 	unsigned long camAgeMs;
 	unsigned long controllerAgeMs;
 	unsigned long lteReconnectMs;
+	unsigned long photoUploadAgeMs;
 	unsigned long proxyUptimeMs;
 };
 
@@ -65,7 +71,8 @@ void maintainWiFiConnection(unsigned long now);
 void startWiFiConnection();
 
 /** Fetch OTP + delivery_id + optional status from proxy GET /otp.
- *  Updates currentOtp, activeDeliveryId, hasActiveDelivery, lastStatusCommand. */
+ *  Updates currentOtp, activeDeliveryId, hasActiveDelivery, lastStatusCommand,
+ *  and phase/geofence fields. */
 void fetchDeliveryContext();
 
 /** Force proxy to refresh delivery context from Firebase (GET /refresh-context). */
@@ -97,7 +104,8 @@ bool reportEventToProxy(bool otpValid,
 bool reportAlertToProxy(const char *alertType, const char *details);
 
 /** Request face check via proxy GET /face-check, with UART Serial2 fallback.
- *  Returns: 1 = face detected, 0 = no face, -1 = error/timeout. */
+ *  Returns: 1 = face detected, 2 = low-light no-face,
+ *           0 = no face, -1 = error/timeout. */
 int requestFaceCheck();
 
 /**

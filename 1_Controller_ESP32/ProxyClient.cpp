@@ -27,6 +27,9 @@ String lastStatusCommand     = "";
 int16_t geoDistMeters        = -1;
 bool    geoInsideFence       = false;
 bool    isReturning          = false;
+char    deliveryPhase[12]    = "NONE";
+bool    pickupInsideFence    = false;
+bool    dropoffInsideFence   = false;
 
 // ── WiFi backoff state ──
 static unsigned long wifiRetryAt    = 0;
@@ -49,6 +52,10 @@ static void hardResetDeliveryContext(const char *reason) {
   geoDistMeters = -1;
   geoInsideFence = false;
   isReturning = false;
+  strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
+  deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
+  pickupInsideFence = false;
+  dropoffInsideFence = false;
   netLog("[FETCH] Hard reset delivery context (%s)\n",
          reason ? reason : "unknown");
 }
@@ -365,11 +372,15 @@ void fetchDeliveryContext() {
   geoDistMeters = -1;
   geoInsideFence = false;
   isReturning = false;
+  strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
+  deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
+  pickupInsideFence = false;
+  dropoffInsideFence = false;
 
   if (code == 200) {
     netLog("[FETCH] Body: '%s'\n", body.c_str());
 
-    // New format: OTP,DELIVERY_ID,STATUS,DIST:N,GEO:0|1,RET:0|1
+    // New format: OTP,DELIVERY_ID,STATUS,DIST:N,GEO:0|1,RET:0|1,PHASE:*,PUP:0|1,DRO:0|1
     // Fields are comma-separated. STATUS may be empty. DIST/GEO/RET are
     // key:value pairs appended after the first 3 positional fields.
     int firstComma  = body.indexOf(',');
@@ -412,6 +423,36 @@ void fetchDeliveryContext() {
         isReturning = (body.charAt(retIdx + 4) == '1');
       }
 
+      // Parse phase + pickup/dropoff fence flags (optional, fail-closed)
+      bool phaseParsed = false;
+      int phaseIdx = body.indexOf("PHASE:");
+      if (phaseIdx >= 0) {
+        int valStart = phaseIdx + 6;
+        int valEnd = body.indexOf(',', valStart);
+        if (valEnd < 0) valEnd = body.length();
+        String phase = body.substring(valStart, valEnd);
+        phase.trim();
+        if (phase.length() > 0 && phase.length() < (int)sizeof(deliveryPhase)) {
+          strncpy(deliveryPhase, phase.c_str(), sizeof(deliveryPhase) - 1);
+          deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
+          phaseParsed = true;
+        }
+      }
+
+      int pupIdx = body.indexOf("PUP:");
+      if (pupIdx >= 0) {
+        pickupInsideFence = (body.charAt(pupIdx + 4) == '1');
+      }
+      int droIdx = body.indexOf("DRO:");
+      if (droIdx >= 0) {
+        dropoffInsideFence = (body.charAt(droIdx + 4) == '1');
+      }
+
+      if (!phaseParsed) {
+        strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
+        deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
+      }
+
       bool validOtp = (otpPart != "NO_OTP" && otpPart != "null" &&
                        otpPart.length() > 0 && otpPart.length() <= 6);
       bool validDel = (delPart != "NO_DELIVERY" && delPart != "null" &&
@@ -431,9 +472,17 @@ void fetchDeliveryContext() {
       }
 
       hasActiveDelivery = validDel;
-      netLog("[FETCH] otp=%d del=%d dist=%d geo=%d ret=%d cmd='%s'\n",
-             validOtp, validDel, geoDistMeters, geoInsideFence ? 1 : 0,
-             isReturning ? 1 : 0, lastStatusCommand.c_str());
+      if (!hasActiveDelivery) {
+        strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
+        deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
+        pickupInsideFence = false;
+        dropoffInsideFence = false;
+      }
+            netLog("[FETCH] otp=%d del=%d dist=%d geo=%d ret=%d phase=%s pup=%d dro=%d cmd='%s'\n",
+              validOtp, validDel, geoDistMeters, geoInsideFence ? 1 : 0,
+              isReturning ? 1 : 0, deliveryPhase,
+              pickupInsideFence ? 1 : 0, dropoffInsideFence ? 1 : 0,
+              lastStatusCommand.c_str());
     } else {
       // Legacy format (just OTP, no delivery_id)
       if (body != "NO_OTP" && body != "null" && body.length() > 0 &&
@@ -589,6 +638,18 @@ bool fetchDiagnostics(ControllerDiagData &out) {
     parsed.lteReconnectMs = (unsigned long)field.toInt();
     parsedAny = true;
   }
+  if (parseDiagField(body, "upload_active", field)) {
+    parsed.photoUploadActive = (field.toInt() != 0);
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "upload_pct", field)) {
+    parsed.photoUploadProgress = field.toInt();
+    parsedAny = true;
+  }
+  if (parseDiagField(body, "upload_age", field)) {
+    parsed.photoUploadAgeMs = (unsigned long)field.toInt();
+    parsedAny = true;
+  }
   if (parseDiagField(body, "cam_age", field)) {
     parsed.camAgeMs = (unsigned long)field.toInt();
     parsedAny = true;
@@ -613,6 +674,8 @@ bool fetchDiagnostics(ControllerDiagData &out) {
   if (parsed.csq > 31) parsed.csq = 31;
   if (parsed.firebaseFailures < 0) parsed.firebaseFailures = 0;
   if (parsed.commandStage < 0) parsed.commandStage = 0;
+  if (parsed.photoUploadProgress < 0) parsed.photoUploadProgress = 0;
+  if (parsed.photoUploadProgress > 100) parsed.photoUploadProgress = 100;
 
   out = parsed;
   return true;
@@ -849,8 +912,9 @@ int requestFaceCheck() {
       body.trim();
       http.end();
 
-      if (body.indexOf("FACE_OK") >= 0)  return 1;
-      if (body.indexOf("NO_FACE") >= 0)  return 0;
+      if (body.indexOf("FACE_OK") >= 0) return 1;
+      if (body.indexOf("NO_FACE_LOW_LIGHT") >= 0) return 2;
+      if (body.indexOf("NO_FACE") >= 0) return 0;
 
       Serial.printf("[FACE] HTTP 200 but body error: %s\n", body.c_str());
     } else {
@@ -894,6 +958,7 @@ int requestFaceCheck() {
   Serial.printf("[FACE] UART response: '%s'\n", uartBuf);
 
   if (strstr(uartBuf, "FACE_OK") != NULL) return 1;
+  if (strstr(uartBuf, "NO_FACE_LOW_LIGHT") != NULL) return 2;
   if (strstr(uartBuf, "NO_FACE") != NULL) return 0;
 
   Serial.println(F("[FACE] UART fallback failed"));

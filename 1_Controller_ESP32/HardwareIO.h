@@ -35,6 +35,9 @@ bool toggleBacklightOverride();
 /** Read one keypad character (non-blocking). Returns '\0' if nothing pressed. */
 char readKeypad();
 
+/** Drain any buffered keypad digits (non-blocking). */
+void drainKeypadBuffer();
+
 /** Get the currently held key (thread-safe, for EC-82 stuck detection). */
 char getHeldKey();
 

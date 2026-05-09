@@ -66,9 +66,17 @@ char DEVICE_ID[24] = "OV3660_CAM_001";
 #define UPLOAD_RETRY_MAX_MS 60000
 
 // ===================== DETECTION CONFIG =====================
-#define DETECTION_COOLDOWN_MS 5000     // Min time between uploads
-#define UPLOAD_FRAME_SIZE FRAMESIZE_VGA // 640x480, faster LTE proof upload
-#define UPLOAD_JPEG_QUALITY 12
+#define DETECTION_COOLDOWN_MS 5000 // Min time between uploads
+#define PREVIEW_FRAME_SIZE FRAMESIZE_VGA
+#define PREVIEW_JPEG_QUALITY 12
+#define UPLOAD_FRAME_SIZE FRAMESIZE_SVGA
+#define UPLOAD_JPEG_QUALITY 10
+#define LOW_LIGHT_LUMA_THRESHOLD 38
+#define BRIGHT_LIGHT_LUMA_THRESHOLD 170
+#define UPLOAD_EXPOSURE_SETTLE_MS 900
+#define LOW_LIGHT_EXPOSURE_SETTLE_MS 1400
+#define DETECT_PROFILE_SETTLE_MS 250
+#define UPLOAD_STALE_FLUSH_FRAMES 3
 #define FACE_DETECT_WINDOW_MS 6000  // Repeated detect window per request
 #define FACE_DETECT_RETRY_GAP_MS 30 // Gap between detect attempts
 #define WIFI_BOOT_CONNECT_TIMEOUT_MS 120000
@@ -104,6 +112,9 @@ static bool cameraInDetectMode = true;
 static bool cameraSleepMode = false;
 static bool camRebootPending = false;
 static unsigned long camRebootAtMs = 0;
+static uint8_t lastDetectLuma = 255;
+static bool lastFaceWindowLowLight = false;
+static bool lastFaceWindowBright = false;
 
 // Deferred upload flag — set by face-check handlers, executed in loop()
 static bool pendingUpload = false;
@@ -179,7 +190,8 @@ void netLog(const char *format, ...) {
 } // ===================== HELPERS =====================
 
 bool uploadToSupabase(const uint8_t *data, size_t len,
-                      const String &objectPath);
+                      const String &objectPath,
+                      const char *proofRole = "full");
 
 static uint32_t fnv1a32(const char *text) {
   const char *src = text ? text : "";
@@ -259,7 +271,7 @@ static void clearPendingPayloadStorage() {
 
 static bool savePendingPayload(const uint8_t *data, size_t len,
                                const String &objectPath) {
-  if (!payloadStoreReady || !data || len == 0 || len > 400000) {
+  if (!payloadStoreReady || !data || len == 0) {
     return false;
   }
 
@@ -296,7 +308,7 @@ static bool uploadPendingPayloadFromStorage() {
   }
 
   size_t len = (size_t)f.size();
-  if (len == 0 || len > 400000) {
+  if (len == 0) {
     f.close();
     return false;
   }
@@ -317,7 +329,7 @@ static bool uploadPendingPayloadFromStorage() {
     return false;
   }
 
-  bool ok = uploadToSupabase(buf, len, String(pendingObjectPath));
+  bool ok = uploadToSupabase(buf, len, String(pendingObjectPath), "full");
   free(buf);
   if (ok) {
     clearPendingPayloadStorage();
@@ -641,6 +653,64 @@ void initTime() {
 
 // ===================== CAMERA =====================
 
+void applySensorTuning(sensor_t *sensor, bool uploadMode, bool lowLightMode,
+                       bool brightLightMode = false) {
+  if (!sensor) {
+    return;
+  }
+
+  sensor->set_vflip(sensor, 1);
+  sensor->set_hmirror(sensor, 1);
+  sensor->set_brightness(sensor, lowLightMode ? 2 : (brightLightMode ? -1 : 0));
+  sensor->set_contrast(sensor, uploadMode ? 2 : 1);
+  sensor->set_saturation(sensor, brightLightMode ? -1 : 0);
+  sensor->set_sharpness(sensor, uploadMode ? 2 : 1);
+  sensor->set_exposure_ctrl(sensor, 1);
+  sensor->set_aec2(sensor, 1);
+  sensor->set_ae_level(sensor, lowLightMode ? 2 : (brightLightMode ? -1 : 0));
+  sensor->set_gain_ctrl(sensor, 1);
+  sensor->set_agc_gain(sensor, lowLightMode ? 24 : (brightLightMode ? 4 : 8));
+  sensor->set_gainceiling(sensor, lowLightMode ? GAINCEILING_64X
+                                               : (brightLightMode ? GAINCEILING_8X
+                                                                  : GAINCEILING_16X));
+  sensor->set_whitebal(sensor, 1);
+  sensor->set_awb_gain(sensor, 1);
+  sensor->set_wb_mode(sensor, brightLightMode ? 1 : 0);
+}
+
+uint8_t estimateRgb565Luma(const camera_fb_t *fb) {
+  if (!fb || fb->format != PIXFORMAT_RGB565 || !fb->buf || fb->len < 2) {
+    return 255;
+  }
+
+  const size_t pixelCount = (size_t)fb->width * (size_t)fb->height;
+  if (pixelCount == 0 || fb->len < pixelCount * 2) {
+    return 255;
+  }
+
+  size_t step = pixelCount / 384;
+  if (step < 1) {
+    step = 1;
+  }
+  uint32_t sum = 0;
+  uint16_t samples = 0;
+
+  for (size_t p = 0; p < pixelCount && samples < 512; p += step) {
+    size_t offset = p * 2;
+    uint16_t raw = ((uint16_t)fb->buf[offset + 1] << 8) | fb->buf[offset];
+    uint8_t r = (uint8_t)(((raw >> 11) & 0x1F) * 255 / 31);
+    uint8_t g = (uint8_t)(((raw >> 5) & 0x3F) * 255 / 63);
+    uint8_t b = (uint8_t)((raw & 0x1F) * 255 / 31);
+    sum += (uint32_t)r * 30 + (uint32_t)g * 59 + (uint32_t)b * 11;
+    samples++;
+  }
+
+  if (samples == 0) {
+    return 255;
+  }
+  return (uint8_t)((sum / samples) / 100);
+}
+
 bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -687,14 +757,7 @@ bool initCamera() {
     if (sensor->id.PID == OV3660_PID) {
       Serial.println(F("OV3660 detected."));
     }
-    // Optimise for clarity and detection
-    sensor->set_vflip(sensor, 1);
-    sensor->set_hmirror(sensor, 1);
-    sensor->set_brightness(sensor, 1);
-    sensor->set_contrast(sensor, 1);
-    sensor->set_saturation(sensor, 0);
-    sensor->set_sharpness(sensor, 1);
-    sensor->set_exposure_ctrl(sensor, 1);
+    applySensorTuning(sensor, false, false);
   }
 
   cameraInDetectMode = true;
@@ -702,10 +765,8 @@ bool initCamera() {
   return true;
 }
 
-void switchToUploadMode() {
-  if (!cameraInDetectMode)
-    return;
-
+void switchToUploadMode(framesize_t frameSize, int jpegQuality,
+                        bool lowLightMode, bool brightLightMode = false) {
   esp_camera_deinit();
   delay(100);
 
@@ -734,19 +795,21 @@ void switchToUploadMode() {
   config.ledc_channel = LEDC_CHANNEL_0;
 
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size = UPLOAD_FRAME_SIZE;
-  config.jpeg_quality = UPLOAD_JPEG_QUALITY;
+  config.frame_size = frameSize;
+  config.jpeg_quality = jpegQuality;
   config.grab_mode = CAMERA_GRAB_LATEST;
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.fb_count = 2; // Need 2 for JPEG DMA
 
-  esp_camera_init(&config);
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Upload camera init failed: 0x%x\n", err);
+    cameraInDetectMode = false;
+    return;
+  }
 
   sensor_t *sensor = esp_camera_sensor_get();
-  if (sensor) {
-    sensor->set_vflip(sensor, 1);
-    sensor->set_hmirror(sensor, 1);
-  }
+  applySensorTuning(sensor, true, lowLightMode, brightLightMode);
 
   cameraInDetectMode = false;
 }
@@ -789,13 +852,15 @@ void switchToDetectMode() {
   config.fb_location = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
   config.fb_count = 2;
 
-  esp_camera_init(&config);
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("Detect camera init failed: 0x%x\n", err);
+    cameraInDetectMode = true;
+    return;
+  }
 
   sensor_t *sensor = esp_camera_sensor_get();
-  if (sensor) {
-    sensor->set_vflip(sensor, 1);
-    sensor->set_hmirror(sensor, 1);
-  }
+  applySensorTuning(sensor, false, false);
 
   cameraInDetectMode = true;
 }
@@ -821,6 +886,8 @@ bool runFaceDetection() {
     initCamera();
     return false;
   }
+
+  lastDetectLuma = estimateRgb565Luma(fb);
 
   // Convert RGB565 to RGB888 for ESP-Face (MSR01 expects 24-bit RGB)
   size_t rgbBytes = (size_t)fb->width * (size_t)fb->height * 3;
@@ -856,34 +923,89 @@ bool runFaceDetection() {
   return detected;
 }
 
-bool runFaceDetectionWindow(unsigned long windowMs) {
+bool runFaceDetectionWindow(unsigned long windowMs, bool *lowLightOut = nullptr) {
   unsigned long detectStart = millis();
+  uint32_t lumaSum = 0;
+  uint16_t lumaSamples = 0;
+  uint16_t lowLightHits = 0;
+  uint16_t brightLightHits = 0;
+  uint8_t profileIndex = 0;
+  const char *profileName = "normal";
+
+  sensor_t *sensor = esp_camera_sensor_get();
+  applySensorTuning(sensor, false, false, false);
+
   while (millis() - detectStart < windowMs) {
+    unsigned long elapsed = millis() - detectStart;
+    uint8_t nextProfile =
+        elapsed < (windowMs * 45UL / 100UL)
+            ? 0
+            : (elapsed < (windowMs * 75UL / 100UL) ? 1 : 2);
+
+    if (nextProfile != profileIndex) {
+      profileIndex = nextProfile;
+      profileName = profileIndex == 1 ? "bright-glare" : "low-light";
+      applySensorTuning(sensor, false, profileIndex == 2, profileIndex == 1);
+      netLog("[FACE] Detection profile -> %s\n", profileName);
+      delay(DETECT_PROFILE_SETTLE_MS);
+    }
+
     if (runFaceDetection()) {
       scanCount++;
+      lastFaceWindowLowLight = profileIndex == 2;
+      lastFaceWindowBright = profileIndex == 1;
+      netLog("[FACE] Detected using %s profile (luma=%u)\n", profileName,
+             lastDetectLuma);
+      if (lowLightOut) {
+        *lowLightOut = false;
+      }
       return true;
+    }
+    lumaSum += lastDetectLuma;
+    lumaSamples++;
+    if (lastDetectLuma <= LOW_LIGHT_LUMA_THRESHOLD) {
+      lowLightHits++;
+    }
+    if (lastDetectLuma >= BRIGHT_LIGHT_LUMA_THRESHOLD) {
+      brightLightHits++;
     }
     scanCount++;
     delay(FACE_DETECT_RETRY_GAP_MS);
   }
+
+  uint8_t avgLuma = lumaSamples > 0 ? (uint8_t)(lumaSum / lumaSamples) : 255;
+  lastFaceWindowLowLight =
+      lumaSamples > 0 &&
+      (avgLuma <= LOW_LIGHT_LUMA_THRESHOLD || lowLightHits >= (lumaSamples / 2));
+  lastFaceWindowBright =
+      lumaSamples > 0 &&
+      (avgLuma >= BRIGHT_LIGHT_LUMA_THRESHOLD || brightLightHits >= (lumaSamples / 2));
+  if (lowLightOut) {
+    *lowLightOut = lastFaceWindowLowLight;
+  }
+  if (lastFaceWindowLowLight) {
+    netLog("[FACE] Low light window avg=%u hits=%u/%u\n", avgLuma,
+           (unsigned int)lowLightHits, (unsigned int)lumaSamples);
+  } else if (lastFaceWindowBright) {
+    netLog("[FACE] Bright/glare window avg=%u hits=%u/%u\n", avgLuma,
+           (unsigned int)brightLightHits, (unsigned int)lumaSamples);
+  }
+  applySensorTuning(sensor, false, false, false);
   return false;
 }
 
 // ===================== UPLOAD =====================
 
-String makeObjectPath() {
+String makeObjectPath(const char *proofRole = "full") {
   char filename[128];
-  snprintf(filename, sizeof(filename), "%s_%lu.jpg", currentDeliveryId,
-           millis());
-  // Mobile app uses "deliveries/{boxId}/{filename}" instead of "deliveries/OV3660_CAM_001/"
-  // But wait, the hardware ID is BOX_001, while DEVICE_ID is OV3660_CAM_001.
-  // I will just change it to use the format similar to where it expects, or keep it as is,
-  // let's look at how the app does it.
+  snprintf(filename, sizeof(filename), "%s_%s_%lu.jpg", currentDeliveryId,
+           (proofRole && proofRole[0] != '\0') ? proofRole : "full", millis());
   return String("deliveries/") + DEVICE_ID + "/" + filename;
 }
 
 bool uploadToSupabase(const uint8_t *data, size_t len,
-                      const String &objectPath) {
+                      const String &objectPath,
+                      const char *proofRole) {
   if (WiFi.status() != WL_CONNECTED) {
     maintainWiFiConnection();
     if (WiFi.status() != WL_CONNECTED) {
@@ -903,6 +1025,8 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
   http.addHeader("Content-Type", "image/jpeg");
   // Tell the proxy the Supabase storage path for this image
   http.addHeader("X-Object-Path", objectPath);
+  http.addHeader("X-Proof-Role",
+                 (proofRole && proofRole[0] != '\0') ? proofRole : "full");
   char idempotencyKey[48];
   snprintf(idempotencyKey, sizeof(idempotencyKey), "%08lx-%u",
            (unsigned long)fnv1a32(objectPath.c_str()), (unsigned int)len);
@@ -930,23 +1054,68 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
 
 bool captureHighResAndUpload() {
   unsigned long t0 = millis();
+  bool lowLightMode =
+      lastFaceWindowLowLight || lastDetectLuma <= LOW_LIGHT_LUMA_THRESHOLD;
+  bool brightLightMode = !lowLightMode &&
+      (lastFaceWindowBright || lastDetectLuma >= BRIGHT_LIGHT_LUMA_THRESHOLD);
 
-  // Switch to JPEG
-  switchToUploadMode();
+  switchToUploadMode(PREVIEW_FRAME_SIZE, PREVIEW_JPEG_QUALITY, lowLightMode,
+                     brightLightMode);
 
-  // Give the sensor a tiny moment to adjust its exposure in the new resolution
-  delay(150);
+  unsigned long settleMs = lowLightMode ? LOW_LIGHT_EXPOSURE_SETTLE_MS
+                                        : UPLOAD_EXPOSURE_SETTLE_MS;
+  delay(settleMs);
 
-  // Flush 1 stale frame that might have been queued during the switch
-  camera_fb_t *stale = esp_camera_fb_get();
-  if (stale) {
-    esp_camera_fb_return(stale);
+  for (uint8_t i = 0; i < UPLOAD_STALE_FLUSH_FRAMES; i++) {
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (stale) {
+      esp_camera_fb_return(stale);
+    }
+    delay(70);
   }
 
-  // Grab the actual high-res photo
-  camera_fb_t *photo = esp_camera_fb_get();
+  camera_fb_t *preview = esp_camera_fb_get();
 
-  // If the frame is suspiciously small (corrupted JPEG), try one more time
+  if (preview && preview->len < 4000) {
+    esp_camera_fb_return(preview);
+    delay(50);
+    preview = esp_camera_fb_get();
+  }
+
+  if (!preview) {
+    Serial.println(F("ERROR: Proof preview capture failed."));
+    switchToDetectMode();
+    return false;
+  }
+
+  Serial.printf("Captured preview JPEG: %u bytes in %lu ms\n", preview->len,
+                millis() - t0);
+
+  // Give the solenoid its power window before modem upload spikes begin.
+  delay(1500);
+
+  String previewObjectPath = makeObjectPath("preview");
+  bool previewUploaded =
+      uploadToSupabase(preview->buf, preview->len, previewObjectPath, "preview");
+  esp_camera_fb_return(preview);
+
+  if (!previewUploaded) {
+    switchToDetectMode();
+    return false;
+  }
+
+  switchToUploadMode(UPLOAD_FRAME_SIZE, UPLOAD_JPEG_QUALITY, lowLightMode,
+                     brightLightMode);
+  delay(settleMs);
+  for (uint8_t i = 0; i < UPLOAD_STALE_FLUSH_FRAMES; i++) {
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (stale) {
+      esp_camera_fb_return(stale);
+    }
+    delay(70);
+  }
+
+  camera_fb_t *photo = esp_camera_fb_get();
   if (photo && photo->len < 5000) {
     esp_camera_fb_return(photo);
     delay(50);
@@ -954,31 +1123,24 @@ bool captureHighResAndUpload() {
   }
 
   if (!photo) {
-    Serial.println(F("ERROR: Hi-res capture failed."));
+    Serial.println(F("ERROR: Hi-res capture failed after preview upload."));
     switchToDetectMode();
     return false;
   }
 
-  Serial.printf("Captured JPEG: %u bytes in %lu ms\n", photo->len,
+  Serial.printf("Captured full JPEG: %u bytes in %lu ms\n", photo->len,
                 millis() - t0);
-
-  // DELAY UPLOAD TO PREVENT BROWNOUT DURING SOLENOID FIRING
-  // The solenoid is actively firing right now (takes ~1000ms).
-  // The Proxy LTE transmission draws huge current spikes up to 2A.
-  // Delaying the HTTP POST ensures the physical lock actuates securely
-  // before the modem blasts the network.
-  delay(1500);
 
   String objectPath =
       (pendingObjectPath[0] != '\0') ? String(pendingObjectPath)
-                                     : makeObjectPath();
+                                     : makeObjectPath("full");
   if (payloadStoreReady) {
     if (!savePendingPayload(photo->buf, photo->len, objectPath)) {
       netLog("[UPLOAD] Warning: payload snapshot not persisted\n");
     }
   }
 
-  bool uploaded = uploadToSupabase(photo->buf, photo->len, objectPath);
+  bool uploaded = uploadToSupabase(photo->buf, photo->len, objectPath, "full");
 
   esp_camera_fb_return(photo);
   if (uploaded) {
@@ -1233,8 +1395,9 @@ void handleFaceStatusClient() {
 
   // Run repeated face detection in a window (old working logic style)
   bool faceFound = false;
+  bool lowLight = false;
   if (!cameraSleepMode) {
-    faceFound = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS);
+    faceFound = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS, &lowLight);
   }
 
   const char *result;
@@ -1244,8 +1407,9 @@ void handleFaceStatusClient() {
     result = "FACE_OK";
     queueSingleUpload("HTTP");
   } else {
-    netLog("[HTTP] No face detected\n");
-    result = "NO_FACE";
+    netLog(lowLight ? "[HTTP] No face detected (low light)\n"
+                    : "[HTTP] No face detected\n");
+    result = lowLight ? "NO_FACE_LOW_LIGHT" : "NO_FACE";
   }
 
   // Send HTTP response IMMEDIATELY (before any upload)
@@ -1386,7 +1550,8 @@ void handleUartFaceCommand() {
   }
 
   // Run repeated face detection in a window (old working logic style)
-  bool detected = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS);
+  bool lowLight = false;
+  bool detected = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS, &lowLight);
 
   // Respond IMMEDIATELY
   if (detected) {
@@ -1394,7 +1559,7 @@ void handleUartFaceCommand() {
     Serial2.println("FACE_OK");
     queueSingleUpload("UART");
   } else {
-    Serial.println(F("[UART] No face"));
-    Serial2.println("NO_FACE");
+    Serial.println(lowLight ? F("[UART] No face (low light)") : F("[UART] No face"));
+    Serial2.println(lowLight ? "NO_FACE_LOW_LIGHT" : "NO_FACE");
   }
 }

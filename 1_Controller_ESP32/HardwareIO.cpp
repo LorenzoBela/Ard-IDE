@@ -139,6 +139,13 @@ char readKeypad() {
   return k;
 }
 
+void drainKeypadBuffer() {
+  if (!keyQueue) return;
+  char k = '\0';
+  while (xQueueReceive(keyQueue, &k, 0) == pdTRUE) {
+  }
+}
+
 char getHeldKey() {
   return heldKeyAtomic;
 }

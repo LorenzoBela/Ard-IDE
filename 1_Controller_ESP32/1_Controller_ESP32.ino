@@ -127,6 +127,9 @@ static ControllerDiagData diagCache = {
   0,
   0,
   0,
+  false,
+  0,
+  0,
   0,
   0,
   0
@@ -229,9 +232,47 @@ static bool hasLoadedOtp() {
   return currentOtp[0] != '\0';
 }
 
-static bool isPinEligibleNow() {
-  // PIN entry is allowed only when inside the geofence with an active OTP.
-  return hasActiveDelivery && hasLoadedOtp() && geoInsideFence;
+static bool isPhase(const char *phase) {
+  return phase && deliveryPhase[0] != '\0' && strcmp(deliveryPhase, phase) == 0;
+}
+
+static bool isDropoffOtpEligibleNow() {
+  return hasActiveDelivery && hasLoadedOtp() && isPhase("DROPOFF") &&
+         dropoffInsideFence;
+}
+
+static bool isReturnOtpEligibleNow() {
+  return hasActiveDelivery && hasLoadedOtp() && isPhase("RETURN") &&
+         pickupInsideFence;
+}
+
+static bool isPickupPersonalPinEligibleNow() {
+  return hasActiveDelivery && isPhase("PICKUP") && pickupInsideFence;
+}
+
+static bool isPersonalPinShortcutAllowedNow() {
+  return !hasActiveDelivery || isPickupPersonalPinEligibleNow();
+}
+
+static bool isOtpEntryEligibleNow() {
+  return isDropoffOtpEligibleNow() || isReturnOtpEligibleNow();
+}
+
+static void startPersonalPinEntryWithDigit(unsigned long now, char firstDigit) {
+  stopUtilityMode(now);
+  enterState(STATE_PERSONAL_PIN_ENTRY);
+
+  if (firstDigit >= '0' && firstDigit <= '9') {
+    personalPinCode[0] = firstDigit;
+    personalPinCode[1] = '\0';
+    personalPinLen = 1;
+
+    if (!isDisplayFailed()) {
+      char masked[17];
+      snprintf(masked, sizeof(masked), "%c", firstDigit);
+      updateDisplay("Personal PIN:", masked);
+    }
+  }
 }
 
 // Format distance for LCD: >9999m → "10km", >999m → "1.2km", else "450m"
@@ -341,7 +382,7 @@ void updateHandoffCheckpointForState(TesterState state) {
     clearHandoffCheckpoint();
     break;
   case STATE_IDLE:
-    if (hasActiveDelivery && isPinEligibleNow()) {
+    if (hasActiveDelivery && isOtpEntryEligibleNow()) {
       checkpointHandoffState("handoff_started", (uint8_t)getFailedAttemptCount());
     }
     break;
@@ -576,6 +617,104 @@ void updatePeerHealthOnDiagFailure() {
   }
 }
 
+static void showPersonalPinBlockedMessage(unsigned long now) {
+  if (!isDisplayFailed()) {
+    if (isPhase("IN_TRANSIT")) {
+      updateDisplay("Pickup done", "PIN disabled");
+    } else if (isPhase("DROPOFF")) {
+      updateDisplay("Use customer", "OTP only");
+    } else if (isPhase("RETURN")) {
+      updateDisplay("Return active", "OTP only");
+    } else if (isPhase("PICKUP")) {
+      updateDisplay("Outside pickup", "PIN locked");
+    } else {
+      updateDisplay("PIN disabled", "Hold 9");
+    }
+  } else {
+    fallbackError();
+  }
+  messageStartAt = now;
+  currentState = STATE_SHOW_MESSAGE;
+}
+
+static void showOtpEntryBlockedMessage(unsigned long now) {
+  if (!isDisplayFailed()) {
+    if (!hasActiveDelivery) {
+      updateDisplay("No delivery", "Check app");
+    } else if (isPhase("PICKUP")) {
+      updateDisplay("Pickup phase", "Enter rider PIN");
+    } else if (isPhase("IN_TRANSIT")) {
+      updateDisplay("In transit", "PIN disabled");
+    } else if (isPhase("DROPOFF")) {
+      updateDisplay("Outside dropoff", "PIN locked");
+    } else if (isPhase("RETURN")) {
+      updateDisplay("Return locked", "Outside fence");
+    } else {
+      updateDisplay("PIN disabled", "Hold 9");
+    }
+  } else {
+    fallbackError();
+  }
+  messageStartAt = now;
+  currentState = STATE_SHOW_MESSAGE;
+}
+
+static void showKeypadStatusMessage(unsigned long now, bool refreshOk) {
+  if (isDisplayFailed()) {
+    fallbackError();
+    messageStartAt = now;
+    currentState = STATE_SHOW_MESSAGE;
+    return;
+  }
+
+  if (!refreshOk) {
+    if (WiFi.status() != WL_CONNECTED) {
+      updateDisplay("Offline", "No network");
+    } else {
+      updateDisplay("Refresh failed", "Check network");
+    }
+    messageStartAt = now;
+    currentState = STATE_SHOW_MESSAGE;
+    return;
+  }
+
+  if (!hasActiveDelivery) {
+    updateDisplay("No delivery", "Check app");
+    messageStartAt = now;
+    currentState = STATE_SHOW_MESSAGE;
+    return;
+  }
+
+  if (isPickupPersonalPinEligibleNow()) {
+    updateDisplay("Pickup ready", "Enter PIN");
+  } else if (isDropoffOtpEligibleNow()) {
+    updateDisplay("Dropoff ready", "Enter OTP");
+  } else if (isReturnOtpEligibleNow()) {
+    updateDisplay("Return PIN:", "PIN: ");
+  } else if (isPhase("PICKUP")) {
+    updateDisplay("Pickup locked", "Outside fence");
+  } else if (isPhase("IN_TRANSIT")) {
+    char distBuf[8] = "";
+    char line1[17] = "";
+    formatDistance(geoDistMeters, distBuf, sizeof(distBuf));
+    snprintf(line1, sizeof(line1), "Drop %s", distBuf);
+    updateDisplay("In transit", geoDistMeters >= 0 ? line1 : "Loc stale");
+  } else if (isPhase("DROPOFF")) {
+    char distBuf[8] = "";
+    char line1[17] = "";
+    formatDistance(geoDistMeters, distBuf, sizeof(distBuf));
+    snprintf(line1, sizeof(line1), "Drop %s", distBuf);
+    updateDisplay("Dropoff locked", geoDistMeters >= 0 ? line1 : "Loc stale");
+  } else if (isPhase("RETURN")) {
+    updateDisplay("Return locked", "Outside fence");
+  } else {
+    updateDisplay("Status unknown", "Hold 9");
+  }
+
+  messageStartAt = now;
+  currentState = STATE_SHOW_MESSAGE;
+}
+
 static void renderIdleJourneyStatus() {
   unsigned long now = millis();
 
@@ -608,9 +747,8 @@ static void renderIdleJourneyStatus() {
     return;
   }
 
-  // PIN-ready: inside geofence with loaded OTP.
-  if (isPinEligibleNow()) {
-    if (isReturning) {
+  if (isOtpEntryEligibleNow()) {
+    if (isReturnOtpEligibleNow()) {
       updateDisplay("Return PIN:", "PIN: ");
     } else {
       updateDisplay("Enter PIN:", "PIN: ");
@@ -618,12 +756,36 @@ static void renderIdleJourneyStatus() {
     return;
   }
 
-  // Outside geofence: show the next action instead of stale distance.
-  if (isReturning) {
-    updateDisplay("Pickup locked", "Hold 9 check");
-  } else {
-    updateDisplay("Dropoff locked", "Hold 9 check");
+  if (isPickupPersonalPinEligibleNow()) {
+    updateDisplay("Pickup ready", "Enter PIN");
+    return;
   }
+
+  if (isPhase("PICKUP")) {
+    updateDisplay("Pickup locked", "Hold 9 check");
+    return;
+  }
+
+  if (isPhase("IN_TRANSIT")) {
+    char distBuf[8] = "";
+    char line1[17] = "";
+    formatDistance(geoDistMeters, distBuf, sizeof(distBuf));
+    snprintf(line1, sizeof(line1), "Drop %s", distBuf);
+    updateDisplay("In transit", geoDistMeters >= 0 ? line1 : "Loc stale");
+    return;
+  }
+
+  if (isPhase("DROPOFF")) {
+    updateDisplay("Dropoff locked", "Hold 9 check");
+    return;
+  }
+
+  if (isPhase("RETURN")) {
+    updateDisplay("Return locked", "Hold 9 check");
+    return;
+  }
+
+  updateDisplay("Waiting status", "Hold 9");
 }
 
 static void clearKeypadGeoCheck() {
@@ -644,11 +806,16 @@ static void showKeypadGeoCheckFailure(unsigned long now) {
   if (!isDisplayFailed()) {
     if (!hasActiveDelivery) {
       updateDisplay("No delivery", "Check app");
-    } else if (!hasLoadedOtp()) {
+    } else if (!hasLoadedOtp() && !isPickupPersonalPinEligibleNow()) {
       updateDisplay("OTP syncing", "Hold 9 again");
-    } else if (geoDistMeters >= 0) {
-      updateDisplay(isReturning ? "Outside pickup" : "Outside dropoff",
-                    "PIN still locked");
+    } else if (isPickupPersonalPinEligibleNow()) {
+      updateDisplay("Pickup ready", "Enter PIN");
+    } else if (isPhase("IN_TRANSIT")) {
+      updateDisplay("In transit", "PIN disabled");
+    } else if (isPhase("DROPOFF")) {
+      updateDisplay("Outside dropoff", "PIN locked");
+    } else if (isPhase("RETURN")) {
+      updateDisplay("Return locked", "Outside fence");
     } else {
       updateDisplay("Location stale", "Use app refresh");
     }
@@ -687,7 +854,7 @@ static void processKeypadGeoCheck(unsigned long now) {
   fetchDeliveryContext();
   lastDeliveryContextFetch = now;
 
-  if (isPinEligibleNow()) {
+  if (isOtpEntryEligibleNow()) {
     clearKeypadGeoCheck();
     inputLen = 0;
     inputCode[0] = '\0';
@@ -738,7 +905,28 @@ static unsigned long getDiagRefreshInterval() {
       currentState == STATE_PERSONAL_PIN_ENTRY) {
     return CONTROLLER_DIAG_IDLE_REFRESH_MS;
   }
+  if (currentState == STATE_UNLOCKING || currentState == STATE_AWAITING_CLOSE ||
+      currentState == STATE_OWNER_UNLOCKED) {
+    return CONTROLLER_DIAG_UTILITY_REFRESH_MS;
+  }
   return CONTROLLER_DIAG_STANDBY_REFRESH_MS;
+}
+
+static void renderPhotoUploadProgress() {
+  if (isDisplayFailed()) {
+    return;
+  }
+
+  int pct = diagCache.photoUploadProgress;
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  int filled = pct / 10;
+  char bar[17];
+  for (int i = 0; i < 10; i++) {
+    bar[i] = i < filled ? '#' : '-';
+  }
+  snprintf(bar + 10, sizeof(bar) - 10, " %3d%%", pct);
+  updateDisplay("Photo upload", bar);
 }
 
 void renderUtilityMode(unsigned long now) {
@@ -831,7 +1019,10 @@ void pollDiagnosticsIfDue(unsigned long now) {
 
     if (!(currentState == STATE_STANDBY || currentState == STATE_IDLE ||
       currentState == STATE_ENTERING_PIN ||
-      currentState == STATE_PERSONAL_PIN_ENTRY)) {
+      currentState == STATE_PERSONAL_PIN_ENTRY ||
+      currentState == STATE_UNLOCKING ||
+      currentState == STATE_AWAITING_CLOSE ||
+      currentState == STATE_OWNER_UNLOCKED)) {
     return;
   }
 
@@ -853,6 +1044,8 @@ void pollDiagnosticsIfDue(unsigned long now) {
 
     if (utilityModeActive) {
       renderUtilityMode(now);
+    } else if (data.photoUploadActive && data.photoUploadAgeMs <= CONTROLLER_DIAG_STALE_MS) {
+      renderPhotoUploadProgress();
     }
   } else {
     diagFailCount++;
@@ -1173,9 +1366,16 @@ void loop() {
     // Long-press '9' to force a delivery context refresh from Firebase.
     static unsigned long nineHoldStart = 0;
     static bool nineHoldTriggered = false;
-    if (heldKey == '9') {
+    if (heldKey == '9' &&
+        currentState != STATE_ENTERING_PIN &&
+        currentState != STATE_PERSONAL_PIN_ENTRY &&
+        currentState != STATE_BOOT_AUTH &&
+        !(currentState == STATE_IDLE && isOtpEntryEligibleNow())) {
       if (nineHoldStart == 0) nineHoldStart = now;
       if (!nineHoldTriggered && (now - nineHoldStart) >= 1200) {
+        inputLen = 0;
+        inputCode[0] = '\0';
+        drainKeypadBuffer();
         if (!bootPhaseComplete) {
           clearKeypadGeoCheck();
           if (!isDisplayFailed()) {
@@ -1185,17 +1385,10 @@ void loop() {
           currentState = STATE_SHOW_MESSAGE;
         } else {
           bool ok = requestContextRefresh();
-          if (ok) {
-            scheduleKeypadGeoCheck(now);
-          } else {
-            clearKeypadGeoCheck();
-            fetchDeliveryContext();
-            lastDeliveryContextFetch = now;
-          }
-          if (!isDisplayFailed()) {
-            updateDisplay(ok ? "Checking area" : "Refresh failed",
-                          ok ? "Wait..." : "Check network");
-          }
+          clearKeypadGeoCheck();
+          fetchDeliveryContext();
+          lastDeliveryContextFetch = now;
+          showKeypadStatusMessage(now, ok);
         }
         nineHoldTriggered = true;
       }
@@ -1500,11 +1693,22 @@ void handleStateMachine(unsigned long now) {
       currentState = STATE_SHOW_MESSAGE;
       break;
     }
+    if (standbyKey == '9') {
+      inputLen = 0;
+      inputCode[0] = '\0';
+      drainKeypadBuffer();
+      showKeypadStatusMessage(now, true);
+      break;
+    }
     if (standbyKey == '4') {
-      personalPinLen = 0;
-      personalPinCode[0] = '\0';
-      personalPinExpiresAt = now + PERSONAL_PIN_TIMEOUT_MS;
-      enterState(STATE_PERSONAL_PIN_ENTRY);
+      if (isPersonalPinShortcutAllowedNow()) {
+        personalPinLen = 0;
+        personalPinCode[0] = '\0';
+        personalPinExpiresAt = now + PERSONAL_PIN_TIMEOUT_MS;
+        enterState(STATE_PERSONAL_PIN_ENTRY);
+      } else {
+        showPersonalPinBlockedMessage(now);
+      }
       break;
     }
     if (standbyKey && isUtilityKey(standbyKey)) {
@@ -1564,8 +1768,15 @@ void handleStateMachine(unsigned long now) {
       char key = readKeypad();
       if (!key) break;
 
+      if (key >= '0' && key <= '9' && currentState == STATE_IDLE &&
+          inputLen == 0 && isPickupPersonalPinEligibleNow()) {
+        startPersonalPinEntryWithDigit(now, key);
+        break;
+      }
+
+
       // Backlight toggle shortcut (key '5') — only from IDLE when no PIN running
-      if (currentState == STATE_IDLE && inputLen == 0 && key == '5' && !isPinEligibleNow()) {
+      if (currentState == STATE_IDLE && inputLen == 0 && key == '5' && !isOtpEntryEligibleNow()) {
         stopUtilityMode(now);
         bool isOn = toggleBacklightOverride();
         displayBacklightOn();
@@ -1578,13 +1789,17 @@ void handleStateMachine(unsigned long now) {
         break;
       }
 
-      // Personal PIN shortcut (key '4') — only when no PIN-eligible delivery
-      if (currentState == STATE_IDLE && inputLen == 0 && key == '4' && !isPinEligibleNow()) {
+      // Personal PIN shortcut (key '4') is only for idle/no-delivery access.
+      if (currentState == STATE_IDLE && inputLen == 0 && key == '4' && !hasActiveDelivery) {
         stopUtilityMode(now);
-        personalPinLen = 0;
-        personalPinCode[0] = '\0';
-        personalPinExpiresAt = now + PERSONAL_PIN_TIMEOUT_MS;
-        enterState(STATE_PERSONAL_PIN_ENTRY);
+        if (isPersonalPinShortcutAllowedNow()) {
+          personalPinLen = 0;
+          personalPinCode[0] = '\0';
+          personalPinExpiresAt = now + PERSONAL_PIN_TIMEOUT_MS;
+          enterState(STATE_PERSONAL_PIN_ENTRY);
+        } else {
+          showPersonalPinBlockedMessage(now);
+        }
         break;
       }
 
@@ -1601,12 +1816,12 @@ void handleStateMachine(unsigned long now) {
       } else if (key == '#') {
         stopUtilityMode(now);
         if (inputLen > 0) enterState(STATE_VERIFYING_OTP);
-      } else if (isUtilityKey(key) && !isPinEligibleNow() &&
+      } else if (isUtilityKey(key) && !isOtpEntryEligibleNow() &&
                  ((currentState == STATE_IDLE && inputLen == 0) || utilityModeActive)) {
         // Utility mode (1-3) only accessible when delivery is NOT PIN-eligible
         // (i.e., in transit/pickup phase, or no delivery at all)
         startUtilityMode(key, now);
-      } else if (key == '6' && currentState == STATE_IDLE && inputLen == 0 && !isPinEligibleNow()) {
+      } else if (key == '6' && currentState == STATE_IDLE && inputLen == 0 && !isOtpEntryEligibleNow()) {
         // Key '6' — Unjam utility (guarded: auth + geofence)
         if (!bootAuthDone) {
           enterState(STATE_BOOT_AUTH);
@@ -1646,9 +1861,9 @@ void handleStateMachine(unsigned long now) {
         messageStartAt = now;
         currentState = STATE_SHOW_MESSAGE;
         break;
-      } else if (inputLen < 6) {
+      } else if (key >= '0' && key <= '9' && inputLen < 6) {
         // Enforce geofence lock: no PIN entry unless journey phase is PIN-eligible.
-        if (isPinEligibleNow()) {
+        if (isOtpEntryEligibleNow()) {
           if (!isCameraLikelyUp(now)) {
             netLog("[FACE] Camera marked down at PIN entry; attempting anyway\n");
           }
@@ -1672,7 +1887,7 @@ void handleStateMachine(unsigned long now) {
 
             char display[17];
             snprintf(display, sizeof(display), "PIN: %s", masked);
-            if (isReturning) {
+            if (isReturnOtpEligibleNow()) {
               updateDisplay("Return PIN:", display);
             } else {
               updateDisplay("Enter PIN:", display);
@@ -1680,13 +1895,7 @@ void handleStateMachine(unsigned long now) {
           }
         } else {
           // Keypad pressed but we are in transit/pickup so no OTP is loaded
-          if (!isDisplayFailed()) {
-            updateDisplay("Not at destination", "PIN disabled");
-            messageStartAt = millis();
-            currentState = STATE_SHOW_MESSAGE;
-          } else {
-            fallbackError();
-          }
+          showOtpEntryBlockedMessage(now);
           break; // break the while(true) to handle state change
         }
       }
@@ -1899,6 +2108,10 @@ void handleStateMachine(unsigned long now) {
 
       if (result == 1) {
         netLog("[FACE] DETECTED! Unlocking solenoid...\n");
+        if (!isDisplayFailed()) {
+          updateDisplay("Face detected", "Upload starting");
+        }
+        diagNextPollAt = millis() + CONTROLLER_DIAG_UTILITY_REFRESH_MS;
         if (otpVerifyStartedAt > 0) {
           lastUnlockLatencyMs = now - otpVerifyStartedAt;
         } else {
@@ -1909,21 +2122,27 @@ void handleStateMachine(unsigned long now) {
                            false, "", lastUnlockLatencyMs);
       } else {
         bool noFace = (result == 0);
-        const char *reason = noFace ? "NO_FACE" :
-                (result == -2 ? "CAM_OFFLINE" : "CAMERA_ERROR");
-        bool exhausted = (faceAttemptCount >= FACE_CHECK_MAX_ATTEMPTS);
+        bool lowLightNoFace = (result == 2);
+        const char *reason = lowLightNoFace ? "LOW_LIGHT" :
+                (noFace ? "NO_FACE" :
+                (result == -2 ? "CAM_OFFLINE" : "CAMERA_ERROR"));
+        bool exhausted = lowLightNoFace
+            ? (faceAttemptCount >= 2)
+            : (faceAttemptCount >= FACE_CHECK_MAX_ATTEMPTS);
 
         if (!exhausted) {
           nextFaceAttemptAt = millis() + FACE_RETRY_DELAY_MS;
+          uint8_t displayMaxAttempts = lowLightNoFace ? 2 : FACE_CHECK_MAX_ATTEMPTS;
           netLog("[FACE] %s — retrying in %ums (%u/%u)\n", reason,
                  (unsigned int)FACE_RETRY_DELAY_MS, faceAttemptCount,
-                 (unsigned int)FACE_CHECK_MAX_ATTEMPTS);
+                 (unsigned int)displayMaxAttempts);
           if (!isDisplayFailed()) {
             char retryLine[17];
             snprintf(retryLine, sizeof(retryLine), "Retry %u/%u", faceAttemptCount + 1,
-                     (unsigned int)FACE_CHECK_MAX_ATTEMPTS);
-            updateDisplay(noFace ? "No face found" :
-                         (result == -2 ? "Camera offline" : "Camera error"),
+                     (unsigned int)displayMaxAttempts);
+            updateDisplay(lowLightNoFace ? "Too dark" :
+                         (noFace ? "No face found" :
+                         (result == -2 ? "Camera offline" : "Camera error")),
                          retryLine);
           } else {
             fallbackError();
@@ -1936,7 +2155,8 @@ void handleStateMachine(unsigned long now) {
         netLog("[FACE] %s after %u attempts — fallback required\n", reason,
                faceAttemptCount);
         if (!isDisplayFailed()) {
-          updateDisplay("Face check failed", "Use rider fallback");
+          updateDisplay(lowLightNoFace ? "Low light" : "Face check failed",
+                        "Use rider fallback");
         } else {
           fallbackError();
         }
