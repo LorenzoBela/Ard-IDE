@@ -43,21 +43,21 @@ static bool readReedRaw() {
 }
 
 static void energise(unsigned long now) {
-  digitalWrite(LOCK_PIN, HIGH);
+  digitalWrite(LOCK_PIN, LOCK_PIN_ON);
   solenoidOnAt = now;
   coilTempC += LOCK_HEAT_PER_ACTUATION;
   unjamDeEnergiseAt = 0; // Clear any pending unjam timer (defense in depth).
 }
 
 static void deEnergise() {
-  digitalWrite(LOCK_PIN, LOW);
+  digitalWrite(LOCK_PIN, LOCK_PIN_OFF);
   solenoidOnAt = 0;
 }
 
 // ==================== PUBLIC API ====================
 
 void initLock() {
-  digitalWrite(LOCK_PIN, LOW);
+  digitalWrite(LOCK_PIN, LOCK_PIN_OFF);
   pinMode(LOCK_PIN, OUTPUT);
 
 #if REED_USE_INTERNAL_PULLUP

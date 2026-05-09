@@ -1643,6 +1643,10 @@ void handleStateMachine(unsigned long now) {
         bootPhaseComplete = true; // Boot sequence done — don't loop back to auth.
         netLog("[BOOT-AUTH] Skipped (no active delivery / unpaired box)\n");
         enterState(STATE_STANDBY);
+      } else if (bootAuthDone) {
+        // Rider already authenticated; don't trap them in a loop if WiFi reconnects.
+        netLog("[BOOT-AUTH] Skipped (already authenticated before WiFi reconnect)\n");
+        enterState(STATE_IDLE);
       } else {
         // Active delivery on fresh boot — require rider authentication.
         enterState(STATE_BOOT_AUTH);
