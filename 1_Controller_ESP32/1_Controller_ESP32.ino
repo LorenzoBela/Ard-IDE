@@ -1081,6 +1081,9 @@ void setup() {
   // under-voltage would cause real corruption — which would manifest as
   // a watchdog reset instead.
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  
+  // Immediately clamp lock pin LOW to prevent startup relay snapping
+  initLock();
 
   Serial.begin(115200);
   delay(500);
@@ -1089,7 +1092,6 @@ void setup() {
   Serial.println(F("[BOOT] Brownout detector disabled (USB power workaround)"));
 
   initHardwareIO();
-  initLock();
   initDisplayHealth();
   initOtpLockoutPersistence();
   initOfflineContextStore();
