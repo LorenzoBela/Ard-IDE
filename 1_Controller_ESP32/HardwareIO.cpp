@@ -46,31 +46,40 @@ static void initLcdSequence(bool fast) {
 }
 
 static void keypadTask(void *pvParameters) {
+  static unsigned long lastBufferTime = 0;
+
   while (true) {
-    // getKeys() scans all keys and advances each key's state machine
-    // (IDLE → PRESSED → HOLD → RELEASED). Unlike getKey(), it does NOT
-    // consume the event — allowing HOLD to be detected reliably.
     if (keypad.getKeys()) {
+      int newPresses = 0;
+      char lastKey = 0;
+      
       for (int i = 0; i < LIST_MAX; i++) {
         if (!keypad.key[i].stateChanged) continue;
 
-        KeyState st = keypad.key[i].kstate;
-        char     kc = keypad.key[i].kchar;
+        if (keypad.key[i].kstate == PRESSED && keypad.key[i].kchar != 0) {
+          newPresses++;
+          lastKey = keypad.key[i].kchar;
+        }
+      }
 
-        if (st == PRESSED && kc != 0) {
-          xQueueSend(keyQueue, &kc, 0);
-          Serial.printf("[KEYPAD] Buffered: %c\n", kc);
+      // If matrix ghosting happens, '2' (Row 0) and '0' (Row 3) both trigger in the same tick.
+      // Because keypad.key[] is populated in matrix scan order, the true physical
+      // key ('0', row 3) will always overwrite the ghost key ('2', row 0) in lastKey.
+      if (newPresses > 0) {
+        if (millis() - lastBufferTime > 150) { // Strict software cooldown prevents "00" bounce
+          xQueueSend(keyQueue, &lastKey, 0);
+          lastBufferTime = millis();
+          Serial.printf("[KEYPAD] Buffered: %c (from %d simultaneous)\n", lastKey, newPresses);
         }
       }
     }
 
     // Track held key for EC-82 stuck detection + long-press '0' LCD recovery.
-    // Scan all key slots — the first one in HOLD state wins.
+    // Scan all key slots — the last one in HOLD state wins (bypasses ghost '2' HOLD).
     char held = 0;
     for (int i = 0; i < LIST_MAX; i++) {
       if (keypad.key[i].kstate == HOLD && keypad.key[i].kchar != 0) {
         held = keypad.key[i].kchar;
-        break;
       }
     }
     heldKeyAtomic = held;
@@ -81,7 +90,7 @@ static void keypadTask(void *pvParameters) {
 
 // ==================== INIT ====================
 void initHardwareIO() {
-  keypad.setDebounceTime(50);
+  keypad.setDebounceTime(100);
   keypad.setHoldTime(500);  // HOLD state after 500ms (long-press '0' checks 1200ms separately)
   
   keyQueue = xQueueCreate(10, sizeof(char));
