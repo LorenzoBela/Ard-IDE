@@ -46,19 +46,23 @@ static const uint8_t KP_ROWS = 4;
 static const uint8_t KP_COLS = 3;
 
 // ==================== TIMING ====================
-#define WIFI_FIRST_RETRY_DELAY_MS 500
+#define WIFI_FIRST_RETRY_DELAY_MS 3000
 #define WIFI_RETRY_BASE_MS        1000
 #define WIFI_RETRY_MAX_MS         32000
-#define WIFI_RESCAN_INTERVAL_MS   45000
+#define WIFI_CONNECT_ATTEMPT_MS   12000
+#define WIFI_RESCAN_INTERVAL_MS   90000
 #define WIFI_RETRY_JITTER_MS      500
-#define WIFI_UI_DISCONNECT_GRACE_MS 5000
+#define WIFI_UI_DISCONNECT_GRACE_MS 15000
 #define LCD_MESSAGE_DURATION      2000
 #define FACE_CHECK_TIMEOUT        15000
 #define FACE_CHECK_WIFI_TIMEOUT_MS 8000
 #define FACE_CHECK_UART_TIMEOUT_MS 10000
 #define FACE_CHECK_MAX_ATTEMPTS   3
 #define FACE_RETRY_DELAY_MS       1500
-#define DELIVERY_CONTEXT_FETCH_MS 1000
+#define DELIVERY_CONTEXT_FETCH_MS 2000
+#define DELIVERY_CONTEXT_IDLE_FETCH_MS 8000
+#define PROXY_HEARTBEAT_MS 2500
+#define WIFI_LCD_FAULT_MS 60000
 #define PERSONAL_PIN_TIMEOUT_MS   15000
 #define PERSONAL_PIN_MAX_LEN      6
 
@@ -76,9 +80,13 @@ static const uint8_t KP_COLS = 3;
 #define CONTROLLER_DIAG_IDLE_REFRESH_MS 10000
 #define CONTROLLER_DIAG_UTILITY_REFRESH_MS 1000
 #define CONTROLLER_DIAG_STALE_MS 15000
-#define CONTROLLER_DIAG_HTTP_TIMEOUT_MS 300
+#define CONTROLLER_DIAG_HTTP_TIMEOUT_MS 1000
 #define CONTROLLER_DIAG_RETRY_BASE_MS 1000
 #define CONTROLLER_DIAG_RETRY_MAX_MS 8000
+
+// Keep the last known-good delivery context during short SoftAP drops.
+// A successful /otp response with no delivery still clears immediately.
+#define FETCH_CONTEXT_STICKY_MS 90000UL
 
 // ==================== LOCK SAFETY (EC-21/22/95/96) ====================
 #define LOCK_MAX_ACTIVE_MS        10000   // Hard thermal cutoff (10 sec hold)

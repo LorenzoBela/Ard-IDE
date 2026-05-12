@@ -69,6 +69,7 @@ static uint8_t personalPinLen = 0;
 
 // ── Timing trackers ──
 static unsigned long lastDeliveryContextFetch = 0;
+static unsigned long lastProxyHeartbeat = 0;
 static unsigned long messageStartAt           = 0;
 static unsigned long lastDisplayCheck         = 0;
 static unsigned long personalPinExpiresAt     = 0;
@@ -617,6 +618,65 @@ void updatePeerHealthOnDiagFailure() {
   }
 }
 
+/**
+ * Pre-flight sync before entering Personal PIN mode.
+ * Shows a progress bar on the LCD while refreshing the delivery
+ * context from the proxy, preventing the "PIN not ready" error.
+ * Returns true if the context refresh succeeded (or WiFi is down
+ * and we should still allow offline-cached access).
+ */
+static bool syncBeforePersonalPin() {
+  if (WiFi.status() != WL_CONNECTED) {
+    // Offline — skip sync, allow cached PIN flow
+    return true;
+  }
+
+  if (!isDisplayFailed()) {
+    updateDisplay("Syncing rider..", "----------   0%");
+  }
+
+  // Key-4 personal access does not depend on delivery context. When there is
+  // no active delivery, use a cheap proxy heartbeat instead of forcing LilyGO
+  // to refresh Firebase and reparse the whole hardware payload.
+  if (!hasActiveDelivery) {
+    bool pingOk = requestProxyPing();
+    if (!isDisplayFailed()) {
+      updateDisplay(pingOk ? "Personal PIN" : "Sync partial",
+                    "########## 100%");
+    }
+    netLog("[PIN-SYNC] Personal mode preflight (delivery idle, ping=%s)\n",
+           pingOk ? "ok" : "fail");
+    return true;
+  }
+
+  // Step 1: Request proxy to pull fresh data from Firebase (slow part)
+  bool refreshOk = requestContextRefresh();
+
+  if (!isDisplayFailed()) {
+    updateDisplay("Syncing rider..", "#####----  50%");
+  }
+
+  // Step 2: Fetch the updated context into local globals
+  fetchDeliveryContext();
+  lastDeliveryContextFetch = millis();
+
+  if (hasActiveDelivery && hasLoadedOtp()) {
+    noteOnlineContextSync(millis());
+  }
+
+  if (!isDisplayFailed()) {
+    if (refreshOk) {
+      updateDisplay("Syncing rider..", "########## 100%");
+    } else {
+      updateDisplay("Sync partial",    "########## 100%");
+    }
+  }
+
+  netLog("[PIN-SYNC] Pre-flight sync done (refresh=%s)\n",
+         refreshOk ? "ok" : "fail");
+  return true; // Always allow entry; the PIN verify call will catch real failures
+}
+
 static void showPersonalPinBlockedMessage(unsigned long now) {
   if (!isDisplayFailed()) {
     if (isPhase("IN_TRANSIT")) {
@@ -727,8 +787,12 @@ static void renderIdleJourneyStatus() {
       } else {
         updateDisplay("Offline cached", "PIN window active");
       }
+    } else if (wifiDisconnectedSince > 0 &&
+               (now - wifiDisconnectedSince) < WIFI_LCD_FAULT_MS) {
+      updateDisplay(hasActiveDelivery ? "Link restoring" : "Box Ready",
+                    hasActiveDelivery ? "Keep working" : "Standby");
     } else {
-      updateDisplay("Offline", "Reconnecting...");
+      updateDisplay("Link offline", "Still retrying");
     }
     return;
   }
@@ -1132,10 +1196,14 @@ void loop() {
         (now - wifiDisconnectedSince) >= WIFI_UI_DISCONNECT_GRACE_MS;
     if (wifiDownLongEnough && currentState != STATE_CONNECTING_WIFI &&
         currentState != STATE_BOOT_SELFTEST) {
-      if (isOfflineOtpEligible(now)) {
-        // Keep keypad flow alive in degraded mode while reconnecting in background.
+      // After boot, keep the current user workflow visible and reconnect in
+      // the background. Bouncing the LCD into "Connecting WiFi" for every
+      // short SoftAP hiccup made the box look down even while recovery was
+      // already in progress.
+      if (bootPhaseComplete || isOfflineOtpEligible(now)) {
         if (!offlineModeAnnounced) {
-          netLog("[WIFI] Offline degraded mode active (cached OTP policy)\n");
+          netLog("[WIFI] Link recovering in background%s\n",
+                 isOfflineOtpEligible(now) ? " (cached OTP allowed)" : "");
           offlineModeAnnounced = true;
         }
       } else {
@@ -1186,11 +1254,15 @@ void loop() {
 
   // ── 3. Periodic delivery context fetch ──
   if (WiFi.status() == WL_CONNECTED && currentState != STATE_CONNECTING_WIFI) {
-    if (now - lastDeliveryContextFetch >= DELIVERY_CONTEXT_FETCH_MS) {
+    unsigned long contextFetchInterval =
+        hasActiveDelivery ? DELIVERY_CONTEXT_FETCH_MS : DELIVERY_CONTEXT_IDLE_FETCH_MS;
+
+    if (now - lastDeliveryContextFetch >= contextFetchInterval) {
       bool wasActive = hasActiveDelivery;
       String oldStatus = lastStatusCommand;
       fetchDeliveryContext();
       lastDeliveryContextFetch = now;
+      lastProxyHeartbeat = now;
 
       if (hasActiveDelivery) {
         if (hasLoadedOtp()) {
@@ -1286,6 +1358,14 @@ void loop() {
   }
 
   // ── 4. EC-86: Display health check ──
+  if (WiFi.status() == WL_CONNECTED && currentState != STATE_CONNECTING_WIFI &&
+      !hasActiveDelivery &&
+      now - lastProxyHeartbeat >= PROXY_HEARTBEAT_MS &&
+      now - lastDeliveryContextFetch >= PROXY_HEARTBEAT_MS) {
+    requestProxyPing();
+    lastProxyHeartbeat = now;
+  }
+
   processKeypadGeoCheck(now);
 
   if (now - lastDisplayCheck >= DISPLAY_HEALTH_CHECK_MS) {
@@ -1691,6 +1771,9 @@ void handleStateMachine(unsigned long now) {
     }
     if (standbyKey == '4') {
       if (isPersonalPinShortcutAllowedNow()) {
+        displayBacklightOn();
+        syncBeforePersonalPin();
+        now = millis(); // Refresh after sync delay
         personalPinLen = 0;
         personalPinCode[0] = '\0';
         personalPinExpiresAt = now + PERSONAL_PIN_TIMEOUT_MS;
@@ -1782,6 +1865,9 @@ void handleStateMachine(unsigned long now) {
       if (currentState == STATE_IDLE && inputLen == 0 && key == '4' && !hasActiveDelivery) {
         stopUtilityMode(now);
         if (isPersonalPinShortcutAllowedNow()) {
+          displayBacklightOn();
+          syncBeforePersonalPin();
+          now = millis(); // Refresh after sync delay
           personalPinLen = 0;
           personalPinCode[0] = '\0';
           personalPinExpiresAt = now + PERSONAL_PIN_TIMEOUT_MS;
@@ -2438,7 +2524,7 @@ void enterState(TesterState newState) {
     break;
   case STATE_CONNECTING_WIFI:
     connectStateEnteredAt = millis();
-    if (!isDisplayFailed()) {
+    if (!isDisplayFailed() && !bootPhaseComplete) {
       updateDisplay("Parcel-Safe v3", "Connecting WiFi");
     }
     break;

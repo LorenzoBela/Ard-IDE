@@ -8,6 +8,7 @@
  */
 
 #include "ProxyClient.h"
+#include <esp_wifi.h>
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -35,9 +36,18 @@ bool    dropoffInsideFence   = false;
 static unsigned long wifiRetryAt    = 0;
 static unsigned long wifiBackoffMs  = WIFI_RETRY_BASE_MS;
 static unsigned long wifiRescanAt   = 0;
+static unsigned long wifiConnectStartedAt = 0;
+static uint8_t wifiReconnectAttempts = 0;
+static uint8_t proxyBssid[6] = {0};
+static bool proxyBssidKnown = false;
+static int32_t proxyChannel = 0;
 
 // ── Fetch reliability controls ──
-static const uint16_t FETCH_HTTP_TIMEOUT_MS = 3000;
+static const uint16_t FETCH_HTTP_TIMEOUT_MS = 5000;
+static const uint16_t REFRESH_HTTP_TIMEOUT_MS = 15000;
+static unsigned long lastFetchSuccessAt = 0;
+static uint8_t fetchFailCount = 0;
+static const uint8_t FETCH_FAIL_RESET_THRESHOLD = 20;
 
 static void hardResetDeliveryContext(const char *reason) {
   if (!hasActiveDelivery && currentOtp[0] == '\0' && activeDeliveryId[0] == '\0' &&
@@ -58,6 +68,37 @@ static void hardResetDeliveryContext(const char *reason) {
   dropoffInsideFence = false;
   netLog("[FETCH] Hard reset delivery context (%s)\n",
          reason ? reason : "unknown");
+}
+
+static void noteFetchFailure(const char *stage) {
+  if (fetchFailCount < 255) {
+    fetchFailCount++;
+  }
+
+  netLog("[FETCH] %s failed (%u/%u)\n",
+         stage ? stage : "request",
+         fetchFailCount,
+         FETCH_FAIL_RESET_THRESHOLD);
+
+  if (fetchFailCount < FETCH_FAIL_RESET_THRESHOLD) {
+    return;
+  }
+
+  unsigned long now = millis();
+  bool hasFreshContext =
+      hasActiveDelivery &&
+      lastFetchSuccessAt > 0 &&
+      (now - lastFetchSuccessAt) <= FETCH_CONTEXT_STICKY_MS;
+
+  if (hasFreshContext) {
+    netLog("[FETCH] Preserving cached delivery during WiFi blip (%lums old)\n",
+           now - lastFetchSuccessAt);
+    fetchFailCount = FETCH_FAIL_RESET_THRESHOLD / 2;
+    return;
+  }
+
+  fetchFailCount = 0;
+  hardResetDeliveryContext(stage);
 }
 
 static String normalizeStatusToken(const String &rawToken) {
@@ -136,12 +177,20 @@ bool scanForProxy() {
     String ssid = WiFi.SSID(bestIdx);
     strncpy(WIFI_SSID, ssid.c_str(), sizeof(WIFI_SSID) - 1);
     WIFI_SSID[sizeof(WIFI_SSID) - 1] = '\0';
+    proxyChannel = WiFi.channel(bestIdx);
+    uint8_t *bssid = WiFi.BSSID(bestIdx);
+    if (bssid) {
+      memcpy(proxyBssid, bssid, sizeof(proxyBssid));
+      proxyBssidKnown = true;
+    } else {
+      proxyBssidKnown = false;
+    }
 
     int num = ssid.substring(15).toInt();
     snprintf(HARDWARE_ID, sizeof(HARDWARE_ID), "BOX_%03d", num);
 
-    Serial.printf("[WIFI] Selected: %s (%d dBm) -> %s\n",
-                  WIFI_SSID, bestRssi, HARDWARE_ID);
+    Serial.printf("[WIFI] Selected: %s (%d dBm, ch %ld) -> %s\n",
+                  WIFI_SSID, bestRssi, (long)proxyChannel, HARDWARE_ID);
     WiFi.scanDelete();
     return true;
   }
@@ -151,17 +200,46 @@ bool scanForProxy() {
   return false;
 }
 
+static void beginProxyConnection(const char *reason) {
+  if (WIFI_SSID[0] == '\0') {
+    return;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_max_tx_power(78); // 19.5 dBm, units are quarter-dBm.
+
+  Serial.printf("[WIFI] Begin %s -> %s", reason ? reason : "connect", WIFI_SSID);
+  if (proxyChannel > 0 && proxyBssidKnown) {
+    Serial.printf(" (ch %ld, BSSID locked)", (long)proxyChannel);
+    WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD, proxyChannel, proxyBssid, true);
+  } else {
+    WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
+  }
+  Serial.println();
+
+  wifiConnectStartedAt = millis();
+  if (wifiReconnectAttempts < 255) {
+    wifiReconnectAttempts++;
+  }
+}
+
 void startWiFiConnection() {
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
   // SoftAP link is local and latency-sensitive; disable modem sleep to reduce
   // intermittent HTTP read timeouts (e.g., HTTP -11) on frequent /otp polling.
   WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_max_tx_power(78);
   if (WIFI_SSID[0] == '\0') {
     scanForProxy();
   }
-  if (WIFI_SSID[0] != '\0') {
-    WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
-  }
+  beginProxyConnection("initial");
   wifiRetryAt  = millis() + WIFI_FIRST_RETRY_DELAY_MS;
   wifiRescanAt = millis() + WIFI_RESCAN_INTERVAL_MS;
   wifiBackoffMs = WIFI_RETRY_BASE_MS;
@@ -175,10 +253,17 @@ void maintainWiFiConnection(unsigned long now) {
     wifiBackoffMs = WIFI_RETRY_BASE_MS;
     wifiRetryAt = now + WIFI_FIRST_RETRY_DELAY_MS;
     wifiRescanAt = now + WIFI_RESCAN_INTERVAL_MS;
+    wifiConnectStartedAt = 0;
+    wifiReconnectAttempts = 0;
     return;
   }
 
-  if (now >= wifiRescanAt) {
+  if (wifiConnectStartedAt > 0 &&
+      (now - wifiConnectStartedAt) < WIFI_CONNECT_ATTEMPT_MS) {
+    return;
+  }
+
+  if (now >= wifiRescanAt || WIFI_SSID[0] == '\0') {
     netLog("[WIFI] Lost link; rescanning AP list...\n");
     scanForProxy();
     wifiRescanAt = now + WIFI_RESCAN_INTERVAL_MS;
@@ -188,13 +273,13 @@ void maintainWiFiConnection(unsigned long now) {
 
   netLog("[WIFI] Retry (backoff %lums)...\n", wifiBackoffMs);
   closePersistentConnection(); // Kill stale TCP before WiFi reset
-  WiFi.disconnect();
+  if (wifiReconnectAttempts >= 3) {
+    WiFi.disconnect();
+  }
   if (WIFI_SSID[0] == '\0') {
     scanForProxy();
   }
-  if (WIFI_SSID[0] != '\0') {
-    WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
-  }
+  beginProxyConnection("retry");
 
   unsigned long jitter = (unsigned long)random(0, WIFI_RETRY_JITTER_MS + 1);
   wifiRetryAt = now + wifiBackoffMs + jitter;
@@ -248,7 +333,7 @@ static int readHttpResponse(String &bodyOut, unsigned long timeoutMs) {
 
   // ── Read status line + headers ──
   while (millis() < deadline) {
-    if (!persistentClient.connected()) return -1;
+    if (!persistentClient.connected() && !persistentClient.available()) return -1;
     if (!persistentClient.available()) {
       yield();
       continue;
@@ -313,11 +398,6 @@ static int readHttpResponse(String &bodyOut, unsigned long timeoutMs) {
   return statusCode;
 }
 
-// How many consecutive fetch failures before wiping the delivery context.
-// At ~1Hz polling this gives ~5s of tolerance for a brief WiFi blip.
-static uint8_t fetchFailCount = 0;
-static const uint8_t FETCH_FAIL_RESET_THRESHOLD = 5;
-
 void fetchDeliveryContext() {
   if (WiFi.status() != WL_CONNECTED) {
     netLog("[FETCH] Skip — WiFi not connected\n");
@@ -327,12 +407,7 @@ void fetchDeliveryContext() {
 
   // Ensure persistent TCP socket is alive.
   if (!ensurePersistentConnection()) {
-    fetchFailCount++;
-    netLog("[FETCH] TCP connect failed (%u/%u)\n", fetchFailCount, FETCH_FAIL_RESET_THRESHOLD);
-    if (fetchFailCount >= FETCH_FAIL_RESET_THRESHOLD) {
-      fetchFailCount = 0;
-      hardResetDeliveryContext("tcp_connect_failed");
-    }
+    noteFetchFailure("tcp_connect");
     return;
   }
 
@@ -345,19 +420,14 @@ void fetchDeliveryContext() {
       PROXY_HOST, PROXY_PORT);
 
   String body = "";
-  int code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
+  int code = readHttpResponse(body, REFRESH_HTTP_TIMEOUT_MS);
 
   if (code < 0) {
     netLog("[FETCH] Read failed — reconnecting\n");
     closePersistentConnection();
     // One retry with fresh connection
     if (!ensurePersistentConnection()) {
-      fetchFailCount++;
-      netLog("[FETCH] TCP retry failed (%u/%u)\n", fetchFailCount, FETCH_FAIL_RESET_THRESHOLD);
-      if (fetchFailCount >= FETCH_FAIL_RESET_THRESHOLD) {
-        fetchFailCount = 0;
-        hardResetDeliveryContext("tcp_retry_failed");
-      }
+      noteFetchFailure("tcp_retry");
       return;
     }
     persistentClient.printf(
@@ -367,32 +437,23 @@ void fetchDeliveryContext() {
         "\r\n",
         PROXY_HOST, PROXY_PORT);
     body = "";
-    code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
+    code = readHttpResponse(body, REFRESH_HTTP_TIMEOUT_MS);
     if (code < 0) {
-      fetchFailCount++;
-      netLog("[FETCH] Retry failed (%u/%u)\n", fetchFailCount, FETCH_FAIL_RESET_THRESHOLD);
+      noteFetchFailure("http_retry");
       closePersistentConnection();
-      if (fetchFailCount >= FETCH_FAIL_RESET_THRESHOLD) {
-        fetchFailCount = 0;
-        hardResetDeliveryContext("http_get_failed");
-      }
       return;
     }
   }
 
   netLog("[FETCH] HTTP %d\n", code);
   if (code != 200) {
-    fetchFailCount++;
-    netLog("[FETCH] Non-200 response (%u/%u)\n", fetchFailCount, FETCH_FAIL_RESET_THRESHOLD);
-    if (fetchFailCount >= FETCH_FAIL_RESET_THRESHOLD) {
-      fetchFailCount = 0;
-      hardResetDeliveryContext("http_non_200");
-    }
+    noteFetchFailure("http_non_200");
     return;
   }
 
   // Successful fetch — reset the failure counter.
   fetchFailCount = 0;
+  lastFetchSuccessAt = millis();
 
   bool wasActive = hasActiveDelivery;
   lastStatusCommand = "";
@@ -574,6 +635,34 @@ bool requestContextRefresh() {
 
   body.trim();
   netLog("[REFRESH] HTTP %d body='%s'\n", code, body.c_str());
+  return (code == 200 && body.startsWith("OK"));
+}
+
+bool requestProxyPing() {
+  if (WiFi.status() != WL_CONNECTED) {
+    closePersistentConnection();
+    return false;
+  }
+
+  if (!ensurePersistentConnection()) {
+    return false;
+  }
+
+  persistentClient.printf(
+      "GET /ping HTTP/1.1\r\n"
+      "Host: %s:%d\r\n"
+      "Connection: keep-alive\r\n"
+      "\r\n",
+      PROXY_HOST, PROXY_PORT);
+
+  String body = "";
+  int code = readHttpResponse(body, 1000);
+  if (code < 0) {
+    closePersistentConnection();
+    return false;
+  }
+
+  body.trim();
   return (code == 200 && body.startsWith("OK"));
 }
 
