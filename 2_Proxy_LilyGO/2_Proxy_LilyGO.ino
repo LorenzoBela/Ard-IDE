@@ -128,6 +128,9 @@ WiFiServer camServer(CAM_SERVER_PORT);
 // WiFiServer::available() only returns NEW connections; this tracks
 // the existing one so we can read subsequent requests on the same TCP pipe.
 static WiFiClient keepAliveController;
+static bool inApRequestHandler = false;
+static bool modemHttpBusy = false;
+static bool controllerContextRefreshQueued = false;
 bool apStarted = false;
 String relayDiag =
     ""; // Diagnostics forwarded to ESP32-CAM via HTTP response body
@@ -2463,6 +2466,11 @@ static bool verifyActiveDeliveryContext(const char *reason, bool force) {
     return false;
   }
 
+  if (modemHttpBusy) {
+    Serial.println("[CONTEXT] Delivery verify deferred - modem HTTP busy");
+    return deliveryContextTrusted;
+  }
+
   unsigned long nowMs = millis();
   bool sameAsVerified = lastVerifiedDeliveryId[0] != '\0' &&
                         strcmp(lastVerifiedDeliveryId, cachedDeliveryId) == 0;
@@ -3340,6 +3348,11 @@ void refreshDeliveryContextFromFirebase() {
   }
 
   unsigned long nowMs = millis();
+  if (modemHttpBusy) {
+    Serial.println("[CONTEXT] Skip Firebase fetch - modem HTTP busy");
+    return;
+  }
+
   bool contextCleared = false;
   bool prevDeliveryValid = deliveryIdCacheValid;
   char prevDeliveryId[64] = "";
@@ -3355,12 +3368,16 @@ void refreshDeliveryContextFromFirebase() {
   snprintf(path, sizeof(path), "/hardware/%s.json", HARDWARE_ID);
 
   String resp;
+  modemHttpBusy = true;
   sendATAndWait("+HTTPTERM", 1000);
   delay(100);
 
   modem.sendAT("+HTTPINIT");
-  if (modem.waitResponse(5000L, resp) != 1)
+  if (modem.waitResponse(5000L, resp) != 1) {
+    sendATAndWait("+HTTPTERM", 1000);
+    modemHttpBusy = false;
     return;
+  }
 
   modem.sendAT("+HTTPPARA=\"CID\",1");
   modem.waitResponse(3000L);
@@ -3407,6 +3424,8 @@ void refreshDeliveryContextFromFirebase() {
                 httpStatus, actionOK);
 
   if (!actionOK || httpStatus != 200) {
+    sendATAndWait("+HTTPTERM", 1000);
+    modemHttpBusy = false;
     contextFetchFailCount++;
     bool withinSticky =
         (lastContextFetchOkAtMs > 0) &&
@@ -3492,6 +3511,9 @@ void refreshDeliveryContextFromFirebase() {
 
       offset += chunkLen;
     }
+
+    sendATAndWait("+HTTPTERM", 1000);
+    modemHttpBusy = false;
 
     Serial.printf("[CONTEXT] totalBytes=%d body(120): %.120s\n", (int)body.length(),
                   body.c_str());
@@ -3992,7 +4014,10 @@ void refreshDeliveryContextFromFirebase() {
     }
   }
 
-  sendATAndWait("+HTTPTERM", 1000);
+  if (modemHttpBusy) {
+    sendATAndWait("+HTTPTERM", 1000);
+    modemHttpBusy = false;
+  }
 }
 
 // ==================== LOCK EVENT WRITER ====================
@@ -4419,6 +4444,10 @@ void triggerRebootAllIfScheduled(unsigned long now) {
 
 // ==================== HOTSPOT HTTP ROUTER ====================
 void handleCameraClient() {
+  if (inApRequestHandler) {
+    return;
+  }
+
   WiFiClient client;
 
   // Priority 1: check persistent keep-alive connection for new request data.
@@ -4444,6 +4473,10 @@ void handleCameraClient() {
     }
   }
 
+  inApRequestHandler = true;
+  struct ApHandlerExitGuard {
+    ~ApHandlerExitGuard() { inApRequestHandler = false; }
+  } apHandlerExitGuard;
   esp_task_wdt_reset();
   IPAddress clientAddr = client.remoteIP();
 
@@ -4518,14 +4551,19 @@ void handleCameraClient() {
       manualRefreshBurstUntil = nowMs + MANUAL_REFRESH_BURST_MS;
       lastDeliveryContextRead = 0;
       lastPhoneFetchAtMs = 0;
-      Serial.println("[CONTEXT] Keypad refresh requested - exact refresh now");
-      bool fieldsOk = refreshAuthoritativeDeliveryFieldsFromFirebase();
-      if (fieldsOk && deliveryIdCacheValid && cachedDeliveryId[0] != '\0') {
-        activeAfterRefresh = verifyActiveDeliveryContext("manual_refresh", true);
+      if (modemHttpBusy) {
+        controllerContextRefreshQueued = true;
+        Serial.println("[CONTEXT] Keypad refresh requested while modem busy - queued");
+      } else {
+        Serial.println("[CONTEXT] Keypad refresh requested - exact refresh now");
+        bool fieldsOk = refreshAuthoritativeDeliveryFieldsFromFirebase();
+        if (fieldsOk && deliveryIdCacheValid && cachedDeliveryId[0] != '\0') {
+          activeAfterRefresh = verifyActiveDeliveryContext("manual_refresh", true);
+        }
+        Serial.printf("[CONTEXT] Keypad refresh result fields=%d active=%d delivery=%s\n",
+                      fieldsOk ? 1 : 0, activeAfterRefresh ? 1 : 0,
+                      deliveryIdCacheValid ? cachedDeliveryId : "NONE");
       }
-      Serial.printf("[CONTEXT] Keypad refresh result fields=%d active=%d delivery=%s\n",
-                    fieldsOk ? 1 : 0, activeAfterRefresh ? 1 : 0,
-                    deliveryIdCacheValid ? cachedDeliveryId : "NONE");
     }
 
     const char *body = ok ? (activeAfterRefresh ? "OK_ACTIVE" : "OK") : "NO_LTE";
@@ -4545,7 +4583,7 @@ void handleCameraClient() {
   // Example from a laptop/phone on the AP: http://192.168.4.1:8080/clear-context
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/clear-context")) {
     controllerLastSeenAt = millis();
-    clearDeliveryContextCaches("manual_http_clear", lteConnected);
+    clearDeliveryContextCaches("manual_http_clear", lteConnected && !modemHttpBusy);
     const char *body = lteConnected ? "OK:CLEARED" : "OK:CLEARED_LOCAL_NO_LTE";
     String resp =
         "HTTP/1.1 200 OK\r\n"
@@ -4599,10 +4637,12 @@ void handleCameraClient() {
       Serial.printf("[AP] GEO pre: destValid=%d gpsFix=%d delStatus='%s'\n",
                     destCoordsValid, gpsFix, cachedDeliveryStatus);
 
-      bool haveTargets = activeContextForController && destCoordsValid;
-      if (!haveTargets && activeContextForController) {
-        haveTargets = refreshTargetCoordsFromDelivery(cachedDeliveryId);
-      }
+    bool haveTargets = activeContextForController && destCoordsValid;
+    if (!haveTargets && activeContextForController && !modemHttpBusy) {
+      haveTargets = refreshTargetCoordsFromDelivery(cachedDeliveryId);
+    } else if (!haveTargets && activeContextForController && modemHttpBusy) {
+      Serial.println("[AP] Target refresh deferred - modem busy");
+    }
 
       if (haveTargets && gpsFix) {
         // During return mode the geofence target is already swapped to pickup
@@ -5310,13 +5350,23 @@ void handleCameraClient() {
 // Lightweight Firebase GET that returns the response body as a String.
 // Used only during first-boot registration (not on the hot path).
 String httpGetFromFirebase(const char *path) {
+  if (modemHttpBusy) {
+    Serial.printf("[HTTP] Busy, skipping Firebase GET %s\n",
+                  path ? path : "(null)");
+    return "";
+  }
+
+  modemHttpBusy = true;
   String resp;
   sendATAndWait("+HTTPTERM", 1000);
   delay(100);
 
   modem.sendAT("+HTTPINIT");
-  if (modem.waitResponse(5000L, resp) != 1)
+  if (modem.waitResponse(5000L, resp) != 1) {
+    sendATAndWait("+HTTPTERM", 1000);
+    modemHttpBusy = false;
     return "";
+  }
 
   modem.sendAT("+HTTPPARA=\"CID\",1");
   modem.waitResponse(3000L);
@@ -5393,6 +5443,7 @@ String httpGetFromFirebase(const char *path) {
   }
 
   sendATAndWait("+HTTPTERM", 1000);
+  modemHttpBusy = false;
   return body;
 }
 
@@ -6441,6 +6492,11 @@ void loop() {
 
   // Refresh cached Delivery Context from Firebase (for Tester ESP32 /otp
   // endpoint)
+  if (lteConnected && controllerContextRefreshQueued && !modemHttpBusy) {
+    controllerContextRefreshQueued = false;
+    lastDeliveryContextRead = 0;
+    Serial.println("[CONTEXT] Running queued controller refresh");
+  }
   if (lteConnected && now - lastDeliveryContextRead >= deliveryReadInterval) {
     refreshDeliveryContextFromFirebase();
     lastDeliveryContextRead = now;
