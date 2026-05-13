@@ -50,36 +50,59 @@ static void keypadTask(void *pvParameters) {
 
   while (true) {
     if (keypad.getKeys()) {
-      int newPresses = 0;
-      char lastKey = 0;
+      char pressedKeys[LIST_MAX];
+      int pressCount = 0;
       
       for (int i = 0; i < LIST_MAX; i++) {
         if (!keypad.key[i].stateChanged) continue;
 
         if (keypad.key[i].kstate == PRESSED && keypad.key[i].kchar != 0) {
-          newPresses++;
-          lastKey = keypad.key[i].kchar;
+          pressedKeys[pressCount++] = keypad.key[i].kchar;
         }
       }
 
-      // If matrix ghosting happens, '2' (Row 0) and '0' (Row 3) both trigger in the same tick.
-      // Because keypad.key[] is populated in matrix scan order, the true physical
-      // key ('0', row 3) will always overwrite the ghost key ('2', row 0) in lastKey.
-      if (newPresses > 0) {
-        if (millis() - lastBufferTime > 150) { // Strict software cooldown prevents "00" bounce
-          xQueueSend(keyQueue, &lastKey, 0);
+      if (pressCount > 0) {
+        char trueKey = pressedKeys[0];
+
+        if (pressCount > 1) {
+          // Hardware ghosting workaround (membrane trace shorts):
+          // '2' (middle col) and '9' (right col) are common ghosts.
+          // Prefer keys that are NOT '2' or '9' when multiple keys trigger.
+          for (int i = 0; i < pressCount; i++) {
+            char k = pressedKeys[i];
+            if (k != '2' && k != '9') {
+              trueKey = k;
+            }
+          }
+        }
+
+        if (millis() - lastBufferTime > 150) { // Strict software cooldown prevents bounce
+          xQueueSend(keyQueue, &trueKey, 0);
           lastBufferTime = millis();
-          Serial.printf("[KEYPAD] Buffered: %c (from %d simultaneous)\n", lastKey, newPresses);
+          Serial.printf("[KEYPAD] Buffered: %c (from %d simultaneous)\n", trueKey, pressCount);
         }
       }
     }
 
     // Track held key for EC-82 stuck detection + long-press '0' LCD recovery.
-    // Scan all key slots — the last one in HOLD state wins (bypasses ghost '2' HOLD).
     char held = 0;
+    char heldKeys[LIST_MAX];
+    int heldCount = 0;
     for (int i = 0; i < LIST_MAX; i++) {
       if (keypad.key[i].kstate == HOLD && keypad.key[i].kchar != 0) {
-        held = keypad.key[i].kchar;
+        heldKeys[heldCount++] = keypad.key[i].kchar;
+      }
+    }
+    
+    if (heldCount > 0) {
+      held = heldKeys[0];
+      if (heldCount > 1) {
+        for (int i = 0; i < heldCount; i++) {
+          char k = heldKeys[i];
+          if (k != '2' && k != '9') {
+            held = k;
+          }
+        }
       }
     }
     heldKeyAtomic = held;
