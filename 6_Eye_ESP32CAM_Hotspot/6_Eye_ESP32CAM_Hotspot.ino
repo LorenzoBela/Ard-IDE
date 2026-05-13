@@ -37,15 +37,32 @@
 #include "human_face_detect_msr01.hpp"
 
 // ===================== USER CONFIG =====================
-// WiFi: auto-discovered by scanning for SmartTopBox_AP_* SSIDs
-char WIFI_SSID[24] = "";
-#define WIFI_PASSWORD "topbox123"
+// WiFi: production hotspot-first variant. Hotspots are tried in priority order.
+// Empty SSIDs are ignored.
+struct HotspotCredential {
+  const char *ssid;
+  const char *password;
+};
 
-// Proxy endpoint on the GPS/LTE board (192.168.4.1 is default SoftAP IP)
+static const HotspotCredential HOTSPOTS[] = {
+    {"ZTE_2.4G_3GRHSf", "C539c7d4"},
+    {"bibliyuh", "qwertyui"},
+    {"Zooo :P", "Xpander19"},
+    {"Vivviccc", "vivviccc"},
+};
+static const uint8_t HOTSPOT_COUNT = sizeof(HOTSPOTS) / sizeof(HOTSPOTS[0]);
+
+char WIFI_SSID[33] = "";
+char WIFI_PASSWORD[65] = "";
+
+// Proxy endpoint on the LilyGO board; discovered dynamically on the hotspot LAN.
 // Images are POSTed here; the GPS/LTE board relays them to Supabase via LTE.
-#define PROXY_HOST "192.168.4.1"
+char PROXY_HOST[16] = "";
 #define PROXY_PORT 8080
 #define PROXY_PATH "/upload"
+#define PROXY_DISCOVERY_PORT 5115
+#define PROXY_DISCOVERY_QUERY "SMART_TOP_BOX_PROXY?"
+#define PROXY_DISCOVERY_REPLY "SMART_TOP_BOX_PROXY:"
 
 // Supabase credentials kept here for reference (used by GPS/LTE board for
 // relay)
@@ -429,33 +446,42 @@ const char *getSupabaseBearerToken() {
 // ===================== WIFI =====================
 
 void scanForProxyAP() {
-  Serial.println(F("[WIFI] Scanning for SmartTopBox_AP_*..."));
+  Serial.println(F("[WIFI] Scanning for configured hotspots..."));
   int n = WiFi.scanNetworks();
 
   int bestIdx = -1;
   int bestRssi = -999;
+  int bestCredential = -1;
   for (int i = 0; i < n; i++) {
     String ssid = WiFi.SSID(i);
-    if (ssid.startsWith("SmartTopBox_AP_")) {
-      if (WiFi.RSSI(i) > bestRssi) {
+    Serial.printf("[WIFI]   %s (%d dBm)\n", ssid.c_str(), WiFi.RSSI(i));
+  }
+
+  for (uint8_t h = 0; h < HOTSPOT_COUNT && bestIdx < 0; h++) {
+    if (!HOTSPOTS[h].ssid || HOTSPOTS[h].ssid[0] == '\0') continue;
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == HOTSPOTS[h].ssid && WiFi.RSSI(i) > bestRssi) {
         bestRssi = WiFi.RSSI(i);
         bestIdx = i;
+        bestCredential = h;
       }
     }
   }
 
-  if (bestIdx >= 0) {
+  if (bestIdx >= 0 && bestCredential >= 0) {
     String ssid = WiFi.SSID(bestIdx);
     strncpy(WIFI_SSID, ssid.c_str(), sizeof(WIFI_SSID) - 1);
     WIFI_SSID[sizeof(WIFI_SSID) - 1] = '\0';
+    strncpy(WIFI_PASSWORD, HOTSPOTS[bestCredential].password,
+            sizeof(WIFI_PASSWORD) - 1);
+    WIFI_PASSWORD[sizeof(WIFI_PASSWORD) - 1] = '\0';
 
-    int num = ssid.substring(15).toInt();
-    snprintf(DEVICE_ID, sizeof(DEVICE_ID), "OV3660_CAM_%03d", num);
+    snprintf(DEVICE_ID, sizeof(DEVICE_ID), "OV3660_CAM_001");
 
-    Serial.printf("[WIFI] Found: %s (%d dBm) -> %s\n",
+    Serial.printf("[WIFI] Selected hotspot: %s (%d dBm) -> %s\n",
                   WIFI_SSID, bestRssi, DEVICE_ID);
   } else {
-    Serial.printf("[WIFI] No SmartTopBox_AP_* found (%d APs scanned)\n", n);
+    Serial.printf("[WIFI] No configured hotspot found (%d APs scanned)\n", n);
   }
 
   WiFi.scanDelete();
@@ -507,6 +533,43 @@ void logTargetApVisibility() {
   WiFi.scanDelete();
 }
 
+bool discoverProxyUdp(unsigned long timeoutMs = 1500) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  WiFiUDP discovery;
+  if (!discovery.begin(0)) return false;
+  IPAddress broadcast((uint32_t)WiFi.localIP() | ~(uint32_t)WiFi.subnetMask());
+  discovery.beginPacket(broadcast, PROXY_DISCOVERY_PORT);
+  discovery.print(PROXY_DISCOVERY_QUERY);
+  discovery.endPacket();
+
+  unsigned long deadline = millis() + timeoutMs;
+  char packet[96];
+  while (millis() < deadline) {
+    int size = discovery.parsePacket();
+    if (size > 0) {
+      int len = discovery.read(packet, sizeof(packet) - 1);
+      packet[len] = '\0';
+      if (strncmp(packet, PROXY_DISCOVERY_REPLY,
+                  strlen(PROXY_DISCOVERY_REPLY)) == 0) {
+        IPAddress ip = discovery.remoteIP();
+        strncpy(PROXY_HOST, ip.toString().c_str(), sizeof(PROXY_HOST) - 1);
+        PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
+        Serial.printf("[DISCOVERY] Proxy at %s (%s)\n", PROXY_HOST, packet);
+        discovery.beginPacket(ip, PROXY_DISCOVERY_PORT);
+        discovery.print("SMART_TOP_BOX_CAM:");
+        discovery.print(DEVICE_ID);
+        discovery.endPacket();
+        discovery.stop();
+        return true;
+      }
+    }
+    delay(20);
+  }
+  discovery.stop();
+  Serial.println(F("[DISCOVERY] Proxy not found"));
+  return false;
+}
+
 bool connectWiFi(unsigned long timeoutMs = WIFI_BOOT_CONNECT_TIMEOUT_MS) {
   if (WiFi.status() == WL_CONNECTED) {
     return true;
@@ -528,12 +591,9 @@ bool connectWiFi(unsigned long timeoutMs = WIFI_BOOT_CONNECT_TIMEOUT_MS) {
     return false;
   }
 
-  // Static IP so the LilyGO proxy can always reach us on 192.168.4.10
-  // (matches the hardcoded fallback in forwardFaceCheck() on the LilyGO side)
-  IPAddress staticIP(192, 168, 4, 10);
-  IPAddress gateway(192, 168, 4, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  WiFi.config(staticIP, gateway, subnet, gateway);
+  // Use DHCP from the phone/router hotspot. LilyGO learns this camera IP from
+  // /face-status and /upload traffic.
+  WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
 
   WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
 
@@ -565,6 +625,7 @@ bool connectWiFi(unsigned long timeoutMs = WIFI_BOOT_CONNECT_TIMEOUT_MS) {
     Serial.printf("[WIFI] Connected. IP: %s | RSSI: %d dBm | CH: %d\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI(),
                   WiFi.channel());
+    discoverProxyUdp();
     return true;
   } else {
     wl_status_t statusNow = WiFi.status();
@@ -579,6 +640,9 @@ void maintainWiFiConnection() {
   unsigned long now = millis();
 
   if (WiFi.status() == WL_CONNECTED) {
+    if (PROXY_HOST[0] == '\0') {
+      discoverProxyUdp(250);
+    }
     if (wifiReconnectStartAt != 0) {
       lastWifiReconnectLatencyMs = now - wifiReconnectStartAt;
       netLog("[WIFI] Recovered in %lums\n", lastWifiReconnectLatencyMs);
@@ -633,10 +697,7 @@ void maintainWiFiConnection() {
   WiFi.setSleep(false);
   WiFi.disconnect(false, false);
 
-  IPAddress staticIP(192, 168, 4, 10);
-  IPAddress gateway(192, 168, 4, 1);
-  IPAddress subnet(255, 255, 255, 0);
-  WiFi.config(staticIP, gateway, subnet, gateway);
+  WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
 
   netLog("[WIFI] Non-blocking reconnect attempt to '%s'\n", WIFI_SSID);
   WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
@@ -1019,9 +1080,12 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
       return false;
     }
   }
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
+    Serial.println(F("Upload skipped: proxy discovery failed."));
+    return false;
+  }
 
-  // POST image data to the GPS/LTE board proxy which relays it to Supabase via
-  // LTE.
+  // POST image data to the LilyGO proxy which relays it to Supabase.
   HTTPClient http;
   String endpoint =
       String("http://") + PROXY_HOST + ":" + String(PROXY_PORT) + PROXY_PATH;

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * ProxyClient.cpp — HTTP communication with the LilyGO proxy
  *
  * Rules enforced:
@@ -10,15 +10,27 @@
 #include "ProxyClient.h"
 #include <esp_wifi.h>
 #include <HTTPClient.h>
+#include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
 // ── Box identity (populated by scanForProxy()) ──
-char WIFI_SSID[24]    = "";
-char HARDWARE_ID[12]  = "";
+char WIFI_SSID[33]     = "";
+char WIFI_PASSWORD[65] = "";
+char HARDWARE_ID[12]   = "";
+char PROXY_HOST[16]    = "";
 
 // ── UDP logger ──
 static WiFiUDP udpClient;
+static HardwareSerial proxySerial(1);
+static bool proxyUartStarted = false;
+static uint16_t proxyRequestId = 1;
+static bool bleStarted = false;
+static NimBLEClient *bleClient = nullptr;
+static NimBLERemoteCharacteristic *bleReqChar = nullptr;
+static NimBLERemoteCharacteristic *bleRespChar = nullptr;
+static NimBLERemoteCharacteristic *bleIpChar = nullptr;
+static unsigned long bleLastAttemptAt = 0;
 
 // ── Delivery context ──
 char  currentOtp[8]          = "";
@@ -41,6 +53,275 @@ static uint8_t wifiReconnectAttempts = 0;
 static uint8_t proxyBssid[6] = {0};
 static bool proxyBssidKnown = false;
 static int32_t proxyChannel = 0;
+
+static uint8_t checksum8(const char *text) {
+  uint8_t sum = 0;
+  if (!text) return 0;
+  while (*text) {
+    sum ^= (uint8_t)*text++;
+  }
+  return sum;
+}
+
+static void startProxyUart() {
+  if (proxyUartStarted) return;
+  proxySerial.begin(PROXY_UART_BAUD, SERIAL_8N1, PROXY_UART_RX, PROXY_UART_TX);
+  proxyUartStarted = true;
+#if CONTROLLER_VERBOSE_LOGS
+  Serial.printf("[PROXY-UART] Serial1 ready RX=%d TX=%d baud=%d\n",
+                PROXY_UART_RX, PROXY_UART_TX, PROXY_UART_BAUD);
+#endif
+}
+
+static bool proxyUartRequest(const char *method, const char *path,
+                             const char *payload, String &bodyOut,
+                             unsigned long timeoutMs = PROXY_UART_TIMEOUT_MS) {
+  startProxyUart();
+  while (proxySerial.available()) proxySerial.read();
+
+  uint16_t id = proxyRequestId++;
+  if (proxyRequestId == 0) proxyRequestId = 1;
+
+  char frame[760];
+  snprintf(frame, sizeof(frame), "REQ|%u|%s|%s|%s",
+           (unsigned int)id, method ? method : "GET", path ? path : "/",
+           payload ? payload : "");
+  uint8_t sum = checksum8(frame);
+  proxySerial.printf("%s|%02X\n", frame, sum);
+
+  unsigned long deadline = millis() + timeoutMs;
+  char line[900];
+  uint16_t len = 0;
+
+  while (millis() < deadline) {
+    while (proxySerial.available()) {
+      char c = (char)proxySerial.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        line[len] = '\0';
+        len = 0;
+
+        String resp(line);
+        if (!resp.startsWith("RESP|")) continue;
+        int p1 = resp.indexOf('|', 5);
+        int p2 = (p1 >= 0) ? resp.indexOf('|', p1 + 1) : -1;
+        int p3 = (p2 >= 0) ? resp.lastIndexOf('|') : -1;
+        if (p1 < 0 || p2 < 0 || p3 <= p2) continue;
+
+        uint16_t respId = (uint16_t)resp.substring(5, p1).toInt();
+        if (respId != id) continue;
+
+        String withoutCrc = resp.substring(0, p3);
+        uint8_t expected = (uint8_t)strtoul(resp.substring(p3 + 1).c_str(), NULL, 16);
+        if (checksum8(withoutCrc.c_str()) != expected) {
+#if CONTROLLER_VERBOSE_LOGS
+          Serial.println(F("[PROXY-UART] Ignored bad checksum"));
+#endif
+          continue;
+        }
+
+        int status = resp.substring(p1 + 1, p2).toInt();
+        bodyOut = resp.substring(p2 + 1, p3);
+        return status >= 200 && status < 300;
+      }
+      if (len < sizeof(line) - 1) {
+        line[len++] = c;
+      } else {
+        len = 0;
+      }
+    }
+    yield();
+  }
+  return false;
+}
+
+static void startBleClient() {
+  if (bleStarted) return;
+  NimBLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P3);
+  NimBLEDevice::setMTU(517);
+  bleStarted = true;
+#if CONTROLLER_VERBOSE_LOGS
+  Serial.println(F("[BLE] Client ready"));
+#endif
+}
+
+static bool connectBleProxy() {
+  startBleClient();
+  if (bleClient && bleClient->isConnected() && bleReqChar && bleRespChar) {
+    return true;
+  }
+
+  unsigned long now = millis();
+  if (now - bleLastAttemptAt < 3000) return false;
+  bleLastAttemptAt = now;
+
+  bleReqChar = nullptr;
+  bleRespChar = nullptr;
+  bleIpChar = nullptr;
+
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->setActiveScan(true);
+  NimBLEScanResults results = scan->getResults(BLE_SCAN_TIME_MS, false);
+
+  NimBLEAddress target;
+  bool found = false;
+  NimBLEUUID serviceUuid(BLE_SERVICE_UUID);
+  for (int i = 0; i < results.getCount(); i++) {
+    const NimBLEAdvertisedDevice *dev = results.getDevice(i);
+    bool serviceMatch = dev->isAdvertisingService(serviceUuid);
+    bool nameMatch = dev->haveName() &&
+                     dev->getName().rfind(BLE_PROXY_NAME_PREFIX, 0) == 0;
+    if (serviceMatch || nameMatch) {
+      target = dev->getAddress();
+      found = true;
+      break;
+    }
+  }
+  scan->clearResults();
+  if (!found) {
+#if CONTROLLER_VERBOSE_LOGS
+    Serial.println(F("[BLE] Proxy not found"));
+#endif
+    return false;
+  }
+
+  if (!bleClient) {
+    bleClient = NimBLEDevice::createClient();
+    bleClient->setConnectTimeout(3 * 1000);
+    bleClient->setConnectionParams(24, 48, 0, 180);
+  } else if (bleClient->isConnected()) {
+    bleClient->disconnect();
+  }
+
+  if (!bleClient->connect(target)) {
+#if CONTROLLER_VERBOSE_LOGS
+    Serial.println(F("[BLE] Proxy connect failed"));
+#endif
+    return false;
+  }
+
+  NimBLERemoteService *svc = bleClient->getService(BLE_SERVICE_UUID);
+  if (!svc) {
+    bleClient->disconnect();
+    return false;
+  }
+  bleReqChar = svc->getCharacteristic(BLE_REQ_UUID);
+  bleRespChar = svc->getCharacteristic(BLE_RESP_UUID);
+  bleIpChar = svc->getCharacteristic(BLE_PROXY_IP_UUID);
+  if (!bleReqChar || !bleRespChar) {
+    bleClient->disconnect();
+    bleReqChar = nullptr;
+    bleRespChar = nullptr;
+    return false;
+  }
+
+  if (bleIpChar && PROXY_HOST[0] == '\0') {
+    std::string ip = bleIpChar->readValue();
+    if (!ip.empty() && ip.length() < sizeof(PROXY_HOST)) {
+      strncpy(PROXY_HOST, ip.c_str(), sizeof(PROXY_HOST) - 1);
+      PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
+#if CONTROLLER_VERBOSE_LOGS
+      Serial.printf("[BLE] Proxy IP %s\n", PROXY_HOST);
+#endif
+    }
+  }
+
+#if CONTROLLER_VERBOSE_LOGS
+  Serial.println(F("[BLE] Proxy connected"));
+#endif
+  return true;
+}
+
+static bool proxyBleRequest(const char *method, const char *path,
+                            const char *payload, String &bodyOut,
+                            unsigned long timeoutMs = BLE_REQUEST_TIMEOUT_MS) {
+  if (!connectBleProxy()) return false;
+
+  uint16_t id = proxyRequestId++;
+  if (proxyRequestId == 0) proxyRequestId = 1;
+
+  char frame[760];
+  snprintf(frame, sizeof(frame), "REQ|%u|%s|%s|%s",
+           (unsigned int)id, method ? method : "GET", path ? path : "/",
+           payload ? payload : "");
+  uint8_t sum = checksum8(frame);
+  char framed[780];
+  snprintf(framed, sizeof(framed), "%s|%02X", frame, sum);
+
+  if (!bleReqChar->writeValue((uint8_t *)framed, strlen(framed), true)) {
+#if CONTROLLER_VERBOSE_LOGS
+    Serial.println(F("[BLE] Request write failed"));
+#endif
+    if (bleClient) bleClient->disconnect();
+    return false;
+  }
+
+  unsigned long deadline = millis() + timeoutMs;
+  while (millis() < deadline) {
+    std::string raw = bleRespChar->readValue();
+    if (!raw.empty()) {
+      String resp(raw.c_str());
+      if (resp.startsWith("RESP|")) {
+        int p1 = resp.indexOf('|', 5);
+        int p2 = (p1 >= 0) ? resp.indexOf('|', p1 + 1) : -1;
+        int p3 = (p2 >= 0) ? resp.lastIndexOf('|') : -1;
+        if (p1 >= 0 && p2 >= 0 && p3 > p2) {
+          uint16_t respId = (uint16_t)resp.substring(5, p1).toInt();
+          String withoutCrc = resp.substring(0, p3);
+          uint8_t expected = (uint8_t)strtoul(resp.substring(p3 + 1).c_str(), NULL, 16);
+          if (respId == id && checksum8(withoutCrc.c_str()) == expected) {
+            int status = resp.substring(p1 + 1, p2).toInt();
+            bodyOut = resp.substring(p2 + 1, p3);
+            return status >= 200 && status < 300;
+          }
+        }
+      }
+    }
+    delay(40);
+    yield();
+  }
+#if CONTROLLER_VERBOSE_LOGS
+  Serial.println(F("[BLE] Request timeout"));
+#endif
+  return false;
+}
+
+static bool discoverProxyUdp(unsigned long timeoutMs = 1200) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  WiFiUDP discovery;
+  if (!discovery.begin(0)) return false;
+
+  IPAddress broadcast((uint32_t)WiFi.localIP() | ~(uint32_t)WiFi.subnetMask());
+  discovery.beginPacket(broadcast, PROXY_DISCOVERY_PORT);
+  discovery.print(PROXY_DISCOVERY_QUERY);
+  discovery.endPacket();
+
+  unsigned long deadline = millis() + timeoutMs;
+  char packet[96];
+  while (millis() < deadline) {
+    int size = discovery.parsePacket();
+    if (size > 0) {
+      int len = discovery.read(packet, sizeof(packet) - 1);
+      packet[len] = '\0';
+      if (strncmp(packet, PROXY_DISCOVERY_REPLY,
+                  strlen(PROXY_DISCOVERY_REPLY)) == 0) {
+        IPAddress ip = discovery.remoteIP();
+        strncpy(PROXY_HOST, ip.toString().c_str(), sizeof(PROXY_HOST) - 1);
+        PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
+#if CONTROLLER_VERBOSE_LOGS
+        Serial.printf("[DISCOVERY] Proxy at %s (%s)\n", PROXY_HOST, packet);
+#endif
+        discovery.stop();
+        return true;
+      }
+    }
+    delay(20);
+  }
+  discovery.stop();
+  return false;
+}
 
 // ── Fetch reliability controls ──
 static const uint16_t FETCH_HTTP_TIMEOUT_MS = 5000;
@@ -137,6 +418,7 @@ static bool parseDiagField(const String &body, const char *key, String &out) {
 }
 
 // ==================== LOGGING ====================
+#if CONTROLLER_VERBOSE_LOGS
 void netLog(const char *format, ...) {
   char buf[256];
   va_list args;
@@ -153,30 +435,46 @@ void netLog(const char *format, ...) {
     udpClient.endPacket();
   }
 }
+#endif
 
 // ==================== WIFI ====================
 bool scanForProxy() {
-  Serial.println("[WIFI] Scanning for SmartTopBox_AP_*...");
+#if CONTROLLER_VERBOSE_LOGS
+  Serial.println("[WIFI] Scanning for configured hotspots...");
+#endif
   int n = WiFi.scanNetworks();
+#if CONTROLLER_VERBOSE_LOGS
   Serial.printf("[WIFI] Found %d networks\n", n);
+#endif
 
   int bestIdx = -1;
   int bestRssi = -999;
+  int bestCredential = -1;
   for (int i = 0; i < n; i++) {
     String ssid = WiFi.SSID(i);
+#if CONTROLLER_VERBOSE_LOGS
     Serial.printf("[WIFI]   %s (%d dBm)\n", ssid.c_str(), WiFi.RSSI(i));
-    if (ssid.startsWith("SmartTopBox_AP_")) {
-      if (WiFi.RSSI(i) > bestRssi) {
+#endif
+  }
+
+  for (uint8_t h = 0; h < HOTSPOT_COUNT && bestIdx < 0; h++) {
+    if (!HOTSPOTS[h].ssid || HOTSPOTS[h].ssid[0] == '\0') continue;
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == HOTSPOTS[h].ssid && WiFi.RSSI(i) > bestRssi) {
         bestRssi = WiFi.RSSI(i);
         bestIdx = i;
+        bestCredential = h;
       }
     }
   }
 
-  if (bestIdx >= 0) {
+  if (bestIdx >= 0 && bestCredential >= 0) {
     String ssid = WiFi.SSID(bestIdx);
     strncpy(WIFI_SSID, ssid.c_str(), sizeof(WIFI_SSID) - 1);
     WIFI_SSID[sizeof(WIFI_SSID) - 1] = '\0';
+    strncpy(WIFI_PASSWORD, HOTSPOTS[bestCredential].password,
+            sizeof(WIFI_PASSWORD) - 1);
+    WIFI_PASSWORD[sizeof(WIFI_PASSWORD) - 1] = '\0';
     proxyChannel = WiFi.channel(bestIdx);
     uint8_t *bssid = WiFi.BSSID(bestIdx);
     if (bssid) {
@@ -186,17 +484,20 @@ bool scanForProxy() {
       proxyBssidKnown = false;
     }
 
-    int num = ssid.substring(15).toInt();
-    snprintf(HARDWARE_ID, sizeof(HARDWARE_ID), "BOX_%03d", num);
+    snprintf(HARDWARE_ID, sizeof(HARDWARE_ID), "BOX_001");
 
-    Serial.printf("[WIFI] Selected: %s (%d dBm, ch %ld) -> %s\n",
+#if CONTROLLER_VERBOSE_LOGS
+    Serial.printf("[WIFI] Selected hotspot: %s (%d dBm, ch %ld) -> %s\n",
                   WIFI_SSID, bestRssi, (long)proxyChannel, HARDWARE_ID);
+#endif
     WiFi.scanDelete();
     return true;
   }
 
   WiFi.scanDelete();
-  Serial.println("[WIFI] No SmartTopBox_AP_* found!");
+#if CONTROLLER_VERBOSE_LOGS
+  Serial.println("[WIFI] No configured hotspot found!");
+#endif
   return false;
 }
 
@@ -212,14 +513,20 @@ static void beginProxyConnection(const char *reason) {
   esp_wifi_set_ps(WIFI_PS_NONE);
   esp_wifi_set_max_tx_power(78); // 19.5 dBm, units are quarter-dBm.
 
+#if CONTROLLER_VERBOSE_LOGS
   Serial.printf("[WIFI] Begin %s -> %s", reason ? reason : "connect", WIFI_SSID);
+#endif
   if (proxyChannel > 0 && proxyBssidKnown) {
+#if CONTROLLER_VERBOSE_LOGS
     Serial.printf(" (ch %ld, BSSID locked)", (long)proxyChannel);
+#endif
     WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD, proxyChannel, proxyBssid, true);
   } else {
     WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
   }
+#if CONTROLLER_VERBOSE_LOGS
   Serial.println();
+#endif
 
   wifiConnectStartedAt = millis();
   if (wifiReconnectAttempts < 255) {
@@ -228,6 +535,7 @@ static void beginProxyConnection(const char *reason) {
 }
 
 void startWiFiConnection() {
+  startProxyUart();
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
@@ -250,6 +558,9 @@ static void closePersistentConnection();
 
 void maintainWiFiConnection(unsigned long now) {
   if (WiFi.status() == WL_CONNECTED) {
+    if (PROXY_HOST[0] == '\0') {
+      discoverProxyUdp(250);
+    }
     wifiBackoffMs = WIFI_RETRY_BASE_MS;
     wifiRetryAt = now + WIFI_FIRST_RETRY_DELAY_MS;
     wifiRescanAt = now + WIFI_RESCAN_INTERVAL_MS;
@@ -307,6 +618,10 @@ static void closePersistentConnection() {
 static bool ensurePersistentConnection() {
   if (persistentConnected && persistentClient.connected()) {
     return true;
+  }
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
+    netLog("[FETCH] Proxy discovery failed\n");
+    return false;
   }
   // Tear down stale socket before reconnecting.
   persistentClient.stop();
@@ -398,8 +713,135 @@ static int readHttpResponse(String &bodyOut, unsigned long timeoutMs) {
   return statusCode;
 }
 
+static void parseOtpBody(const String &body) {
+  fetchFailCount = 0;
+  lastFetchSuccessAt = millis();
+
+  lastStatusCommand = "";
+  geoDistMeters = -1;
+  geoInsideFence = false;
+  isReturning = false;
+  strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
+  deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
+  pickupInsideFence = false;
+  dropoffInsideFence = false;
+
+  netLog("[FETCH] Body: '%s'\n", body.c_str());
+
+  int firstComma  = body.indexOf(',');
+  int secondComma = (firstComma > 0) ? body.indexOf(',', firstComma + 1) : -1;
+  int thirdComma  = (secondComma > 0) ? body.indexOf(',', secondComma + 1) : -1;
+
+  if (firstComma > 0) {
+    String otpPart = body.substring(0, firstComma);
+    String delPart;
+    String statusPart = "";
+
+    if (secondComma > 0) {
+      delPart = body.substring(firstComma + 1, secondComma);
+      statusPart = (thirdComma > 0) ? body.substring(secondComma + 1, thirdComma)
+                                    : body.substring(secondComma + 1);
+    } else {
+      delPart = body.substring(firstComma + 1);
+    }
+
+    lastStatusCommand = normalizeStatusToken(statusPart);
+
+    int distIdx = body.indexOf("DIST:");
+    if (distIdx >= 0) {
+      int valStart = distIdx + 5;
+      int valEnd = body.indexOf(',', valStart);
+      if (valEnd < 0) valEnd = body.length();
+      geoDistMeters = (int16_t)body.substring(valStart, valEnd).toInt();
+    }
+    int geoIdx = body.indexOf("GEO:");
+    if (geoIdx >= 0) geoInsideFence = (body.charAt(geoIdx + 4) == '1');
+    int retIdx = body.indexOf("RET:");
+    if (retIdx >= 0) isReturning = (body.charAt(retIdx + 4) == '1');
+
+    bool phaseParsed = false;
+    int phaseIdx = body.indexOf("PHASE:");
+    if (phaseIdx >= 0) {
+      int valStart = phaseIdx + 6;
+      int valEnd = body.indexOf(',', valStart);
+      if (valEnd < 0) valEnd = body.length();
+      String phase = body.substring(valStart, valEnd);
+      phase.trim();
+      if (phase.length() > 0 && phase.length() < (int)sizeof(deliveryPhase)) {
+        strncpy(deliveryPhase, phase.c_str(), sizeof(deliveryPhase) - 1);
+        deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
+        phaseParsed = true;
+      }
+    }
+    if (!phaseParsed) {
+      strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
+      deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
+    }
+
+    int pupIdx = body.indexOf("PUP:");
+    if (pupIdx >= 0) pickupInsideFence = (body.charAt(pupIdx + 4) == '1');
+    int droIdx = body.indexOf("DRO:");
+    if (droIdx >= 0) dropoffInsideFence = (body.charAt(droIdx + 4) == '1');
+
+    bool validOtp = (otpPart != "NO_OTP" && otpPart != "null" &&
+                     otpPart.length() > 0 && otpPart.length() <= 6);
+    bool validDel = (delPart != "NO_DELIVERY" && delPart != "null" &&
+                     delPart.length() > 0);
+
+    if (validOtp) {
+      strncpy(currentOtp, otpPart.c_str(), sizeof(currentOtp) - 1);
+      currentOtp[sizeof(currentOtp) - 1] = '\0';
+    } else {
+      currentOtp[0] = '\0';
+    }
+    if (validDel) {
+      strncpy(activeDeliveryId, delPart.c_str(), sizeof(activeDeliveryId) - 1);
+      activeDeliveryId[sizeof(activeDeliveryId) - 1] = '\0';
+    } else {
+      activeDeliveryId[0] = '\0';
+    }
+
+    hasActiveDelivery = validDel;
+    if (!hasActiveDelivery) {
+      strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
+      deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
+      pickupInsideFence = false;
+      dropoffInsideFence = false;
+    }
+    netLog("[FETCH] otp=%d del=%d dist=%d geo=%d ret=%d phase=%s pup=%d dro=%d cmd='%s'\n",
+           validOtp, validDel, geoDistMeters, geoInsideFence ? 1 : 0,
+           isReturning ? 1 : 0, deliveryPhase,
+           pickupInsideFence ? 1 : 0, dropoffInsideFence ? 1 : 0,
+           lastStatusCommand.c_str());
+    return;
+  }
+
+  if (body != "NO_OTP" && body != "null" && body.length() > 0 &&
+      body.length() <= 6) {
+    strncpy(currentOtp, body.c_str(), sizeof(currentOtp) - 1);
+    currentOtp[sizeof(currentOtp) - 1] = '\0';
+    hasActiveDelivery = true;
+  } else {
+    currentOtp[0] = '\0';
+    activeDeliveryId[0] = '\0';
+    hasActiveDelivery = false;
+  }
+}
+
 void fetchDeliveryContext() {
+  String uartBody;
+  if (proxyUartRequest("GET", "/otp", "", uartBody, REFRESH_HTTP_TIMEOUT_MS)) {
+    netLog("[FETCH] UART OK\n");
+    parseOtpBody(uartBody);
+    return;
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
+    if (proxyBleRequest("GET", "/otp", "", uartBody, REFRESH_HTTP_TIMEOUT_MS)) {
+      netLog("[FETCH] BLE OK\n");
+      parseOtpBody(uartBody);
+      return;
+    }
     netLog("[FETCH] Skip — WiFi not connected\n");
     closePersistentConnection();
     return;
@@ -407,6 +849,11 @@ void fetchDeliveryContext() {
 
   // Ensure persistent TCP socket is alive.
   if (!ensurePersistentConnection()) {
+    if (proxyBleRequest("GET", "/otp", "", uartBody, REFRESH_HTTP_TIMEOUT_MS)) {
+      netLog("[FETCH] BLE OK\n");
+      parseOtpBody(uartBody);
+      return;
+    }
     noteFetchFailure("tcp_connect");
     return;
   }
@@ -451,139 +898,7 @@ void fetchDeliveryContext() {
     return;
   }
 
-  // Successful fetch — reset the failure counter.
-  fetchFailCount = 0;
-  lastFetchSuccessAt = millis();
-
-  bool wasActive = hasActiveDelivery;
-  lastStatusCommand = "";
-  geoDistMeters = -1;
-  geoInsideFence = false;
-  isReturning = false;
-  strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
-  deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
-  pickupInsideFence = false;
-  dropoffInsideFence = false;
-
-  if (code == 200) {
-    netLog("[FETCH] Body: '%s'\n", body.c_str());
-
-    // New format: OTP,DELIVERY_ID,STATUS,DIST:N,GEO:0|1,RET:0|1,PHASE:*,PUP:0|1,DRO:0|1
-    // Fields are comma-separated. STATUS may be empty. DIST/GEO/RET are
-    // key:value pairs appended after the first 3 positional fields.
-    int firstComma  = body.indexOf(',');
-    int secondComma = (firstComma > 0) ? body.indexOf(',', firstComma + 1) : -1;
-    int thirdComma  = (secondComma > 0) ? body.indexOf(',', secondComma + 1) : -1;
-
-    if (firstComma > 0) {
-      String otpPart = body.substring(0, firstComma);
-      String delPart;
-      String statusPart = "";
-
-      if (secondComma > 0) {
-        delPart = body.substring(firstComma + 1, secondComma);
-        if (thirdComma > 0) {
-          statusPart = body.substring(secondComma + 1, thirdComma);
-        } else {
-          statusPart = body.substring(secondComma + 1);
-        }
-      } else {
-        delPart = body.substring(firstComma + 1);
-      }
-
-      // Parse admin command from STATUS field
-      lastStatusCommand = normalizeStatusToken(statusPart);
-
-      // Parse structured fields (DIST:N, GEO:0|1, RET:0|1) from remaining body
-      int distIdx = body.indexOf("DIST:");
-      if (distIdx >= 0) {
-        int valStart = distIdx + 5;
-        int valEnd = body.indexOf(',', valStart);
-        if (valEnd < 0) valEnd = body.length();
-        geoDistMeters = (int16_t)body.substring(valStart, valEnd).toInt();
-      }
-      int geoIdx = body.indexOf("GEO:");
-      if (geoIdx >= 0) {
-        geoInsideFence = (body.charAt(geoIdx + 4) == '1');
-      }
-      int retIdx = body.indexOf("RET:");
-      if (retIdx >= 0) {
-        isReturning = (body.charAt(retIdx + 4) == '1');
-      }
-
-      // Parse phase + pickup/dropoff fence flags (optional, fail-closed)
-      bool phaseParsed = false;
-      int phaseIdx = body.indexOf("PHASE:");
-      if (phaseIdx >= 0) {
-        int valStart = phaseIdx + 6;
-        int valEnd = body.indexOf(',', valStart);
-        if (valEnd < 0) valEnd = body.length();
-        String phase = body.substring(valStart, valEnd);
-        phase.trim();
-        if (phase.length() > 0 && phase.length() < (int)sizeof(deliveryPhase)) {
-          strncpy(deliveryPhase, phase.c_str(), sizeof(deliveryPhase) - 1);
-          deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
-          phaseParsed = true;
-        }
-      }
-
-      int pupIdx = body.indexOf("PUP:");
-      if (pupIdx >= 0) {
-        pickupInsideFence = (body.charAt(pupIdx + 4) == '1');
-      }
-      int droIdx = body.indexOf("DRO:");
-      if (droIdx >= 0) {
-        dropoffInsideFence = (body.charAt(droIdx + 4) == '1');
-      }
-
-      if (!phaseParsed) {
-        strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
-        deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
-      }
-
-      bool validOtp = (otpPart != "NO_OTP" && otpPart != "null" &&
-                       otpPart.length() > 0 && otpPart.length() <= 6);
-      bool validDel = (delPart != "NO_DELIVERY" && delPart != "null" &&
-                       delPart.length() > 0);
-
-      if (validOtp) {
-        strncpy(currentOtp, otpPart.c_str(), sizeof(currentOtp) - 1);
-        currentOtp[sizeof(currentOtp) - 1] = '\0';
-      } else {
-        currentOtp[0] = '\0';
-      }
-      if (validDel) {
-        strncpy(activeDeliveryId, delPart.c_str(), sizeof(activeDeliveryId) - 1);
-        activeDeliveryId[sizeof(activeDeliveryId) - 1] = '\0';
-      } else {
-        activeDeliveryId[0] = '\0';
-      }
-
-      hasActiveDelivery = validDel;
-      if (!hasActiveDelivery) {
-        strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
-        deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
-        pickupInsideFence = false;
-        dropoffInsideFence = false;
-      }
-            netLog("[FETCH] otp=%d del=%d dist=%d geo=%d ret=%d phase=%s pup=%d dro=%d cmd='%s'\n",
-              validOtp, validDel, geoDistMeters, geoInsideFence ? 1 : 0,
-              isReturning ? 1 : 0, deliveryPhase,
-              pickupInsideFence ? 1 : 0, dropoffInsideFence ? 1 : 0,
-              lastStatusCommand.c_str());
-    } else {
-      // Legacy format (just OTP, no delivery_id)
-      if (body != "NO_OTP" && body != "null" && body.length() > 0 &&
-          body.length() <= 6) {
-        strncpy(currentOtp, body.c_str(), sizeof(currentOtp) - 1);
-        currentOtp[sizeof(currentOtp) - 1] = '\0';
-        hasActiveDelivery = true;
-      } else {
-        currentOtp[0] = '\0';
-        hasActiveDelivery = false;
-      }
-    }
-  }
+  parseOtpBody(body);
 
   // Drive state transitions based on delivery availability
   // (State machine transitions are handled in the main .ino — this function
@@ -591,7 +906,19 @@ void fetchDeliveryContext() {
 }
 
 bool requestContextRefresh() {
+  String uartBody;
+  if (proxyUartRequest("GET", "/refresh-context", "", uartBody, FETCH_HTTP_TIMEOUT_MS)) {
+    uartBody.trim();
+    netLog("[REFRESH] UART body='%s'\n", uartBody.c_str());
+    return uartBody.startsWith("OK");
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
+    if (proxyBleRequest("GET", "/refresh-context", "", uartBody, FETCH_HTTP_TIMEOUT_MS)) {
+      uartBody.trim();
+      netLog("[REFRESH] BLE body='%s'\n", uartBody.c_str());
+      return uartBody.startsWith("OK");
+    }
     netLog("[REFRESH] Skip — WiFi not connected\n");
     closePersistentConnection();
     return false;
@@ -639,7 +966,17 @@ bool requestContextRefresh() {
 }
 
 bool requestProxyPing() {
+  String uartBody;
+  if (proxyUartRequest("GET", "/ping", "", uartBody, 600)) {
+    uartBody.trim();
+    return uartBody.startsWith("OK");
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
+    if (proxyBleRequest("GET", "/ping", "", uartBody, 900)) {
+      uartBody.trim();
+      return uartBody.startsWith("OK");
+    }
     closePersistentConnection();
     return false;
   }
@@ -667,9 +1004,74 @@ bool requestProxyPing() {
 }
 
 bool fetchDiagnostics(ControllerDiagData &out) {
+  String uartDiagBody;
+  if (proxyUartRequest("GET", "/diag", "", uartDiagBody, CONTROLLER_DIAG_HTTP_TIMEOUT_MS + 800)) {
+    String field;
+    ControllerDiagData parsed = out;
+    bool parsedAny = false;
+
+    if (parseDiagField(uartDiagBody, "batt_pct", field)) { parsed.battPct = field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "batt_v", field)) { parsed.battVoltage = field.toFloat(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "rssi", field)) { parsed.rssi = field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "csq", field)) { parsed.csq = field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "gps_fix", field)) { parsed.gpsFix = (field.toInt() != 0); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "lte", field)) { parsed.lteConnected = (field.toInt() != 0); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "modem", field)) { parsed.modemOk = (field.toInt() != 0); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "time", field)) { parsed.timeSynced = (field.toInt() != 0); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "cam_up", field)) { parsed.camUp = (field.toInt() != 0); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "ctrl_up", field)) { parsed.controllerUp = (field.toInt() != 0); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "fb_fail", field)) { parsed.firebaseFailures = field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "cmd_stage", field)) { parsed.commandStage = field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "cmd_pending", field)) { parsed.commandPending = (field.toInt() != 0); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "conn_state", field)) { parsed.connectivityState = field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "lte_reconn_ms", field)) { parsed.lteReconnectMs = (unsigned long)field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "upload_active", field)) { parsed.photoUploadActive = (field.toInt() != 0); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "upload_pct", field)) { parsed.photoUploadProgress = field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "upload_age", field)) { parsed.photoUploadAgeMs = (unsigned long)field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "cam_age", field)) { parsed.camAgeMs = (unsigned long)field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "ctrl_age", field)) { parsed.controllerAgeMs = (unsigned long)field.toInt(); parsedAny = true; }
+    if (parseDiagField(uartDiagBody, "uptime", field)) { parsed.proxyUptimeMs = (unsigned long)field.toInt(); parsedAny = true; }
+    if (parsedAny) {
+      out = parsed;
+      return true;
+    }
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
+    if (proxyBleRequest("GET", "/diag", "", uartDiagBody,
+                        CONTROLLER_DIAG_HTTP_TIMEOUT_MS + 1200)) {
+      String field;
+      ControllerDiagData parsed = out;
+      bool parsedAny = false;
+      if (parseDiagField(uartDiagBody, "batt_pct", field)) { parsed.battPct = field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "batt_v", field)) { parsed.battVoltage = field.toFloat(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "rssi", field)) { parsed.rssi = field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "csq", field)) { parsed.csq = field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "gps_fix", field)) { parsed.gpsFix = (field.toInt() != 0); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "lte", field)) { parsed.lteConnected = (field.toInt() != 0); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "modem", field)) { parsed.modemOk = (field.toInt() != 0); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "time", field)) { parsed.timeSynced = (field.toInt() != 0); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "cam_up", field)) { parsed.camUp = (field.toInt() != 0); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "ctrl_up", field)) { parsed.controllerUp = (field.toInt() != 0); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "fb_fail", field)) { parsed.firebaseFailures = field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "cmd_stage", field)) { parsed.commandStage = field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "cmd_pending", field)) { parsed.commandPending = (field.toInt() != 0); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "conn_state", field)) { parsed.connectivityState = field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "lte_reconn_ms", field)) { parsed.lteReconnectMs = (unsigned long)field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "upload_active", field)) { parsed.photoUploadActive = (field.toInt() != 0); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "upload_pct", field)) { parsed.photoUploadProgress = field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "upload_age", field)) { parsed.photoUploadAgeMs = (unsigned long)field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "cam_age", field)) { parsed.camAgeMs = (unsigned long)field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "ctrl_age", field)) { parsed.controllerAgeMs = (unsigned long)field.toInt(); parsedAny = true; }
+      if (parseDiagField(uartDiagBody, "uptime", field)) { parsed.proxyUptimeMs = (unsigned long)field.toInt(); parsedAny = true; }
+      if (parsedAny) {
+        out = parsed;
+        return true;
+      }
+    }
     return false;
   }
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) return false;
 
   WiFiClient client;
   HTTPClient http;
@@ -801,7 +1203,17 @@ bool fetchDiagnostics(ControllerDiagData &out) {
 // Reuses the keep-alive socket for fire-and-forget POSTs during the
 // unlock flow, avoiding ~150ms TCP handshake per call.
 static int sendRawPost(const char *path, const char *json) {
-  if (WiFi.status() != WL_CONNECTED) return -1;
+  String uartBody;
+  if (proxyUartRequest("POST", path, json, uartBody, FETCH_HTTP_TIMEOUT_MS)) {
+    return 200;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (proxyBleRequest("POST", path, json, uartBody, FETCH_HTTP_TIMEOUT_MS)) {
+      return 200;
+    }
+    return -1;
+  }
   if (!ensurePersistentConnection()) return -1;
 
   int jsonLen = strlen(json);
@@ -850,9 +1262,6 @@ bool reportEventToProxy(bool otpValid,
                         bool fallbackRequired,
                         const char *failureReason,
                         unsigned long unlockLatencyMs) {
-  if (WiFi.status() != WL_CONNECTED)
-    return false;
-
   const char *safeReason =
       (failureReason != NULL && failureReason[0] != '\0') ? failureReason : "";
 
@@ -871,16 +1280,15 @@ bool reportEventToProxy(bool otpValid,
            unlockLatencyMs);
 
   int code = sendRawPost("/event", json);
+#if CONTROLLER_VERBOSE_LOGS
   Serial.printf("[EVENT] POST → HTTP %d\n", code);
+#endif
 
   return (code == 200 || code == 201);
 }
 
 // ==================== ALERT REPORTING ====================
 bool reportAlertToProxy(const char *alertType, const char *details) {
-  if (WiFi.status() != WL_CONNECTED)
-    return false;
-
   char json[256];
   snprintf(json, sizeof(json),
            "{\"alert_type\":\"%s\",\"details\":\"%s\","
@@ -888,16 +1296,15 @@ bool reportAlertToProxy(const char *alertType, const char *details) {
            alertType, details, HARDWARE_ID, activeDeliveryId);
 
   int code = sendRawPost("/event", json);
+#if CONTROLLER_VERBOSE_LOGS
   Serial.printf("[ALERT] %s → HTTP %d\n", alertType, code);
+#endif
 
   return (code == 200 || code == 201);
 }
 
 // ==================== TAMPER REPORT ====================
 bool reportTamperToProxy() {
-  if (WiFi.status() != WL_CONNECTED)
-    return false;
-
   char json[256];
   snprintf(json, sizeof(json),
            "{\"alert_type\":\"REED_TAMPER\",\"details\":\"lid_opened_no_unlock\","
@@ -905,16 +1312,15 @@ bool reportTamperToProxy() {
            HARDWARE_ID, activeDeliveryId);
 
   int code = sendRawPost("/event", json);
+#if CONTROLLER_VERBOSE_LOGS
   Serial.printf("[TAMPER] Report → HTTP %d\n", code);
+#endif
 
   return (code == 200 || code == 201);
 }
 
 // ==================== COMMAND ACK REPORT ====================
 bool reportCommandAckToProxy(const char *command, const char *status, const char *details) {
-  if (WiFi.status() != WL_CONNECTED)
-    return false;
-
   char json[320];
   snprintf(json, sizeof(json),
            "{\"command\":\"%s\",\"status\":\"%s\",\"details\":\"%s\","
@@ -923,15 +1329,30 @@ bool reportCommandAckToProxy(const char *command, const char *status, const char
            HARDWARE_ID, activeDeliveryId);
 
   int code = sendRawPost("/command-ack", json);
+#if CONTROLLER_VERBOSE_LOGS
   Serial.printf("[CMD_ACK] %s/%s -> HTTP %d\n", command ? command : "", status ? status : "", code);
+#endif
 
   return (code == 200 || code == 201);
 }
 
 bool requestCameraPowerMode(bool wakeMode) {
+  String uartBody;
+  if (proxyUartRequest("GET", wakeMode ? "/cam-power?mode=wake" : "/cam-power?mode=sleep",
+                       "", uartBody, 3000)) {
+    uartBody.trim();
+    return uartBody.indexOf("CAM_") >= 0 || uartBody.indexOf("OK") >= 0;
+  }
+
   if (WiFi.status() != WL_CONNECTED) {
+    if (proxyBleRequest("GET", wakeMode ? "/cam-power?mode=wake" : "/cam-power?mode=sleep",
+                        "", uartBody, 3000)) {
+      uartBody.trim();
+      return uartBody.indexOf("CAM_") >= 0 || uartBody.indexOf("OK") >= 0;
+    }
     return false;
   }
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) return false;
 
   HTTPClient http;
   char url[96];
@@ -958,14 +1379,9 @@ bool requestCameraPowerMode(bool wakeMode) {
 }
 
 int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
-  if (WiFi.status() != WL_CONNECTED || !pin || pin[0] == '\0') {
+  if (!pin || pin[0] == '\0') {
     return 0;
   }
-
-  HTTPClient http;
-  char url[96];
-  snprintf(url, sizeof(url), "http://%s:%d/personal-pin-verify", PROXY_HOST,
-           PROXY_PORT);
 
   char json[256];
   snprintf(json, sizeof(json),
@@ -973,12 +1389,51 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
            "\"currently_locked\":%s,\"source\":\"controller_keypad\"}",
            pin, HARDWARE_ID, activeDeliveryId, currentlyLocked ? "true" : "false");
 
+  String uartBody;
+  if (proxyUartRequest("POST", "/personal-pin-verify", json, uartBody, 5000)) {
+    uartBody.trim();
+    if (uartBody.indexOf("ALLOW_UNLOCK") >= 0) return 1;
+    if (uartBody.indexOf("ALLOW_RELOCK") >= 0) return 2;
+    if (uartBody.indexOf("DENY:disabled") >= 0 ||
+        uartBody.indexOf("DENY:missing_pin") >= 0 ||
+        uartBody.indexOf("DENY:invalid") >= 0 ||
+        uartBody.indexOf("DENY:sync_failed") >= 0 ||
+        uartBody.indexOf("DENY:box_mismatch") >= 0) {
+      return -1;
+    }
+    return 0;
+  }
+
+  if (WiFi.status() != WL_CONNECTED || !pin || pin[0] == '\0') {
+    if (proxyBleRequest("POST", "/personal-pin-verify", json, uartBody, 5000)) {
+      uartBody.trim();
+      if (uartBody.indexOf("ALLOW_UNLOCK") >= 0) return 1;
+      if (uartBody.indexOf("ALLOW_RELOCK") >= 0) return 2;
+      if (uartBody.indexOf("DENY:disabled") >= 0 ||
+          uartBody.indexOf("DENY:missing_pin") >= 0 ||
+          uartBody.indexOf("DENY:invalid") >= 0 ||
+          uartBody.indexOf("DENY:sync_failed") >= 0 ||
+          uartBody.indexOf("DENY:box_mismatch") >= 0) {
+        return -1;
+      }
+    }
+    return 0;
+  }
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) return -2;
+
+  HTTPClient http;
+  char url[96];
+  snprintf(url, sizeof(url), "http://%s:%d/personal-pin-verify", PROXY_HOST,
+           PROXY_PORT);
+
   http.setTimeout(5000);
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
   int code = http.POST((uint8_t *)json, strlen(json));
   if (code != 200) {
+#if CONTROLLER_VERBOSE_LOGS
     Serial.printf("[PIN] verify HTTP %d\n", code);
+#endif
     http.end();
     return -2;
   }
@@ -1005,8 +1460,30 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
 
 // ==================== FACE CHECK ====================
 int requestFaceCheck() {
-  // ── Primary: WiFi via proxy ──
+  char facePath[128];
+  if (strlen(activeDeliveryId) > 0 &&
+      strcmp(activeDeliveryId, "NO_DELIVERY") != 0 &&
+      strcmp(activeDeliveryId, "null") != 0) {
+    snprintf(facePath, sizeof(facePath), "/face-check?delivery_id=%s", activeDeliveryId);
+  } else {
+    snprintf(facePath, sizeof(facePath), "/face-check");
+  }
+
+  String uartBody;
+  if (proxyUartRequest("GET", facePath, "", uartBody, FACE_CHECK_WIFI_TIMEOUT_MS)) {
+    uartBody.trim();
+    if (uartBody.indexOf("FACE_OK") >= 0) return 1;
+    if (uartBody.indexOf("NO_FACE_LOW_LIGHT") >= 0) return 2;
+    if (uartBody.indexOf("NO_FACE") >= 0) return 0;
+  }
+
+  // ── Secondary: WiFi via proxy ──
   if (WiFi.status() == WL_CONNECTED) {
+    if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
+#if CONTROLLER_VERBOSE_LOGS
+      Serial.println(F("[FACE] Proxy discovery failed"));
+#endif
+    } else {
     HTTPClient http;
     char url[128];
     if (strlen(activeDeliveryId) > 0 &&
@@ -1032,15 +1509,28 @@ int requestFaceCheck() {
       if (body.indexOf("NO_FACE_LOW_LIGHT") >= 0) return 2;
       if (body.indexOf("NO_FACE") >= 0) return 0;
 
+#if CONTROLLER_VERBOSE_LOGS
       Serial.printf("[FACE] HTTP 200 but body error: %s\n", body.c_str());
+#endif
     } else {
+#if CONTROLLER_VERBOSE_LOGS
       Serial.printf("[FACE] HTTP %d\n", code);
+#endif
       http.end();
     }
+    }
+  }
+  if (proxyBleRequest("GET", facePath, "", uartBody, FACE_CHECK_WIFI_TIMEOUT_MS)) {
+    uartBody.trim();
+    if (uartBody.indexOf("FACE_OK") >= 0) return 1;
+    if (uartBody.indexOf("NO_FACE_LOW_LIGHT") >= 0) return 2;
+    if (uartBody.indexOf("NO_FACE") >= 0) return 0;
   }
 
   // ── Fallback: UART Serial2 to ESP32-CAM directly ──
+#if CONTROLLER_VERBOSE_LOGS
   Serial.println(F("[FACE] WiFi down — trying UART fallback..."));
+#endif
 
   // Flush stale data
   while (Serial2.available()) Serial2.read();
@@ -1071,12 +1561,16 @@ int requestFaceCheck() {
   }
   uartBuf[uartLen] = '\0';
 
+#if CONTROLLER_VERBOSE_LOGS
   Serial.printf("[FACE] UART response: '%s'\n", uartBuf);
+#endif
 
   if (strstr(uartBuf, "FACE_OK") != NULL) return 1;
   if (strstr(uartBuf, "NO_FACE_LOW_LIGHT") != NULL) return 2;
   if (strstr(uartBuf, "NO_FACE") != NULL) return 0;
 
+#if CONTROLLER_VERBOSE_LOGS
   Serial.println(F("[FACE] UART fallback failed"));
+#endif
   return -1;
 }

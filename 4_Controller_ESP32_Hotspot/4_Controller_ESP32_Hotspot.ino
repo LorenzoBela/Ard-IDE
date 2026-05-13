@@ -1009,14 +1009,14 @@ void renderUtilityMode(unsigned long now) {
              fresh ? "LIVE" : (diagCacheValid ? "STALE" : "NO DATA"));
   } else if (utilityModeKey == '2') {
     if (diagCache.rssi <= -998) {
-      snprintf(line0, sizeof(line0), "LTE signal N/A");
+      snprintf(line0, sizeof(line0), "Signal N/A");
     } else {
-      snprintf(line0, sizeof(line0), "LTE %d dBm", diagCache.rssi);
+      snprintf(line0, sizeof(line0), "Signal %d dBm", diagCache.rssi);
     }
     snprintf(line1, sizeof(line1), "GPS:%s %s", diagCache.gpsFix ? "LOCK" : "WAIT",
              fresh ? "LIVE" : (diagCacheValid ? "STALE" : "NO DATA"));
   } else {
-    if (diagCache.lteConnected && diagCache.modemOk) {
+    if (diagCache.lteConnected || diagCache.modemOk) {
       snprintf(line0, sizeof(line0), "Net: CONNECTED");
     } else {
       snprintf(line0, sizeof(line0), "Net: OFFLINE");
@@ -1152,8 +1152,8 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.println(F("\n=== Parcel-Safe Controller v3 (Modular) ==="));
-  Serial.println(F("[BOOT] Brownout detector disabled (USB power workaround)"));
+  CTRL_LOG_PRINTLN(F("\n=== Parcel-Safe Controller v3 (Modular) ==="));
+  CTRL_LOG_PRINTLN(F("[BOOT] Brownout detector disabled (USB power workaround)"));
 
   initHardwareIO();
   initDisplayHealth();
@@ -1173,9 +1173,9 @@ void setup() {
     updateDisplay("Self-Test...", "Reed check only");
   }
 
-  Serial.printf("  Proxy: %s:%d\n", PROXY_HOST, PROXY_PORT);
-  Serial.println(F("  Modules: LockSafety, OTPLockout, DisplayHealth, AdminOverride, KeypadHealth"));
-  Serial.println(F("  Boot: SelfTest -> WiFi -> RiderAuth -> Operational"));
+  CTRL_LOG_PRINTF("  Proxy: %s:%d\n", PROXY_HOST, PROXY_PORT);
+  CTRL_LOG_PRINTLN(F("  Modules: LockSafety, OTPLockout, DisplayHealth, AdminOverride, KeypadHealth"));
+  CTRL_LOG_PRINTLN(F("  Boot: SelfTest -> WiFi -> RiderAuth -> Operational"));
 }
 
 // ==================== MAIN LOOP (non-blocking) ====================
@@ -1391,7 +1391,7 @@ void loop() {
       if (!isDisplayFailed()) {
         recoverDisplay();
         lastLcdPeriodicResync = now; // Reset periodic timer too
-        Serial.println(F("[LCD] Auto-recovery after solenoid EMI"));
+        CTRL_LOG_PRINTLN(F("[LCD] Auto-recovery after solenoid EMI"));
       }
     }
 
@@ -1401,7 +1401,7 @@ void loop() {
     } else if (now - lastLcdPeriodicResync >= LCD_PERIODIC_RESYNC_MS) {
       if (!isDisplayFailed()) {
         recoverDisplay();
-        Serial.println(F("[LCD] Periodic watchdog re-sync"));
+        CTRL_LOG_PRINTLN(F("[LCD] Periodic watchdog re-sync"));
       }
       lastLcdPeriodicResync = now;
     }
@@ -1692,7 +1692,7 @@ void handleStateMachine(unsigned long now) {
 
   case STATE_CONNECTING_WIFI:
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+      CTRL_LOG_PRINTF("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
       fetchDeliveryContext();
       lastDeliveryContextFetch = now;
 
