@@ -10,17 +10,9 @@
 
 #include <Arduino.h>
 
-// Compile-time size trim. Keep user-facing LCD behavior; strip verbose Serial
-// and UDP diagnostics from the controller build.
+// Keep verbose subsystem logs off on the ESP32 controller. Direct boot
+// checkpoints in setup() stay active for crash isolation.
 #define CONTROLLER_VERBOSE_LOGS 0
-
-// Controller is a BLE client only. Keep central + observer roles for scanning
-// and connecting to the LilyGO GATT server, but strip unused advertiser/server
-// role code and NimBLE debug text from this build.
-#define CONFIG_BT_NIMBLE_ROLE_PERIPHERAL 0
-#define CONFIG_BT_NIMBLE_ROLE_BROADCASTER 0
-#define CONFIG_BT_NIMBLE_LOG_LEVEL 5
-#define CONFIG_NIMBLE_CPP_LOG_LEVEL 0
 
 #if CONTROLLER_VERBOSE_LOGS
 #define CTRL_LOG_PRINT(...) Serial.print(__VA_ARGS__)
@@ -79,17 +71,6 @@ extern char HARDWARE_ID[12];
 #define PROXY_UART_BAUD 115200
 #define PROXY_UART_TIMEOUT_MS 1200
 
-// BLE controller <-> LilyGO fallback. BLE is low-bandwidth control only.
-#define BLE_DEVICE_NAME "STB-CTRL-001"
-#define BLE_PROXY_NAME_PREFIX "STB-PROXY"
-#define BLE_SERVICE_UUID "7b6f0001-6b6f-4f53-8454-534d41525442"
-#define BLE_REQ_UUID     "7b6f0002-6b6f-4f53-8454-534d41525442"
-#define BLE_RESP_UUID    "7b6f0003-6b6f-4f53-8454-534d41525442"
-#define BLE_HEALTH_UUID  "7b6f0004-6b6f-4f53-8454-534d41525442"
-#define BLE_PROXY_IP_UUID "7b6f0005-6b6f-4f53-8454-534d41525442"
-#define BLE_REQUEST_TIMEOUT_MS 1800
-#define BLE_SCAN_TIME_MS 1200
-
 // ==================== PINS ====================
 #define LOCK_PIN          32    // Relay / MOSFET control pin
 #define LOCK_PIN_ON       LOW   // Active-Low relay: LOW = ON  (solenoid powered)
@@ -124,6 +105,7 @@ static const uint8_t KP_COLS = 3;
 #define FACE_RETRY_DELAY_MS       1500
 #define DELIVERY_CONTEXT_FETCH_MS 2000
 #define DELIVERY_CONTEXT_IDLE_FETCH_MS 8000
+#define BOOT_PROXY_FETCH_RETRY_MS 3000
 #define PROXY_HEARTBEAT_MS 2500
 #define WIFI_LCD_FAULT_MS 60000
 #define PERSONAL_PIN_TIMEOUT_MS   15000
@@ -206,10 +188,6 @@ static const uint8_t KP_COLS = 3;
 // ==================== OPEN-DOOR SAFETY ====================
 #define DOOR_OPEN_LCD_WARN_INTERVAL_MS 30000  // LCD warning flash every 30 s
 #define DOOR_OPEN_CRITICAL_MS          300000 // 5 min → escalated DOOR_OPEN_CRITICAL alert
-
-// ==================== LCD AUTO-RECOVERY ====================
-#define LCD_RECOVERY_POST_SOLENOID_MS  200    // Re-init LCD 200ms after solenoid de-energise (EMI settle)
-#define LCD_PERIODIC_RESYNC_MS         60000  // Watchdog: re-init LCD every 60s to prevent gibberish
 
 // ==================== UDP LOGGING ====================
 #define UDP_LOG_PORT 5114

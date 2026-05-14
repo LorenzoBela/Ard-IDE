@@ -13,6 +13,7 @@
 static LiquidCrystal_I2C lcd(DISPLAY_I2C_ADDR, 16, 2);
 static bool lcdBacklightEnabled = true;
 static bool manualBacklightOverride = false;
+static bool lcdReady = false;
 
 // ── Keypad ──
 static char keys[KP_ROWS][KP_COLS] = {
@@ -25,6 +26,9 @@ static uint8_t rowPins[KP_ROWS] = {13, 23, 19, 26};
 static uint8_t colPins[KP_COLS] = {14, 25, 18};
 static Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, KP_ROWS, KP_COLS);
 
+static const unsigned long KEYPAD_DEBOUNCE_MS = 80;
+static const unsigned long KEYPAD_BUFFER_COOLDOWN_MS = 120;
+
 static QueueHandle_t keyQueue = NULL;
 
 // Thread-safe held-key tracking (written by keypadTask on Core 1,
@@ -32,9 +36,24 @@ static QueueHandle_t keyQueue = NULL;
 static volatile char heldKeyAtomic = 0;
 
 static void initLcdSequence(bool fast) {
+  Serial.println(F("[HW] LCD init start"));
+  Serial.flush();
   Wire.begin(21, 22);
+  Wire.setTimeOut(50);
   Wire.setClock(100000);
-  delay(fast ? 20 : 800); // Fast re-sync after noise vs cold-boot settle
+  delay(fast ? 20 : 80); // Fast re-sync after noise vs cold-boot settle
+
+  Wire.beginTransmission(DISPLAY_I2C_ADDR);
+  uint8_t err = Wire.endTransmission();
+  if (err != 0) {
+    lcdReady = false;
+    lcdBacklightEnabled = false;
+    Serial.printf("[HW] LCD not detected at 0x%02X (err=%u), skipping LCD init\n",
+                  DISPLAY_I2C_ADDR, err);
+    Serial.flush();
+    return;
+  }
+
   for (int i = 0; i < 2; i++) {
     lcd.begin();
     delay(fast ? 20 : 50);
@@ -43,9 +62,13 @@ static void initLcdSequence(bool fast) {
   }
   lcd.backlight();
   lcdBacklightEnabled = true;
+  lcdReady = true;
+  Serial.println(F("[HW] LCD init done"));
+  Serial.flush();
 }
 
 static void keypadTask(void *pvParameters) {
+  (void)pvParameters;
   static unsigned long lastBufferTime = 0;
 
   while (true) {
@@ -62,15 +85,16 @@ static void keypadTask(void *pvParameters) {
         }
       }
 
-      // If matrix ghosting happens, '2' (Row 0) and '0' (Row 3) both trigger in the same tick.
-      // Because keypad.key[] is populated in matrix scan order, the true physical
-      // key ('0', row 3) will always overwrite the ghost key ('2', row 0) in lastKey.
-      if (newPresses > 0) {
-        if (millis() - lastBufferTime > 150) { // Strict software cooldown prevents "00" bounce
-          xQueueSend(keyQueue, &lastKey, 0);
+      if (newPresses == 1) {
+        if (millis() - lastBufferTime > KEYPAD_BUFFER_COOLDOWN_MS) {
+          if (keyQueue) {
+            xQueueSend(keyQueue, &lastKey, 0);
+          }
           lastBufferTime = millis();
-          CTRL_LOG_PRINTF("[KEYPAD] Buffered: %c (from %d simultaneous)\n", lastKey, newPresses);
+          CTRL_LOG_PRINTF("[KEYPAD] Buffered: %c\n", lastKey);
         }
+      } else if (newPresses > 1) {
+        CTRL_LOG_PRINTF("[KEYPAD] Ignored ambiguous scan (%d simultaneous)\n", newPresses);
       }
     }
 
@@ -90,31 +114,49 @@ static void keypadTask(void *pvParameters) {
 
 // ==================== INIT ====================
 void initHardwareIO() {
-  keypad.setDebounceTime(100);
+  Serial.println(F("[HW] init start"));
+  Serial.flush();
+
+  keypad.setDebounceTime(KEYPAD_DEBOUNCE_MS);
   keypad.setHoldTime(500);  // HOLD state after 500ms (long-press '0' checks 1200ms separately)
+  Serial.println(F("[HW] keypad configured"));
+  Serial.flush();
   
   keyQueue = xQueueCreate(10, sizeof(char));
-  xTaskCreatePinnedToCore(keypadTask, "KeypadTask", 2048, NULL, 2, NULL, 1);
+  if (!keyQueue) {
+    Serial.println(F("[HW] key queue create failed"));
+    Serial.flush();
+  }
 
   initLcdSequence(false);
   updateDisplay("Parcel-Safe v2", "Connecting WiFi");
+  Serial.println(F("[HW] LCD splash written"));
+  Serial.flush();
 
   Serial2.begin(CAM_UART_BAUD, SERIAL_8N1, CAM_UART_RX, CAM_UART_TX);
   CTRL_LOG_PRINTLN(F("[UART] Serial2 ready (CAM fallback)"));
+  Serial.println(F("[HW] Serial2 ready"));
+  Serial.flush();
+
+  BaseType_t taskOk = xTaskCreatePinnedToCore(keypadTask, "KeypadTask", 4096, NULL, 2, NULL, 1);
+  Serial.println(taskOk == pdPASS ? F("[HW] keypad task started") : F("[HW] keypad task failed"));
+  Serial.flush();
 }
 
 // ==================== LCD ====================
 void updateDisplay(const char *line0, const char *line1) {
+  if (!lcdReady) return;
   char buf[17];
   lcd.setCursor(0, 0);
-  snprintf(buf, sizeof(buf), "%-16s", line0);
+  snprintf(buf, sizeof(buf), "%-16s", line0 ? line0 : "");
   lcd.print(buf);
   lcd.setCursor(0, 1);
-  snprintf(buf, sizeof(buf), "%-16s", line1);
+  snprintf(buf, sizeof(buf), "%-16s", line1 ? line1 : "");
   lcd.print(buf);
 }
 
 void displayBacklightOn() {
+  if (!lcdReady) return;
   if (!lcdBacklightEnabled) {
     lcd.backlight();
     lcdBacklightEnabled = true;
@@ -123,6 +165,7 @@ void displayBacklightOn() {
 
 void displayBacklightOff() {
   if (manualBacklightOverride) return;
+  if (!lcdReady) return;
   if (lcdBacklightEnabled) {
     lcd.noBacklight();
     lcdBacklightEnabled = false;
@@ -144,6 +187,7 @@ bool toggleBacklightOverride() {
 // ==================== KEYPAD ====================
 char readKeypad() {
   char k = '\0';
+  if (!keyQueue) return k;
   xQueueReceive(keyQueue, &k, 0); // Non-blocking read from buffer
   return k;
 }

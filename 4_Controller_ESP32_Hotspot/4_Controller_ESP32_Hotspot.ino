@@ -70,6 +70,7 @@ static uint8_t personalPinLen = 0;
 // ── Timing trackers ──
 static unsigned long lastDeliveryContextFetch = 0;
 static unsigned long lastProxyHeartbeat = 0;
+static unsigned long lastConnectingFetchAttempt = 0;
 static unsigned long messageStartAt           = 0;
 static unsigned long lastDisplayCheck         = 0;
 static unsigned long personalPinExpiresAt     = 0;
@@ -168,10 +169,6 @@ static uint8_t bootAuthLen = 0;
 static unsigned long bootAuthLastInputAt = 0;
 
 // ── LCD auto-recovery ──
-static bool          prevSolenoidState     = false; // Edge detection for solenoid de-energise
-static unsigned long lcdRecoveryScheduledAt = 0;    // millis() when post-solenoid recovery was scheduled
-static unsigned long lastLcdPeriodicResync  = 0;    // millis() of last periodic watchdog re-sync
-
 // ── Open-door safety ──
 static unsigned long lastDoorOpenWarnAt = 0;
 static bool doorOpenCriticalSent = false;
@@ -210,6 +207,7 @@ static const char *CP_KEY_CRC = "crc";
 // ── Forward declarations ──
 void enterState(TesterState newState);
 void handleStateMachine(unsigned long now);
+void refreshDisplayAfterManualI2cReset();
 void resetFaceSession();
 void applyIdlePowerPolicy(unsigned long now);
 void applyActivePowerPolicy(unsigned long now);
@@ -657,10 +655,10 @@ static bool syncBeforePersonalPin() {
   }
 
   // Step 2: Fetch the updated context into local globals
-  fetchDeliveryContext();
+  bool fetchOk = fetchDeliveryContext();
   lastDeliveryContextFetch = millis();
 
-  if (hasActiveDelivery && hasLoadedOtp()) {
+  if (fetchOk && hasActiveDelivery && hasLoadedOtp()) {
     noteOnlineContextSync(millis());
   }
 
@@ -915,8 +913,15 @@ static void processKeypadGeoCheck(unsigned long now) {
     return;
   }
 
-  fetchDeliveryContext();
+  bool fetchOk = fetchDeliveryContext();
   lastDeliveryContextFetch = now;
+
+  if (!fetchOk) {
+    if (!isDisplayFailed()) {
+      updateDisplay("Proxy offline", "Waiting...");
+    }
+    return;
+  }
 
   if (isOtpEntryEligibleNow()) {
     clearKeypadGeoCheck();
@@ -1137,6 +1142,11 @@ void pollDiagnosticsIfDue(unsigned long now) {
 
 // ==================== SETUP ====================
 void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println();
+  Serial.println(F("[BOOT] setup() entered"));
+  Serial.flush();
   // ── Brownout detector disable (ESP32 hardware workaround) ──
   // The BOD fires during peripheral inrush + WiFi radio init when
   // powered via USB (thin cable / weak source). Disabling the detector
@@ -1145,21 +1155,38 @@ void setup() {
   // under-voltage would cause real corruption — which would manifest as
   // a watchdog reset instead.
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+  Serial.println(F("[BOOT] brownout detector disabled"));
+  Serial.flush();
   
   // Immediately clamp lock pin LOW to prevent startup relay snapping
   initLock();
+  Serial.println(F("[BOOT] lock initialized"));
+  Serial.flush();
 
-  Serial.begin(115200);
-  delay(500);
+  Serial.println(F("[BOOT] banner start"));
+  Serial.flush();
+  Serial.println(F("=== Parcel-Safe Controller v3 (Modular) ==="));
+  Serial.println(F("[BOOT] Brownout detector disabled (USB power workaround)"));
+  Serial.println(F("[BOOT] banner done"));
+  Serial.flush();
 
-  CTRL_LOG_PRINTLN(F("\n=== Parcel-Safe Controller v3 (Modular) ==="));
-  CTRL_LOG_PRINTLN(F("[BOOT] Brownout detector disabled (USB power workaround)"));
-
+  Serial.println(F("[BOOT] hardware IO init start"));
+  Serial.flush();
   initHardwareIO();
+  Serial.println(F("[BOOT] hardware IO initialized"));
+  Serial.flush();
   initDisplayHealth();
+  Serial.println(F("[BOOT] display health initialized"));
+  Serial.flush();
   initOtpLockoutPersistence();
+  Serial.println(F("[BOOT] OTP persistence initialized"));
+  Serial.flush();
   initOfflineContextStore();
+  Serial.println(F("[BOOT] offline context initialized"));
+  Serial.flush();
   initHandoffCheckpointStore();
+  Serial.println(F("[BOOT] handoff checkpoints initialized"));
+  Serial.flush();
 
   // Boot self-test runs concurrently with WiFi — both are non-blocking.
   // SECURITY: Always skip solenoid pulses at boot to prevent:
@@ -1167,7 +1194,11 @@ void setup() {
   //   2. Momentary unauthorized unlock windows (Article 1.2)
   // Reed-only verification confirms sensor integrity without energising.
   initSelfTest(true);   // Reed-only mode — NO solenoid pulses
+  Serial.println(F("[BOOT] self-test initialized"));
+  Serial.flush();
   startWiFiConnection();
+  Serial.println(F("[BOOT] WiFi connection started"));
+  Serial.flush();
   currentState = STATE_BOOT_SELFTEST;
   if (!isDisplayFailed()) {
     updateDisplay("Self-Test...", "Reed check only");
@@ -1260,21 +1291,23 @@ void loop() {
     if (now - lastDeliveryContextFetch >= contextFetchInterval) {
       bool wasActive = hasActiveDelivery;
       String oldStatus = lastStatusCommand;
-      fetchDeliveryContext();
+      bool fetchOk = fetchDeliveryContext();
       lastDeliveryContextFetch = now;
       lastProxyHeartbeat = now;
 
-      if (hasActiveDelivery) {
+      if (fetchOk && hasActiveDelivery) {
         if (hasLoadedOtp()) {
           noteOnlineContextSync(now);
         } else {
           noteOnlineDeliveryOnly(now);
         }
-      } else {
+      } else if (fetchOk) {
         clearOfflineContextSnapshot();
       }
 
-      if (currentState == STATE_OWNER_UNLOCKED) {
+      if (!fetchOk) {
+        // Keep the previous context and try again on the next interval.
+      } else if (currentState == STATE_OWNER_UNLOCKED) {
         if ((hasActiveDelivery != wasActive) || (oldStatus != lastStatusCommand)) {
           deferredContextTransition = true;
           netLog("[OWNER] Deferred delivery transition while owner session active\n");
@@ -1376,38 +1409,10 @@ void loop() {
     lastDisplayCheck = now;
   }
 
-  // ── 4a. LCD auto-recovery: post-solenoid EMI + periodic watchdog ──
-  {
-    // Detect solenoid de-energise edge → schedule LCD re-init after EMI settles.
-    bool solNow = isSolenoidActive();
-    if (prevSolenoidState && !solNow) {
-      lcdRecoveryScheduledAt = now + LCD_RECOVERY_POST_SOLENOID_MS;
-    }
-    prevSolenoidState = solNow;
+  // Automatic LCD/I2C reinitialization is disabled. Use long-press '0'
+  // for manual recovery if the display is corrupted.
 
-    // Execute scheduled post-solenoid recovery.
-    if (lcdRecoveryScheduledAt > 0 && now >= lcdRecoveryScheduledAt) {
-      lcdRecoveryScheduledAt = 0;
-      if (!isDisplayFailed()) {
-        recoverDisplay();
-        lastLcdPeriodicResync = now; // Reset periodic timer too
-        CTRL_LOG_PRINTLN(F("[LCD] Auto-recovery after solenoid EMI"));
-      }
-    }
-
-    // Periodic watchdog: re-sync LCD every 60s to prevent accumulated drift.
-    if (lastLcdPeriodicResync == 0) {
-      lastLcdPeriodicResync = now; // Init on first loop
-    } else if (now - lastLcdPeriodicResync >= LCD_PERIODIC_RESYNC_MS) {
-      if (!isDisplayFailed()) {
-        recoverDisplay();
-        CTRL_LOG_PRINTLN(F("[LCD] Periodic watchdog re-sync"));
-      }
-      lastLcdPeriodicResync = now;
-    }
-  }
-
-  // ── 4b. Utility diagnostics refresh and timeout handling ──
+  // ── 4a. Utility diagnostics refresh and timeout handling ──
   pollDiagnosticsIfDue(now);
   if (utilityModeActive && now >= utilityModeExpiresAt) {
     stopUtilityMode(now);
@@ -1433,10 +1438,16 @@ void loop() {
     if (heldKey == '0') {
       if (zeroHoldStart == 0) zeroHoldStart = now;
       if (!zeroHoldTriggered && (now - zeroHoldStart) >= 1200) {
+        drainKeypadBuffer();
+        if (currentState == STATE_ENTERING_PIN && inputLen == 1 && inputCode[0] == '0') {
+          inputLen = 0;
+          inputCode[0] = '\0';
+          currentState = STATE_IDLE;
+        }
         recoverDisplay();
         checkDisplayHealth();
         if (!isDisplayFailed()) {
-          updateDisplay("Display reset", "Continue");
+          refreshDisplayAfterManualI2cReset();
         }
         zeroHoldTriggered = true;
       }
@@ -1468,9 +1479,9 @@ void loop() {
         } else {
           bool ok = requestContextRefresh();
           clearKeypadGeoCheck();
-          fetchDeliveryContext();
+          bool fetchOk = fetchDeliveryContext();
           lastDeliveryContextFetch = now;
-          showKeypadStatusMessage(now, ok);
+          showKeypadStatusMessage(now, ok && fetchOk);
         }
         nineHoldTriggered = true;
       }
@@ -1551,6 +1562,8 @@ void handleStateMachine(unsigned long now) {
         updateDisplay("Self-Test...", "Reed check...");
       }
     } else if (stResult == SELFTEST_PASS) {
+      Serial.println(F("[BOOT] self-test passed"));
+      Serial.flush();
       netLog("[SELFTEST] PASS — solenoid and reed nominal\n");
       selfTestWarned = false;
       if (!isDisplayFailed()) {
@@ -1560,6 +1573,8 @@ void handleStateMachine(unsigned long now) {
       // WiFi already started in setup() — just transition to wait for it.
       enterState(STATE_CONNECTING_WIFI);
     } else { // SELFTEST_WARN
+      Serial.println(F("[BOOT] self-test warning"));
+      Serial.flush();
       netLog("[SELFTEST] WARN — reed unstable, proceeding with caution\n");
       selfTestWarned = true;
       if (!isDisplayFailed()) {
@@ -1692,9 +1707,25 @@ void handleStateMachine(unsigned long now) {
 
   case STATE_CONNECTING_WIFI:
     if (WiFi.status() == WL_CONNECTED) {
-      CTRL_LOG_PRINTF("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-      fetchDeliveryContext();
+      if (lastConnectingFetchAttempt > 0 &&
+          now - lastConnectingFetchAttempt < BOOT_PROXY_FETCH_RETRY_MS) {
+        break;
+      }
+      lastConnectingFetchAttempt = now;
+
+      Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+      Serial.flush();
+      bool fetchOk = fetchDeliveryContext();
       lastDeliveryContextFetch = now;
+
+      if (!fetchOk) {
+        Serial.println(F("[BOOT] proxy context unavailable; waiting/retrying"));
+        Serial.flush();
+        if (!isDisplayFailed()) {
+          updateDisplay("Proxy offline", "Waiting...");
+        }
+        break;
+      }
 
       if (hasActiveDelivery) {
         if (hasLoadedOtp()) {
@@ -2268,7 +2299,6 @@ void handleStateMachine(unsigned long now) {
 
       if (ls == LOCK_OK) {
         netLog("[LOCK] Solenoid ON (unlock OK)\n");
-        recoverDisplay(); // Re-sync LCD after relay/solenoid EMI
         if (overrideAttempt) {
           reportCommandAckToProxy("UNLOCKING", "executed", "lock_ok");
           adminOverride.clear();
@@ -2462,6 +2492,56 @@ void handleStateMachine(unsigned long now) {
 }
 
 
+void refreshDisplayAfterManualI2cReset() {
+  switch (currentState) {
+  case STATE_STANDBY:
+    updateDisplay("Box Ready", "No Delivery");
+    break;
+  case STATE_IDLE:
+    renderIdleJourneyStatus();
+    break;
+  case STATE_ENTERING_PIN: {
+    char display[17];
+    snprintf(display, sizeof(display), "PIN: %s", inputCode);
+    updateDisplay(isReturnOtpEligibleNow() ? "Return PIN:" : "Enter PIN:", display);
+    break;
+  }
+  case STATE_PERSONAL_PIN_ENTRY:
+    updateDisplay("Personal PIN:", personalPinCode);
+    break;
+  case STATE_BOOT_SELFTEST:
+    updateDisplay("Self-Test...", "Reed check only");
+    break;
+  case STATE_BOOT_AUTH:
+    updateDisplay("Rider PIN:", bootAuthCode);
+    break;
+  case STATE_CONNECTING_WIFI:
+    updateDisplay("Parcel-Safe v3", "Connecting WiFi");
+    break;
+  case STATE_VERIFYING_OTP:
+    updateDisplay("Checking PIN", "Please wait");
+    break;
+  case STATE_REQUESTING_FACE:
+    updateDisplay("Face scanning...", "Please wait");
+    break;
+  case STATE_UNLOCKING:
+    updateDisplay("Unlocking...", "Please wait");
+    break;
+  case STATE_OWNER_UNLOCKED:
+    updateDisplay("Owner Access", "* = Relock");
+    break;
+  case STATE_AWAITING_CLOSE:
+    updateDisplay("Close lid first", "#=Close assist");
+    break;
+  case STATE_RELOCKING:
+    updateDisplay("Locking...", "Please wait");
+    break;
+  case STATE_SHOW_MESSAGE:
+    enterState(hasActiveDelivery ? STATE_IDLE : STATE_STANDBY);
+    break;
+  }
+}
+
 // ==================== STATE HELPER ====================
 void enterState(TesterState newState) {
   if (utilityModeActive && newState != STATE_STANDBY && newState != STATE_IDLE &&
@@ -2540,6 +2620,7 @@ void enterState(TesterState newState) {
     displayBacklightOn();
     break;
   case STATE_CONNECTING_WIFI:
+    lastConnectingFetchAttempt = 0;
     connectStateEnteredAt = millis();
     if (!isDisplayFailed() && !bootPhaseComplete) {
       updateDisplay("Parcel-Safe v3", "Connecting WiFi");

@@ -13,7 +13,6 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <HTTPClient.h>
-#include <NimBLEDevice.h>
 #include <WiFiClientSecure.h>
 #include "mbedtls/sha256.h"
 
@@ -81,19 +80,12 @@ static const uint8_t HOTSPOT_COUNT = sizeof(HOTSPOTS) / sizeof(HOTSPOTS[0]);
 
 // Dedicated controller <-> LilyGO UART. Do not reuse modem UART pins 26/27.
 // Wire cross-over:
-//   LilyGO GPIO21 TX -> Controller GPIO13 RX
-//   LilyGO GPIO22 RX <- Controller GPIO14 TX
+//   LilyGO GPIO21 TX -> Controller GPIO33 RX
+//   LilyGO GPIO22 RX <- Controller GPIO27 TX
 //   GND shared
 #define PROXY_UART_RX 22
 #define PROXY_UART_TX 21
 #define PROXY_UART_BAUD 115200
-
-#define BLE_PROXY_NAME "STB-PROXY-001"
-#define BLE_SERVICE_UUID "7b6f0001-6b6f-4f53-8454-534d41525442"
-#define BLE_REQ_UUID     "7b6f0002-6b6f-4f53-8454-534d41525442"
-#define BLE_RESP_UUID    "7b6f0003-6b6f-4f53-8454-534d41525442"
-#define BLE_HEALTH_UUID  "7b6f0004-6b6f-4f53-8454-534d41525442"
-#define BLE_PROXY_IP_UUID "7b6f0005-6b6f-4f53-8454-534d41525442"
 
 // Supabase Storage (matches ESP32-CAM sketch)
 #define SUPABASE_URL "https://lvpneakciqegwyymtqno.supabase.co"
@@ -144,10 +136,6 @@ static const uint8_t HOTSPOT_COUNT = sizeof(HOTSPOTS) / sizeof(HOTSPOTS[0]);
 HardwareSerial modemSerial(1);
 TinyGsm modem(modemSerial);
 HardwareSerial proxySerial(2);
-static NimBLECharacteristic *bleRespChar = nullptr;
-static NimBLECharacteristic *bleHealthChar = nullptr;
-static NimBLECharacteristic *bleProxyIpChar = nullptr;
-static bool proxyResponseBleMode = false;
 
 bool lteConnected = false;
 bool wifiUplinkConnected = false;
@@ -462,6 +450,18 @@ unsigned long lastPersonalPinFlushAt = 0;
 #define PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS 5000
 static unsigned long lastPinRuntimeRefreshAt = 0;
 #define PIN_RUNTIME_REFRESH_MIN_MS 15000
+static bool personalPinRuntimeRefreshQueued = false;
+static bool personalPinRuntimeRefreshForce = false;
+static bool tamperFirebaseWriteQueued = false;
+static bool lockEventFirebaseWriteQueued = false;
+static bool queuedLockOtpValid = false;
+static bool queuedLockFaceDetected = false;
+static bool queuedLockUnlocked = false;
+static int queuedLockFaceAttempts = 0;
+static bool queuedLockFaceRetryExhausted = false;
+static bool queuedLockFallbackRequired = false;
+static char queuedLockFailureReason[24] = "";
+static unsigned long queuedLockUnlockLatencyMs = 0;
 
 // Reliability counters
 uint8_t consecutiveModemFailures = 0;
@@ -517,8 +517,6 @@ static void maintainHotspotStation(unsigned long now);
 static void pollDiscoveryServer();
 static void beginProxyUart();
 static void pollProxyUart();
-static void beginProxyBle();
-static void updateProxyBleStatus();
 static void handleProxyUartRequest(const String &line);
 static bool cloudWifiAvailable();
 static bool wifiPutToFirebase(const char *path, const String &jsonData);
@@ -537,6 +535,13 @@ void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked,
                               const char *failureReason,
                               unsigned long unlockLatencyMs);
 void writeTamperToFirebase();
+static void queueTamperFirebaseWrite();
+static void queueLockEventFirebaseWrite(bool otpValid, bool faceDetected,
+                                        bool unlocked, int faceAttempts,
+                                        bool faceRetryExhausted,
+                                        bool fallbackRequired,
+                                        const char *failureReason,
+                                        unsigned long unlockLatencyMs);
 String forwardFaceCheck(String deliveryId);
 String forwardCameraPowerCommand(const String &mode);
 
@@ -2225,6 +2230,10 @@ static void startHotspotStation() {
                   WiFi.gatewayIP().toString().c_str());
     udpServer.begin(UDP_LOG_PORT);
     discoveryServer.begin(PROXY_DISCOVERY_PORT);
+    Serial.printf("[DISCOVERY] Listening on UDP %d\n", PROXY_DISCOVERY_PORT);
+    camServer.begin();
+    Serial.printf("[WIFI] Controller HTTP server listening on port %d\n",
+                  CAM_SERVER_PORT);
     wifiCloudHealthy = true;
     apStarted = true;
   } else {
@@ -2249,11 +2258,14 @@ static void maintainHotspotStation(unsigned long now) {
 static void pollDiscoveryServer() {
   int packetSize = discoveryServer.parsePacket();
   if (packetSize <= 0) return;
+  IPAddress remoteIp = discoveryServer.remoteIP();
+  uint16_t remotePort = discoveryServer.remotePort();
   char packet[96];
   int len = discoveryServer.read(packet, sizeof(packet) - 1);
+  if (len < 0) len = 0;
   packet[len] = '\0';
   if (strncmp(packet, "SMART_TOP_BOX_CAM:", 18) == 0) {
-    camClientIP = discoveryServer.remoteIP();
+    camClientIP = remoteIp;
     camClientKnown = true;
     camLastSeenAt = millis();
     Serial.printf("[DISCOVERY] CAM at %s (%s)\n",
@@ -2261,6 +2273,8 @@ static void pollDiscoveryServer() {
     return;
   }
   if (strcmp(packet, PROXY_DISCOVERY_QUERY) != 0) return;
+  Serial.printf("[DISCOVERY] Controller query from %s:%u\n",
+                remoteIp.toString().c_str(), remotePort);
 
   char reply[64];
   snprintf(reply, sizeof(reply), "%s%s:%d:%s",
@@ -2268,9 +2282,23 @@ static void pollDiscoveryServer() {
            WiFi.localIP().toString().c_str(),
            CAM_SERVER_PORT,
            HARDWARE_ID);
-  discoveryServer.beginPacket(discoveryServer.remoteIP(), discoveryServer.remotePort());
+
+  // Reply on several paths. Phone hotspots can be inconsistent with
+  // client-to-client UDP: the controller's broadcast may arrive while a
+  // unicast reply to its random source port is dropped.
+  discoveryServer.beginPacket(remoteIp, remotePort);
   discoveryServer.print(reply);
   discoveryServer.endPacket();
+  if (remotePort != PROXY_DISCOVERY_PORT) {
+    discoveryServer.beginPacket(remoteIp, PROXY_DISCOVERY_PORT);
+    discoveryServer.print(reply);
+    discoveryServer.endPacket();
+  }
+  IPAddress broadcast((uint32_t)WiFi.localIP() | ~(uint32_t)WiFi.subnetMask());
+  discoveryServer.beginPacket(broadcast, PROXY_DISCOVERY_PORT);
+  discoveryServer.print(reply);
+  discoveryServer.endPacket();
+  Serial.printf("[DISCOVERY] Reply sent: %s\n", reply);
 }
 
 // Start WiFi station mode so all boards share the phone/router hotspot.
@@ -2298,82 +2326,9 @@ static void beginProxyUart() {
                 PROXY_UART_RX, PROXY_UART_TX, PROXY_UART_BAUD);
 }
 
-class ProxyBleCallbacks : public NimBLECharacteristicCallbacks {
-  void onWrite(NimBLECharacteristic *chr, NimBLEConnInfo &connInfo) override {
-    std::string value = chr->getValue();
-    if (value.empty()) return;
-    proxyResponseBleMode = true;
-    handleProxyUartRequest(String(value.c_str()));
-    proxyResponseBleMode = false;
-  }
-};
-
-static ProxyBleCallbacks proxyBleCallbacks;
-
-static void beginProxyBle() {
-  NimBLEDevice::init(BLE_PROXY_NAME);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P3);
-  NimBLEDevice::setMTU(517);
-
-  NimBLEServer *server = NimBLEDevice::createServer();
-  NimBLEService *svc = server->createService(BLE_SERVICE_UUID);
-  NimBLECharacteristic *req =
-      svc->createCharacteristic(BLE_REQ_UUID, NIMBLE_PROPERTY::WRITE);
-  bleRespChar =
-      svc->createCharacteristic(BLE_RESP_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-  bleHealthChar =
-      svc->createCharacteristic(BLE_HEALTH_UUID, NIMBLE_PROPERTY::READ);
-  bleProxyIpChar =
-      svc->createCharacteristic(BLE_PROXY_IP_UUID, NIMBLE_PROPERTY::READ);
-
-  req->setCallbacks(&proxyBleCallbacks);
-  bleRespChar->setValue("RESP|0|204||00");
-  updateProxyBleStatus();
-  svc->start();
-
-  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
-  adv->setName(BLE_PROXY_NAME);
-  adv->addServiceUUID(BLE_SERVICE_UUID);
-  adv->enableScanResponse(true);
-  adv->start();
-  Serial.println("[BLE] Proxy GATT server advertising");
-}
-
-static void updateProxyBleStatus() {
-  static unsigned long lastBleStatusAt = 0;
-  unsigned long now = millis();
-  if (now - lastBleStatusAt < 1000) return;
-  lastBleStatusAt = now;
-
-  if (bleProxyIpChar) {
-    bleProxyIpChar->setValue(WiFi.status() == WL_CONNECTED
-                                 ? WiFi.localIP().toString().c_str()
-                                 : "");
-  }
-  if (bleHealthChar) {
-    char health[96];
-    snprintf(health, sizeof(health), "id=%s,wifi=%d,cloud=%d,lte=%d,cam=%d,uptime=%lu",
-             HARDWARE_ID,
-             WiFi.status() == WL_CONNECTED ? 1 : 0,
-             wifiCloudHealthy ? 1 : 0,
-             lteConnected ? 1 : 0,
-             camClientKnown ? 1 : 0,
-             (unsigned long)now);
-    bleHealthChar->setValue(health);
-  }
-}
-
 static void sendProxyUartResponse(uint16_t id, int status, const String &body) {
   String frame = "RESP|" + String(id) + "|" + String(status) + "|" + body;
   uint8_t sum = uartChecksum8(frame.c_str());
-  if (proxyResponseBleMode && bleRespChar) {
-    String framed = frame + "|";
-    if (sum < 16) framed += "0";
-    framed += String(sum, HEX);
-    bleRespChar->setValue(framed.c_str());
-    bleRespChar->notify();
-    return;
-  }
   proxySerial.print(frame);
   proxySerial.print("|");
   if (sum < 16) proxySerial.print("0");
@@ -2477,6 +2432,8 @@ static void handleProxyUartRequest(const String &line) {
   String path = line.substring(p3 + 1, p4);
   String payload = line.substring(p4 + 1, p5);
   controllerLastSeenAt = millis();
+  Serial.printf("[PROXY-UART] Request id=%u %s %s\n",
+                (unsigned int)id, method.c_str(), path.c_str());
 
   if (method == "GET" && path.startsWith("/ping")) {
     sendProxyUartResponse(id, 200, "OK");
@@ -2520,7 +2477,7 @@ static void handleProxyUartRequest(const String &line) {
   } else if (method == "POST" && path == "/event") {
     sendProxyUartResponse(id, 200, "OK");
     if (payload.indexOf("\"tamper\":true") >= 0) {
-      writeTamperToFirebase();
+      queueTamperFirebaseWrite();
     } else {
       String jsonStr = payload;
       bool ov = payload.indexOf("\"otp_valid\":true") >= 0;
@@ -2536,9 +2493,9 @@ static void handleProxyUartRequest(const String &line) {
       readTopLevelJsonBool(jsonStr, "fallback_required", fallbackRequired);
       readTopLevelJsonInt(jsonStr, "unlock_latency_ms", unlockLatencyMs);
       readTopLevelJsonString(jsonStr, "failure_reason", failureReason, sizeof(failureReason));
-      writeLockEventToFirebase(ov, fd, ul, faceAttempts, faceRetryExhausted,
-                               fallbackRequired, failureReason,
-                               (unsigned long)(unlockLatencyMs > 0 ? unlockLatencyMs : 0));
+      queueLockEventFirebaseWrite(ov, fd, ul, faceAttempts, faceRetryExhausted,
+                                  fallbackRequired, failureReason,
+                                  (unsigned long)(unlockLatencyMs > 0 ? unlockLatencyMs : 0));
     }
   } else {
     sendProxyUartResponse(id, 404, "NOT_FOUND");
@@ -3613,13 +3570,14 @@ static void writePersonalPinAudit(const char *action,
            "\"offline_queued\":%s,\"rider_id\":\"%s\","
            "\"timestamp\":{\".sv\":\"timestamp\"},\"device_epoch\":%lu}",
            action ? action : "RIDER_MANUAL_PIN_ATTEMPT",
-           result ? result : "unknown", currentlyLocked ? "true" : "false",
-           offlineQueued ? "true" : "false", cachedPersonalPinRiderId,
-           nowEpoch);
+            result ? result : "unknown", currentlyLocked ? "true" : "false",
+            offlineQueued ? "true" : "false", cachedPersonalPinRiderId,
+            nowEpoch);
 
-  if (!writePersonalPinAuditNow(eventJson)) {
-    queuePersonalPinAudit(eventJson);
-  }
+  // Do not perform Firebase HTTP writes from handleCameraClient(); that path
+  // runs on loopTask and can overflow the stack during POST /personal-pin-verify.
+  // Queue the audit and let flushQueuedPersonalPinAudits() upload it later.
+  queuePersonalPinAudit(eventJson);
 }
 
 // ==================== TAMPER CLEAR SUPPRESSION ====================
@@ -3632,6 +3590,32 @@ static unsigned long tamperRetriggerAtMs = 0;
 static const unsigned long TAMPER_SUPPRESSION_TTL_MS = 120000UL;
 
 void writeTamperToFirebase();
+
+static void queueTamperFirebaseWrite() {
+  tamperFirebaseWriteQueued = true;
+  Serial.println("[TAMPER] Firebase write queued");
+}
+
+static void queueLockEventFirebaseWrite(bool otpValid, bool faceDetected,
+                                        bool unlocked, int faceAttempts,
+                                        bool faceRetryExhausted,
+                                        bool fallbackRequired,
+                                        const char *failureReason,
+                                        unsigned long unlockLatencyMs) {
+  queuedLockOtpValid = otpValid;
+  queuedLockFaceDetected = faceDetected;
+  queuedLockUnlocked = unlocked;
+  queuedLockFaceAttempts = faceAttempts;
+  queuedLockFaceRetryExhausted = faceRetryExhausted;
+  queuedLockFallbackRequired = fallbackRequired;
+  strncpy(queuedLockFailureReason,
+          failureReason ? failureReason : "",
+          sizeof(queuedLockFailureReason) - 1);
+  queuedLockFailureReason[sizeof(queuedLockFailureReason) - 1] = '\0';
+  queuedLockUnlockLatencyMs = unlockLatencyMs;
+  lockEventFirebaseWriteQueued = true;
+  Serial.println("[EVENT] lock_events write queued");
+}
 
 static void captureSuppressedTamper(unsigned long now) {
   tamperRetriggerPending = true;
@@ -3658,7 +3642,7 @@ static void replayPendingTamperIfAny(unsigned long now, const char *reason) {
   if (!theftGuardIsLockdown()) {
     theftGuardActivateLockdown("tamper_retrigger", now);
   }
-  writeTamperToFirebase();
+  queueTamperFirebaseWrite();
 }
 
 static void startTamperSuppression(unsigned long now) {
@@ -4132,7 +4116,7 @@ void refreshDeliveryContextFromFirebase() {
     if (totalResponseLen > 0 && totalResponseLen > (int)body.length()) {
       if (totalResponseLen > DELIVERY_CONTEXT_MAX_BYTES) {
         Serial.printf(
-            "[CONTEXT] WARNING: Response %d > max context window %d (%d bytes read). Shrink /hardware/%s or raise DELIVERY_CONTEXT_MAX_BYTES.\n",
+            "[CONTEXT] Large hardware node: %d > context window %d (%d bytes read). Using exact field reads for controller context.\n",
             totalResponseLen, DELIVERY_CONTEXT_MAX_BYTES, (int)body.length(),
             HARDWARE_ID);
       } else {
@@ -4142,6 +4126,9 @@ void refreshDeliveryContextFromFirebase() {
       }
     }
     bool responseTruncated = (totalResponseLen > 0 && totalResponseLen > (int)body.length());
+    if (responseTruncated) {
+      refreshAuthoritativeDeliveryFieldsFromFirebase();
+    }
 
     // Manual refresh: if mobile app bumped refresh_context_at, speed up polls.
     {
@@ -4158,7 +4145,7 @@ void refreshDeliveryContextFromFirebase() {
     }
 
     // EC-32: Parse top-level return_active (ignore nested historical fields).
-    {
+    if (!responseTruncated) {
       bool parsedReturnActive = false;
       bool returnActiveValue = false;
       parsedReturnActive = readTopLevelJsonBool(body, "return_active", returnActiveValue);
@@ -4166,7 +4153,7 @@ void refreshDeliveryContextFromFirebase() {
     }
 
     // Parse top-level return_otp.
-    {
+    if (!responseTruncated) {
       char parsedReturnOtp[8] = "";
       if (readTopLevelJsonString(body, "return_otp", parsedReturnOtp, sizeof(parsedReturnOtp)) &&
           strlen(parsedReturnOtp) > 0 && strlen(parsedReturnOtp) <= 6) {
@@ -4180,7 +4167,7 @@ void refreshDeliveryContextFromFirebase() {
     }
 
     // Parse top-level otp_code only.
-    {
+    if (!responseTruncated) {
       char parsedOtp[8] = "";
       if (readTopLevelJsonString(body, "otp_code", parsedOtp, sizeof(parsedOtp)) &&
           strlen(parsedOtp) > 0 && strlen(parsedOtp) <= 6) {
@@ -4194,7 +4181,7 @@ void refreshDeliveryContextFromFirebase() {
     }
 
     // Parse top-level delivery_id only.
-    {
+    if (!responseTruncated) {
       char parsedDeliveryId[64] = "";
       if (readTopLevelJsonString(body, "delivery_id", parsedDeliveryId,
                                  sizeof(parsedDeliveryId)) &&
@@ -4211,7 +4198,9 @@ void refreshDeliveryContextFromFirebase() {
     // The hardware node has grown large enough that whole-node reads can be
     // truncated by the modem. These exact tiny reads make cancellation/order
     // clearing authoritative even when the diagnostic payload is oversized.
-    refreshAuthoritativeDeliveryFieldsFromFirebase();
+    if (!responseTruncated) {
+      refreshAuthoritativeDeliveryFieldsFromFirebase();
+    }
 
     // Same-site demo bookings use one physical location for pickup and dropoff.
     // Keep this top-level flag close to the delivery context so /otp can expose
@@ -5637,43 +5626,31 @@ void handleCameraClient() {
 
     const char *resultBody = "DENY:invalid";
     bool verified = false;
-    bool refreshed = false;
+    bool pinCacheReady =
+        personalPinEnabled &&
+        cachedPersonalPinHashMcu[0] != '\0' &&
+        cachedPersonalPinSalt[0] != '\0' &&
+        cachedPersonalPinRiderId[0] != '\0';
 
     if (reqBoxId[0] != '\0' && strcmp(reqBoxId, HARDWARE_ID) != 0) {
       resultBody = "DENY:box_mismatch";
-    } else if (lteConnected) {
-      if (syncPersonalPinRuntimeWithActivePairing(true, true)) {
-        refreshed = true;
-      } else {
-        resultBody = "DENY:sync_failed";
-      }
-    } else if (!lteConnected &&
-               (!personalPinEnabled || cachedPersonalPinHashMcu[0] == '\0' ||
-                cachedPersonalPinSalt[0] == '\0' || cachedPersonalPinRiderId[0] == '\0')) {
-      refreshed = refreshPersonalPinRuntimeFromFirebase(true, true);
-    }
-
-    if (strncmp(resultBody, "DENY:", 5) == 0 &&
-        strcmp(resultBody, "DENY:invalid") != 0) {
-      // A specific denial reason was already selected above.
-    } else if (!personalPinEnabled) {
-      resultBody = "DENY:disabled";
     } else if (pin[0] == '\0') {
       resultBody = "DENY:missing_pin";
+    } else if (!personalPinEnabled) {
+      personalPinRuntimeRefreshQueued = true;
+      personalPinRuntimeRefreshForce = true;
+      resultBody = "DENY:disabled";
+    } else if (!pinCacheReady) {
+      personalPinRuntimeRefreshQueued = true;
+      personalPinRuntimeRefreshForce = true;
+      resultBody = "DENY:sync_failed";
     } else {
       verified = verifyPersonalPinLocal(pin);
-      if (!verified && !refreshed) {
-        bool retryRefreshOk = lteConnected
-                                  ? syncPersonalPinRuntimeWithActivePairing(true, true)
-                                  : refreshPersonalPinRuntimeFromFirebase(true, true);
-        if (retryRefreshOk) {
-          refreshed = true;
-          verified = verifyPersonalPinLocal(pin);
-        }
-      }
       if (verified) {
         resultBody = currentlyLocked ? "ALLOW_UNLOCK" : "ALLOW_RELOCK";
       } else {
+        personalPinRuntimeRefreshQueued = true;
+        personalPinRuntimeRefreshForce = true;
         resultBody = "DENY:mismatch";
       }
     }
@@ -5726,7 +5703,7 @@ void handleCameraClient() {
         captureSuppressedTamper(millis());
       } else {
         Serial.println("[AP] TAMPER event received — writing to Firebase");
-        writeTamperToFirebase();
+        queueTamperFirebaseWrite();
       }
     } else {
       String jsonStr = String(jsonBuf);
@@ -5757,9 +5734,9 @@ void handleCameraClient() {
       }
       
       // Also write alert events to the lock_events stream so it appears in web UI
-      writeLockEventToFirebase(ov, fd, ul, faceAttempts, faceRetryExhausted,
-                               fallbackRequired, failureReason,
-                               (unsigned long)(unlockLatencyMs > 0 ? unlockLatencyMs : 0));
+      queueLockEventFirebaseWrite(ov, fd, ul, faceAttempts, faceRetryExhausted,
+                                  fallbackRequired, failureReason,
+                                  (unsigned long)(unlockLatencyMs > 0 ? unlockLatencyMs : 0));
     }
     
     return;
@@ -6784,7 +6761,6 @@ void setup() {
   // Initialize modem with proper power sequence
   modemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
   beginProxyUart();
-  beginProxyBle();
   powerModem();
 
   modemOK = initModem();
@@ -6817,7 +6793,6 @@ void setup() {
   // ── Start WiFi hotspot so ESP32-CAM can connect and relay images ──
   // (after provisioning so AP_SSID has the correct box number)
   if (apStarted) {
-    camServer.begin();
     Serial.printf("[WIFI] Camera/controller proxy server listening on port %d\n",
                   CAM_SERVER_PORT);
     startLogServer();
@@ -6944,7 +6919,6 @@ void loop() {
   pollWifiCloudHealth(now);
   pollDiscoveryServer();
   pollProxyUart();
-  updateProxyBleStatus();
   enforceTamperSuppressionTimeout(now);
   maybeEvaluateConnectivityMatrix(now);
 
@@ -7118,6 +7092,47 @@ void loop() {
     lastDeliveryContextRead = 0;
     Serial.println("[CONTEXT] Running queued controller refresh");
   }
+
+  if ((wifiCloudHealthy || lteConnected) && tamperFirebaseWriteQueued && !modemHttpBusy) {
+    tamperFirebaseWriteQueued = false;
+    Serial.println("[TAMPER] Running queued Firebase write");
+    writeTamperToFirebase();
+  }
+
+  if ((wifiCloudHealthy || lteConnected) && lockEventFirebaseWriteQueued && !modemHttpBusy) {
+    bool ov = queuedLockOtpValid;
+    bool fd = queuedLockFaceDetected;
+    bool ul = queuedLockUnlocked;
+    int attempts = queuedLockFaceAttempts;
+    bool retryExhausted = queuedLockFaceRetryExhausted;
+    bool fallbackRequired = queuedLockFallbackRequired;
+    char reason[sizeof(queuedLockFailureReason)];
+    strncpy(reason, queuedLockFailureReason, sizeof(reason) - 1);
+    reason[sizeof(reason) - 1] = '\0';
+    unsigned long latencyMs = queuedLockUnlockLatencyMs;
+    lockEventFirebaseWriteQueued = false;
+    Serial.println("[EVENT] Running queued lock_events write");
+    writeLockEventToFirebase(ov, fd, ul, attempts, retryExhausted,
+                             fallbackRequired, reason, latencyMs);
+  }
+
+  if ((wifiCloudHealthy || lteConnected) && personalPinRuntimeRefreshQueued &&
+      !modemHttpBusy && now - lastPinRuntimeRefreshAt >= PIN_RUNTIME_REFRESH_MIN_MS) {
+    bool force = personalPinRuntimeRefreshForce;
+    personalPinRuntimeRefreshQueued = false;
+    personalPinRuntimeRefreshForce = false;
+    lastPinRuntimeRefreshAt = now;
+    Serial.println("[PIN] Running queued runtime refresh");
+    bool ok = lteConnected
+                  ? syncPersonalPinRuntimeWithActivePairing(true, force)
+                  : refreshPersonalPinRuntimeFromFirebase(true, force);
+    if (!ok) {
+      personalPinRuntimeRefreshQueued = true;
+      personalPinRuntimeRefreshForce = force;
+      Serial.println("[PIN] Queued runtime refresh failed; will retry");
+    }
+  }
+
   if ((wifiCloudHealthy || lteConnected) && now - lastDeliveryContextRead >= deliveryReadInterval) {
     refreshDeliveryContextFromFirebase();
     lastDeliveryContextRead = now;

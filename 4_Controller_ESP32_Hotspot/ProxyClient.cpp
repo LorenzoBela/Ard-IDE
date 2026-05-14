@@ -10,7 +10,6 @@
 #include "ProxyClient.h"
 #include <esp_wifi.h>
 #include <HTTPClient.h>
-#include <NimBLEDevice.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
@@ -25,12 +24,6 @@ static WiFiUDP udpClient;
 static HardwareSerial proxySerial(1);
 static bool proxyUartStarted = false;
 static uint16_t proxyRequestId = 1;
-static bool bleStarted = false;
-static NimBLEClient *bleClient = nullptr;
-static NimBLERemoteCharacteristic *bleReqChar = nullptr;
-static NimBLERemoteCharacteristic *bleRespChar = nullptr;
-static NimBLERemoteCharacteristic *bleIpChar = nullptr;
-static unsigned long bleLastAttemptAt = 0;
 
 // ── Delivery context ──
 char  currentOtp[8]          = "";
@@ -53,6 +46,14 @@ static uint8_t wifiReconnectAttempts = 0;
 static uint8_t proxyBssid[6] = {0};
 static bool proxyBssidKnown = false;
 static int32_t proxyChannel = 0;
+
+static void clearDiscoveredProxy(const char *reason) {
+  if (PROXY_HOST[0] != '\0') {
+    Serial.printf("[DISCOVERY] Clearing proxy %s (%s)\n",
+                  PROXY_HOST, reason ? reason : "unknown");
+  }
+  PROXY_HOST[0] = '\0';
+}
 
 static uint8_t checksum8(const char *text) {
   uint8_t sum = 0;
@@ -135,184 +136,59 @@ static bool proxyUartRequest(const char *method, const char *path,
   return false;
 }
 
-static void startBleClient() {
-  if (bleStarted) return;
-  NimBLEDevice::init(BLE_DEVICE_NAME);
-  NimBLEDevice::setPower(ESP_PWR_LVL_P3);
-  NimBLEDevice::setMTU(517);
-  bleStarted = true;
-#if CONTROLLER_VERBOSE_LOGS
-  Serial.println(F("[BLE] Client ready"));
-#endif
-}
-
-static bool connectBleProxy() {
-  startBleClient();
-  if (bleClient && bleClient->isConnected() && bleReqChar && bleRespChar) {
-    return true;
-  }
-
-  unsigned long now = millis();
-  if (now - bleLastAttemptAt < 3000) return false;
-  bleLastAttemptAt = now;
-
-  bleReqChar = nullptr;
-  bleRespChar = nullptr;
-  bleIpChar = nullptr;
-
-  NimBLEScan *scan = NimBLEDevice::getScan();
-  scan->setActiveScan(true);
-  NimBLEScanResults results = scan->getResults(BLE_SCAN_TIME_MS, false);
-
-  NimBLEAddress target;
-  bool found = false;
-  NimBLEUUID serviceUuid(BLE_SERVICE_UUID);
-  for (int i = 0; i < results.getCount(); i++) {
-    const NimBLEAdvertisedDevice *dev = results.getDevice(i);
-    bool serviceMatch = dev->isAdvertisingService(serviceUuid);
-    bool nameMatch = dev->haveName() &&
-                     dev->getName().rfind(BLE_PROXY_NAME_PREFIX, 0) == 0;
-    if (serviceMatch || nameMatch) {
-      target = dev->getAddress();
-      found = true;
-      break;
-    }
-  }
-  scan->clearResults();
-  if (!found) {
-#if CONTROLLER_VERBOSE_LOGS
-    Serial.println(F("[BLE] Proxy not found"));
-#endif
-    return false;
-  }
-
-  if (!bleClient) {
-    bleClient = NimBLEDevice::createClient();
-    bleClient->setConnectTimeout(3 * 1000);
-    bleClient->setConnectionParams(24, 48, 0, 180);
-  } else if (bleClient->isConnected()) {
-    bleClient->disconnect();
-  }
-
-  if (!bleClient->connect(target)) {
-#if CONTROLLER_VERBOSE_LOGS
-    Serial.println(F("[BLE] Proxy connect failed"));
-#endif
-    return false;
-  }
-
-  NimBLERemoteService *svc = bleClient->getService(BLE_SERVICE_UUID);
-  if (!svc) {
-    bleClient->disconnect();
-    return false;
-  }
-  bleReqChar = svc->getCharacteristic(BLE_REQ_UUID);
-  bleRespChar = svc->getCharacteristic(BLE_RESP_UUID);
-  bleIpChar = svc->getCharacteristic(BLE_PROXY_IP_UUID);
-  if (!bleReqChar || !bleRespChar) {
-    bleClient->disconnect();
-    bleReqChar = nullptr;
-    bleRespChar = nullptr;
-    return false;
-  }
-
-  if (bleIpChar && PROXY_HOST[0] == '\0') {
-    std::string ip = bleIpChar->readValue();
-    if (!ip.empty() && ip.length() < sizeof(PROXY_HOST)) {
-      strncpy(PROXY_HOST, ip.c_str(), sizeof(PROXY_HOST) - 1);
-      PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
-#if CONTROLLER_VERBOSE_LOGS
-      Serial.printf("[BLE] Proxy IP %s\n", PROXY_HOST);
-#endif
-    }
-  }
-
-#if CONTROLLER_VERBOSE_LOGS
-  Serial.println(F("[BLE] Proxy connected"));
-#endif
-  return true;
-}
-
-static bool proxyBleRequest(const char *method, const char *path,
-                            const char *payload, String &bodyOut,
-                            unsigned long timeoutMs = BLE_REQUEST_TIMEOUT_MS) {
-  if (!connectBleProxy()) return false;
-
-  uint16_t id = proxyRequestId++;
-  if (proxyRequestId == 0) proxyRequestId = 1;
-
-  char frame[760];
-  snprintf(frame, sizeof(frame), "REQ|%u|%s|%s|%s",
-           (unsigned int)id, method ? method : "GET", path ? path : "/",
-           payload ? payload : "");
-  uint8_t sum = checksum8(frame);
-  char framed[780];
-  snprintf(framed, sizeof(framed), "%s|%02X", frame, sum);
-
-  if (!bleReqChar->writeValue((uint8_t *)framed, strlen(framed), true)) {
-#if CONTROLLER_VERBOSE_LOGS
-    Serial.println(F("[BLE] Request write failed"));
-#endif
-    if (bleClient) bleClient->disconnect();
-    return false;
-  }
-
-  unsigned long deadline = millis() + timeoutMs;
-  while (millis() < deadline) {
-    std::string raw = bleRespChar->readValue();
-    if (!raw.empty()) {
-      String resp(raw.c_str());
-      if (resp.startsWith("RESP|")) {
-        int p1 = resp.indexOf('|', 5);
-        int p2 = (p1 >= 0) ? resp.indexOf('|', p1 + 1) : -1;
-        int p3 = (p2 >= 0) ? resp.lastIndexOf('|') : -1;
-        if (p1 >= 0 && p2 >= 0 && p3 > p2) {
-          uint16_t respId = (uint16_t)resp.substring(5, p1).toInt();
-          String withoutCrc = resp.substring(0, p3);
-          uint8_t expected = (uint8_t)strtoul(resp.substring(p3 + 1).c_str(), NULL, 16);
-          if (respId == id && checksum8(withoutCrc.c_str()) == expected) {
-            int status = resp.substring(p1 + 1, p2).toInt();
-            bodyOut = resp.substring(p2 + 1, p3);
-            return status >= 200 && status < 300;
-          }
-        }
-      }
-    }
-    delay(40);
-    yield();
-  }
-#if CONTROLLER_VERBOSE_LOGS
-  Serial.println(F("[BLE] Request timeout"));
-#endif
-  return false;
-}
-
 static bool discoverProxyUdp(unsigned long timeoutMs = 1200) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
   WiFiUDP discovery;
-  if (!discovery.begin(0)) return false;
+  // Use a fixed receive port. Some phone hotspots pass broadcast discovery
+  // but drop replies to random high UDP source ports.
+  if (!discovery.begin(PROXY_DISCOVERY_PORT)) {
+    Serial.printf("[DISCOVERY] UDP begin(%d) failed\n", PROXY_DISCOVERY_PORT);
+    return false;
+  }
 
   IPAddress broadcast((uint32_t)WiFi.localIP() | ~(uint32_t)WiFi.subnetMask());
-  discovery.beginPacket(broadcast, PROXY_DISCOVERY_PORT);
-  discovery.print(PROXY_DISCOVERY_QUERY);
-  discovery.endPacket();
 
   unsigned long deadline = millis() + timeoutMs;
   char packet[96];
+  unsigned long nextQueryAt = 0;
   while (millis() < deadline) {
+    unsigned long now = millis();
+    if (now >= nextQueryAt) {
+      discovery.beginPacket(broadcast, PROXY_DISCOVERY_PORT);
+      discovery.print(PROXY_DISCOVERY_QUERY);
+      discovery.endPacket();
+      nextQueryAt = now + 250;
+    }
+
     int size = discovery.parsePacket();
     if (size > 0) {
       int len = discovery.read(packet, sizeof(packet) - 1);
+      if (len < 0) len = 0;
       packet[len] = '\0';
       if (strncmp(packet, PROXY_DISCOVERY_REPLY,
                   strlen(PROXY_DISCOVERY_REPLY)) == 0) {
-        IPAddress ip = discovery.remoteIP();
-        strncpy(PROXY_HOST, ip.toString().c_str(), sizeof(PROXY_HOST) - 1);
+        const char *payload = packet + strlen(PROXY_DISCOVERY_REPLY);
+        char replyIp[16] = "";
+        int replyPort = PROXY_PORT;
+        char replyHardware[12] = "";
+
+        int parsed = sscanf(payload, "%15[^:]:%d:%11s",
+                            replyIp, &replyPort, replyHardware);
+        IPAddress ip;
+        if (parsed >= 1 && ip.fromString(replyIp)) {
+          strncpy(PROXY_HOST, replyIp, sizeof(PROXY_HOST) - 1);
+        } else {
+          ip = discovery.remoteIP();
+          strncpy(PROXY_HOST, ip.toString().c_str(), sizeof(PROXY_HOST) - 1);
+        }
         PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
-#if CONTROLLER_VERBOSE_LOGS
-        Serial.printf("[DISCOVERY] Proxy at %s (%s)\n", PROXY_HOST, packet);
-#endif
+        if (parsed >= 3 && replyHardware[0] != '\0') {
+          strncpy(HARDWARE_ID, replyHardware, sizeof(HARDWARE_ID) - 1);
+          HARDWARE_ID[sizeof(HARDWARE_ID) - 1] = '\0';
+        }
+        Serial.printf("[DISCOVERY] Proxy at %s:%d (%s)\n",
+                      PROXY_HOST, replyPort, packet);
         discovery.stop();
         return true;
       }
@@ -320,6 +196,7 @@ static bool discoverProxyUdp(unsigned long timeoutMs = 1200) {
     delay(20);
   }
   discovery.stop();
+  Serial.println(F("[DISCOVERY] Proxy discovery timed out"));
   return false;
 }
 
@@ -428,7 +305,7 @@ void netLog(const char *format, ...) {
 
   Serial.print(buf);
 
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED && PROXY_HOST[0] != '\0') {
     udpClient.beginPacket(PROXY_HOST, UDP_LOG_PORT);
     udpClient.print("[ESP32] ");
     udpClient.print(buf);
@@ -584,6 +461,7 @@ void maintainWiFiConnection(unsigned long now) {
 
   netLog("[WIFI] Retry (backoff %lums)...\n", wifiBackoffMs);
   closePersistentConnection(); // Kill stale TCP before WiFi reset
+  clearDiscoveredProxy("wifi_retry");
   if (wifiReconnectAttempts >= 3) {
     WiFi.disconnect();
   }
@@ -630,10 +508,97 @@ static bool ensurePersistentConnection() {
   persistentClient.setTimeout(FETCH_HTTP_TIMEOUT_MS / 1000); // seconds
   if (!persistentClient.connect(PROXY_HOST, PROXY_PORT)) {
     netLog("[FETCH] TCP connect failed\n");
+    clearDiscoveredProxy("tcp_connect_failed");
     return false;
   }
   persistentConnected = true;
   return true;
+}
+
+static int httpGetOnce(const char *path, String &bodyOut,
+                       unsigned long timeoutMs = FETCH_HTTP_TIMEOUT_MS) {
+  bodyOut = "";
+  if (WiFi.status() != WL_CONNECTED) return -1;
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) return -1;
+
+  WiFiClient client;
+  client.setTimeout(timeoutMs / 1000);
+  Serial.printf("[HTTP] GET http://%s:%d%s\n", PROXY_HOST, PROXY_PORT, path);
+  Serial.flush();
+  if (!client.connect(PROXY_HOST, PROXY_PORT)) {
+    Serial.println(F("[HTTP] TCP connect failed"));
+    Serial.flush();
+    clearDiscoveredProxy("http_connect_failed");
+    return -1;
+  }
+
+  client.printf(
+      "GET %s HTTP/1.1\r\n"
+      "Host: %s:%d\r\n"
+      "Connection: close\r\n"
+      "\r\n",
+      path, PROXY_HOST, PROXY_PORT);
+
+  unsigned long deadline = millis() + timeoutMs;
+  int statusCode = -1;
+  int contentLength = -1;
+  bool headersDone = false;
+
+  while (millis() < deadline) {
+    if (!client.connected() && !client.available()) break;
+    if (!client.available()) {
+      yield();
+      continue;
+    }
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (statusCode < 0) {
+      if (line.startsWith("HTTP/")) {
+        int spaceIdx = line.indexOf(' ');
+        if (spaceIdx > 0) statusCode = line.substring(spaceIdx + 1).toInt();
+      }
+      continue;
+    }
+    if (line.length() == 0) {
+      headersDone = true;
+      break;
+    }
+    if (line.startsWith("Content-Length:") || line.startsWith("content-length:")) {
+      contentLength = line.substring(line.indexOf(':') + 1).toInt();
+    }
+  }
+
+  if (!headersDone || statusCode < 0) {
+    client.stop();
+    Serial.println(F("[HTTP] No complete response headers"));
+    Serial.flush();
+    return -1;
+  }
+
+  if (contentLength >= 0) {
+    while ((int)bodyOut.length() < contentLength && millis() < deadline) {
+      if (client.available()) {
+        bodyOut += (char)client.read();
+      } else {
+        yield();
+      }
+    }
+  } else {
+    while (millis() < deadline && (client.connected() || client.available())) {
+      if (client.available()) {
+        bodyOut += (char)client.read();
+      } else if (bodyOut.length() > 0) {
+        break;
+      } else {
+        yield();
+      }
+    }
+  }
+  client.stop();
+  bodyOut.trim();
+  Serial.printf("[HTTP] status=%d body='%s'\n", statusCode, bodyOut.c_str());
+  Serial.flush();
+  return statusCode;
 }
 
 /** Read one complete HTTP response from the persistent socket.
@@ -828,34 +793,35 @@ static void parseOtpBody(const String &body) {
   }
 }
 
-void fetchDeliveryContext() {
+bool fetchDeliveryContext() {
   String uartBody;
-  if (proxyUartRequest("GET", "/otp", "", uartBody, REFRESH_HTTP_TIMEOUT_MS)) {
-    netLog("[FETCH] UART OK\n");
-    parseOtpBody(uartBody);
-    return;
-  }
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (proxyBleRequest("GET", "/otp", "", uartBody, REFRESH_HTTP_TIMEOUT_MS)) {
-      netLog("[FETCH] BLE OK\n");
+    if (proxyUartRequest("GET", "/otp", "", uartBody, PROXY_UART_TIMEOUT_MS)) {
+      netLog("[FETCH] UART OK\n");
       parseOtpBody(uartBody);
-      return;
+      return true;
     }
     netLog("[FETCH] Skip — WiFi not connected\n");
     closePersistentConnection();
-    return;
+    return false;
+  }
+
+  String httpBody;
+  int httpCode = httpGetOnce("/otp", httpBody, REFRESH_HTTP_TIMEOUT_MS);
+  if (httpCode == 200) {
+    parseOtpBody(httpBody);
+    return true;
+  }
+  if (httpCode > 0) {
+    noteFetchFailure("http_non_200");
+    return false;
   }
 
   // Ensure persistent TCP socket is alive.
   if (!ensurePersistentConnection()) {
-    if (proxyBleRequest("GET", "/otp", "", uartBody, REFRESH_HTTP_TIMEOUT_MS)) {
-      netLog("[FETCH] BLE OK\n");
-      parseOtpBody(uartBody);
-      return;
-    }
     noteFetchFailure("tcp_connect");
-    return;
+    return false;
   }
 
   // Send raw HTTP/1.1 GET with keep-alive.
@@ -875,7 +841,7 @@ void fetchDeliveryContext() {
     // One retry with fresh connection
     if (!ensurePersistentConnection()) {
       noteFetchFailure("tcp_retry");
-      return;
+      return false;
     }
     persistentClient.printf(
         "GET /otp HTTP/1.1\r\n"
@@ -888,35 +854,32 @@ void fetchDeliveryContext() {
     if (code < 0) {
       noteFetchFailure("http_retry");
       closePersistentConnection();
-      return;
+      return false;
     }
   }
 
   netLog("[FETCH] HTTP %d\n", code);
   if (code != 200) {
     noteFetchFailure("http_non_200");
-    return;
+    if (proxyUartRequest("GET", "/otp", "", uartBody, PROXY_UART_TIMEOUT_MS)) {
+      netLog("[FETCH] UART OK\n");
+      parseOtpBody(uartBody);
+      return true;
+    }
+    return false;
   }
 
   parseOtpBody(body);
-
-  // Drive state transitions based on delivery availability
-  // (State machine transitions are handled in the main .ino — this function
-  //  only updates the shared globals.)
+  return true;
 }
 
 bool requestContextRefresh() {
   String uartBody;
-  if (proxyUartRequest("GET", "/refresh-context", "", uartBody, FETCH_HTTP_TIMEOUT_MS)) {
-    uartBody.trim();
-    netLog("[REFRESH] UART body='%s'\n", uartBody.c_str());
-    return uartBody.startsWith("OK");
-  }
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (proxyBleRequest("GET", "/refresh-context", "", uartBody, FETCH_HTTP_TIMEOUT_MS)) {
+    if (proxyUartRequest("GET", "/refresh-context", "", uartBody, PROXY_UART_TIMEOUT_MS)) {
       uartBody.trim();
-      netLog("[REFRESH] BLE body='%s'\n", uartBody.c_str());
+      netLog("[REFRESH] UART body='%s'\n", uartBody.c_str());
       return uartBody.startsWith("OK");
     }
     netLog("[REFRESH] Skip — WiFi not connected\n");
@@ -967,13 +930,9 @@ bool requestContextRefresh() {
 
 bool requestProxyPing() {
   String uartBody;
-  if (proxyUartRequest("GET", "/ping", "", uartBody, 600)) {
-    uartBody.trim();
-    return uartBody.startsWith("OK");
-  }
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (proxyBleRequest("GET", "/ping", "", uartBody, 900)) {
+    if (proxyUartRequest("GET", "/ping", "", uartBody, 600)) {
       uartBody.trim();
       return uartBody.startsWith("OK");
     }
@@ -1005,44 +964,12 @@ bool requestProxyPing() {
 
 bool fetchDiagnostics(ControllerDiagData &out) {
   String uartDiagBody;
-  if (proxyUartRequest("GET", "/diag", "", uartDiagBody, CONTROLLER_DIAG_HTTP_TIMEOUT_MS + 800)) {
-    String field;
-    ControllerDiagData parsed = out;
-    bool parsedAny = false;
-
-    if (parseDiagField(uartDiagBody, "batt_pct", field)) { parsed.battPct = field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "batt_v", field)) { parsed.battVoltage = field.toFloat(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "rssi", field)) { parsed.rssi = field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "csq", field)) { parsed.csq = field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "gps_fix", field)) { parsed.gpsFix = (field.toInt() != 0); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "lte", field)) { parsed.lteConnected = (field.toInt() != 0); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "modem", field)) { parsed.modemOk = (field.toInt() != 0); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "time", field)) { parsed.timeSynced = (field.toInt() != 0); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "cam_up", field)) { parsed.camUp = (field.toInt() != 0); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "ctrl_up", field)) { parsed.controllerUp = (field.toInt() != 0); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "fb_fail", field)) { parsed.firebaseFailures = field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "cmd_stage", field)) { parsed.commandStage = field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "cmd_pending", field)) { parsed.commandPending = (field.toInt() != 0); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "conn_state", field)) { parsed.connectivityState = field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "lte_reconn_ms", field)) { parsed.lteReconnectMs = (unsigned long)field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "upload_active", field)) { parsed.photoUploadActive = (field.toInt() != 0); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "upload_pct", field)) { parsed.photoUploadProgress = field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "upload_age", field)) { parsed.photoUploadAgeMs = (unsigned long)field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "cam_age", field)) { parsed.camAgeMs = (unsigned long)field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "ctrl_age", field)) { parsed.controllerAgeMs = (unsigned long)field.toInt(); parsedAny = true; }
-    if (parseDiagField(uartDiagBody, "uptime", field)) { parsed.proxyUptimeMs = (unsigned long)field.toInt(); parsedAny = true; }
-    if (parsedAny) {
-      out = parsed;
-      return true;
-    }
-  }
-
   if (WiFi.status() != WL_CONNECTED) {
-    if (proxyBleRequest("GET", "/diag", "", uartDiagBody,
-                        CONTROLLER_DIAG_HTTP_TIMEOUT_MS + 1200)) {
+    if (proxyUartRequest("GET", "/diag", "", uartDiagBody, CONTROLLER_DIAG_HTTP_TIMEOUT_MS + 800)) {
       String field;
       ControllerDiagData parsed = out;
       bool parsedAny = false;
+
       if (parseDiagField(uartDiagBody, "batt_pct", field)) { parsed.battPct = field.toInt(); parsedAny = true; }
       if (parseDiagField(uartDiagBody, "batt_v", field)) { parsed.battVoltage = field.toFloat(); parsedAny = true; }
       if (parseDiagField(uartDiagBody, "rssi", field)) { parsed.rssi = field.toInt(); parsedAny = true; }
@@ -1204,12 +1131,9 @@ bool fetchDiagnostics(ControllerDiagData &out) {
 // unlock flow, avoiding ~150ms TCP handshake per call.
 static int sendRawPost(const char *path, const char *json) {
   String uartBody;
-  if (proxyUartRequest("POST", path, json, uartBody, FETCH_HTTP_TIMEOUT_MS)) {
-    return 200;
-  }
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (proxyBleRequest("POST", path, json, uartBody, FETCH_HTTP_TIMEOUT_MS)) {
+    if (proxyUartRequest("POST", path, json, uartBody, PROXY_UART_TIMEOUT_MS)) {
       return 200;
     }
     return -1;
@@ -1338,15 +1262,10 @@ bool reportCommandAckToProxy(const char *command, const char *status, const char
 
 bool requestCameraPowerMode(bool wakeMode) {
   String uartBody;
-  if (proxyUartRequest("GET", wakeMode ? "/cam-power?mode=wake" : "/cam-power?mode=sleep",
-                       "", uartBody, 3000)) {
-    uartBody.trim();
-    return uartBody.indexOf("CAM_") >= 0 || uartBody.indexOf("OK") >= 0;
-  }
 
   if (WiFi.status() != WL_CONNECTED) {
-    if (proxyBleRequest("GET", wakeMode ? "/cam-power?mode=wake" : "/cam-power?mode=sleep",
-                        "", uartBody, 3000)) {
+    if (proxyUartRequest("GET", wakeMode ? "/cam-power?mode=wake" : "/cam-power?mode=sleep",
+                         "", uartBody, PROXY_UART_TIMEOUT_MS)) {
       uartBody.trim();
       return uartBody.indexOf("CAM_") >= 0 || uartBody.indexOf("OK") >= 0;
     }
@@ -1390,22 +1309,10 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
            pin, HARDWARE_ID, activeDeliveryId, currentlyLocked ? "true" : "false");
 
   String uartBody;
-  if (proxyUartRequest("POST", "/personal-pin-verify", json, uartBody, 5000)) {
-    uartBody.trim();
-    if (uartBody.indexOf("ALLOW_UNLOCK") >= 0) return 1;
-    if (uartBody.indexOf("ALLOW_RELOCK") >= 0) return 2;
-    if (uartBody.indexOf("DENY:disabled") >= 0 ||
-        uartBody.indexOf("DENY:missing_pin") >= 0 ||
-        uartBody.indexOf("DENY:invalid") >= 0 ||
-        uartBody.indexOf("DENY:sync_failed") >= 0 ||
-        uartBody.indexOf("DENY:box_mismatch") >= 0) {
-      return -1;
-    }
-    return 0;
-  }
 
   if (WiFi.status() != WL_CONNECTED || !pin || pin[0] == '\0') {
-    if (proxyBleRequest("POST", "/personal-pin-verify", json, uartBody, 5000)) {
+    if (pin && pin[0] != '\0' &&
+        proxyUartRequest("POST", "/personal-pin-verify", json, uartBody, PROXY_UART_TIMEOUT_MS)) {
       uartBody.trim();
       if (uartBody.indexOf("ALLOW_UNLOCK") >= 0) return 1;
       if (uartBody.indexOf("ALLOW_RELOCK") >= 0) return 2;
@@ -1470,12 +1377,6 @@ int requestFaceCheck() {
   }
 
   String uartBody;
-  if (proxyUartRequest("GET", facePath, "", uartBody, FACE_CHECK_WIFI_TIMEOUT_MS)) {
-    uartBody.trim();
-    if (uartBody.indexOf("FACE_OK") >= 0) return 1;
-    if (uartBody.indexOf("NO_FACE_LOW_LIGHT") >= 0) return 2;
-    if (uartBody.indexOf("NO_FACE") >= 0) return 0;
-  }
 
   // ── Secondary: WiFi via proxy ──
   if (WiFi.status() == WL_CONNECTED) {
@@ -1520,17 +1421,17 @@ int requestFaceCheck() {
     }
     }
   }
-  if (proxyBleRequest("GET", facePath, "", uartBody, FACE_CHECK_WIFI_TIMEOUT_MS)) {
+  // ── Fallback: UART Serial2 to ESP32-CAM directly ──
+#if CONTROLLER_VERBOSE_LOGS
+      Serial.println(F("[FACE] WiFi down — trying UART fallback..."));
+#endif
+
+  if (proxyUartRequest("GET", facePath, "", uartBody, PROXY_UART_TIMEOUT_MS)) {
     uartBody.trim();
     if (uartBody.indexOf("FACE_OK") >= 0) return 1;
     if (uartBody.indexOf("NO_FACE_LOW_LIGHT") >= 0) return 2;
     if (uartBody.indexOf("NO_FACE") >= 0) return 0;
   }
-
-  // ── Fallback: UART Serial2 to ESP32-CAM directly ──
-#if CONTROLLER_VERBOSE_LOGS
-  Serial.println(F("[FACE] WiFi down — trying UART fallback..."));
-#endif
 
   // Flush stale data
   while (Serial2.available()) Serial2.read();

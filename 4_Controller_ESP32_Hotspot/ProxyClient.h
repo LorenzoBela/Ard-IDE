@@ -76,8 +76,9 @@ void startWiFiConnection();
 
 /** Fetch OTP + delivery_id + optional status from proxy GET /otp.
  *  Updates currentOtp, activeDeliveryId, hasActiveDelivery, lastStatusCommand,
- *  and phase/geofence fields. */
-void fetchDeliveryContext();
+ *  and phase/geofence fields. Returns false if neither UART nor WiFi proxy
+ *  responded. */
+bool fetchDeliveryContext();
 
 /** Force proxy to refresh delivery context from Firebase (GET /refresh-context). */
 bool requestContextRefresh();
