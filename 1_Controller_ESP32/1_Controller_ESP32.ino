@@ -1654,14 +1654,26 @@ void handleStateMachine(unsigned long now) {
         messageStartAt = now;
         currentState = STATE_SHOW_MESSAGE;
       } else if (decision == -2) {
-        // HTTP/network error — proxy unreachable or errored.
+        // HTTP/network error â€” proxy unreachable or errored.
         if (!isDisplayFailed()) {
           updateDisplay("Network error", "Retry in moment");
         }
         messageStartAt = now;
         currentState = STATE_SHOW_MESSAGE;
+      } else if (decision == -3) {
+        if (!isDisplayFailed()) {
+          updateDisplay("PIN disabled", "Enable in app");
+        }
+        messageStartAt = now;
+        currentState = STATE_SHOW_MESSAGE;
+      } else if (decision == -4) {
+        if (!isDisplayFailed()) {
+          updateDisplay("Proxy syncing...", "Please wait");
+        }
+        messageStartAt = now;
+        currentState = STATE_SHOW_MESSAGE;
       } else if (decision < 0) {
-        // DENY response: disabled, missing_pin, sync_failed, etc.
+        // DENY response: missing_pin, invalid, box_mismatch, etc.
         if (!isDisplayFailed()) {
           updateDisplay("PIN rejected", "Hold 9 re-sync");
         }
@@ -2040,14 +2052,26 @@ void handleStateMachine(unsigned long now) {
             currentState = STATE_SHOW_MESSAGE;
           }
         } else if (decision == -2) {
-          // HTTP/network error — proxy unreachable or errored.
+          // HTTP/network error â€” proxy unreachable or errored.
           if (!isDisplayFailed()) {
             updateDisplay("Network error", "Retry in moment");
           }
           messageStartAt = now;
           currentState = STATE_SHOW_MESSAGE;
+        } else if (decision == -3) {
+          if (!isDisplayFailed()) {
+            updateDisplay("PIN disabled", "Enable in app");
+          }
+          messageStartAt = now;
+          currentState = STATE_SHOW_MESSAGE;
+        } else if (decision == -4) {
+          if (!isDisplayFailed()) {
+            updateDisplay("Proxy syncing...", "Please wait");
+          }
+          messageStartAt = now;
+          currentState = STATE_SHOW_MESSAGE;
         } else if (decision < 0) {
-          // DENY: disabled, missing_pin, sync_failed, etc.
+          // DENY: missing_pin, invalid, box_mismatch, etc.
           if (!isDisplayFailed()) {
             updateDisplay("PIN rejected", "Hold 9 re-sync");
           }

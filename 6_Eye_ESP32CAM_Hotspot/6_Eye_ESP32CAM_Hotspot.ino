@@ -99,6 +99,7 @@ char DEVICE_ID[24] = "OV3660_CAM_001";
 #define UPLOAD_STALE_FLUSH_FRAMES 3
 #define FACE_DETECT_WINDOW_MS 6000  // Repeated detect window per request
 #define FACE_DETECT_RETRY_GAP_MS 30 // Gap between detect attempts
+#define BROWSER_STREAM_MAX_MS 20000 // Diagnostic stream window; face-check uses the same server
 #define WIFI_BOOT_CONNECT_TIMEOUT_MS 120000
 #define WIFI_RECONNECT_TIMEOUT_MS 20000
 #define WIFI_MAINTAIN_INTERVAL_MS 8000
@@ -191,6 +192,21 @@ WiFiServer faceServer(80);
 // ===================== UDP LOGGING =====================
 WiFiUDP udpClient;
 #define UDP_LOG_PORT 5114
+
+void printBrowserUrls() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[HTTP] Browser URLs unavailable: WiFi not connected"));
+    return;
+  }
+
+  String baseUrl = String("http://") + WiFi.localIP().toString();
+  Serial.println(F("[HTTP] Browser live view URLs:"));
+  Serial.printf("       Live page : %s/\n", baseUrl.c_str());
+  Serial.printf("       Stream    : %s/stream\n", baseUrl.c_str());
+  Serial.printf("       Snapshot  : %s/snapshot\n", baseUrl.c_str());
+  Serial.printf("       Face test : %s/face-test\n", baseUrl.c_str());
+  Serial.printf("       Status    : %s/status\n", baseUrl.c_str());
+}
 
 void netLog(const char *format, ...) {
   char buf[256];
@@ -432,8 +448,7 @@ void printCommands() {
 }
 
 bool hasUnsetConfig() {
-  return strlen(WIFI_PASSWORD) == 0 ||
-         strlen(SUPABASE_URL) == 0 || strlen(SUPABASE_API_KEY) == 0;
+  return strlen(SUPABASE_URL) == 0 || strlen(SUPABASE_API_KEY) == 0 || HOTSPOT_COUNT == 0;
 }
 
 const char *getSupabaseBearerToken() {
@@ -536,29 +551,55 @@ void logTargetApVisibility() {
 bool discoverProxyUdp(unsigned long timeoutMs = 1500) {
   if (WiFi.status() != WL_CONNECTED) return false;
   WiFiUDP discovery;
-  if (!discovery.begin(0)) return false;
+  if (!discovery.begin(0)) {
+    Serial.println(F("[DISCOVERY] UDP begin failed"));
+    return false;
+  }
   IPAddress broadcast((uint32_t)WiFi.localIP() | ~(uint32_t)WiFi.subnetMask());
-  discovery.beginPacket(broadcast, PROXY_DISCOVERY_PORT);
-  discovery.print(PROXY_DISCOVERY_QUERY);
-  discovery.endPacket();
 
   unsigned long deadline = millis() + timeoutMs;
   char packet[96];
+  unsigned long nextQueryAt = 0;
+  
   while (millis() < deadline) {
+    unsigned long now = millis();
+    if (now >= nextQueryAt) {
+      discovery.beginPacket(broadcast, PROXY_DISCOVERY_PORT);
+      discovery.print(PROXY_DISCOVERY_QUERY);
+      discovery.endPacket();
+      nextQueryAt = now + 250; // Resend every 250ms
+    }
+
     int size = discovery.parsePacket();
     if (size > 0) {
       int len = discovery.read(packet, sizeof(packet) - 1);
       packet[len] = '\0';
       if (strncmp(packet, PROXY_DISCOVERY_REPLY,
                   strlen(PROXY_DISCOVERY_REPLY)) == 0) {
-        IPAddress ip = discovery.remoteIP();
-        strncpy(PROXY_HOST, ip.toString().c_str(), sizeof(PROXY_HOST) - 1);
+        
+        String payload = String(packet + strlen(PROXY_DISCOVERY_REPLY));
+        int firstColon = payload.indexOf(':');
+        int secondColon = firstColon >= 0 ? payload.indexOf(':', firstColon + 1) : -1;
+        String replyIp = firstColon >= 0 ? payload.substring(0, firstColon) : "";
+        int replyPort = secondColon > firstColon
+            ? payload.substring(firstColon + 1, secondColon).toInt()
+            : PROXY_PORT;
+
+        IPAddress ip;
+        if (replyIp.length() == 0 || !ip.fromString(replyIp)) {
+          ip = discovery.remoteIP();
+          replyIp = ip.toString();
+        }
+
+        strncpy(PROXY_HOST, replyIp.c_str(), sizeof(PROXY_HOST) - 1);
         PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
-        Serial.printf("[DISCOVERY] Proxy at %s (%s)\n", PROXY_HOST, packet);
+        Serial.printf("[DISCOVERY] Proxy at %s:%d (%s)\n", PROXY_HOST, replyPort, packet);
+
         discovery.beginPacket(ip, PROXY_DISCOVERY_PORT);
         discovery.print("SMART_TOP_BOX_CAM:");
         discovery.print(DEVICE_ID);
         discovery.endPacket();
+        
         discovery.stop();
         return true;
       }
@@ -723,23 +764,40 @@ void applySensorTuning(sensor_t *sensor, bool uploadMode, bool lowLightMode,
     return;
   }
 
-  sensor->set_vflip(sensor, 1);
-  sensor->set_hmirror(sensor, 1);
-  sensor->set_brightness(sensor, lowLightMode ? 2 : (brightLightMode ? -1 : 0));
-  sensor->set_contrast(sensor, uploadMode ? 2 : 1);
-  sensor->set_saturation(sensor, brightLightMode ? -1 : 0);
-  sensor->set_sharpness(sensor, uploadMode ? 2 : 1);
-  sensor->set_exposure_ctrl(sensor, 1);
-  sensor->set_aec2(sensor, 1);
-  sensor->set_ae_level(sensor, lowLightMode ? 2 : (brightLightMode ? -1 : 0));
-  sensor->set_gain_ctrl(sensor, 1);
-  sensor->set_agc_gain(sensor, lowLightMode ? 24 : (brightLightMode ? 4 : 8));
-  sensor->set_gainceiling(sensor, lowLightMode ? GAINCEILING_64X
-                                               : (brightLightMode ? GAINCEILING_8X
-                                                                  : GAINCEILING_16X));
-  sensor->set_whitebal(sensor, 1);
-  sensor->set_awb_gain(sensor, 1);
-  sensor->set_wb_mode(sensor, brightLightMode ? 1 : 0);
+  // Camera is mounted inverted in the box, so rotate the image 180 degrees.
+  if (sensor->set_vflip) sensor->set_vflip(sensor, 1);
+  if (sensor->set_hmirror) sensor->set_hmirror(sensor, 1);
+  
+  // Keep exposure and gain automatic, but bias normal/low-light scenes brighter.
+  if (sensor->set_brightness) sensor->set_brightness(sensor, lowLightMode ? 2 : (brightLightMode ? -2 : 2));
+  // Contrast: Higher contrast helps Haar/CNN extract facial edges reliably
+  if (sensor->set_contrast) sensor->set_contrast(sensor, 2);
+  // Saturation: Lower saturation helps focus on luma/edges rather than color noise
+  if (sensor->set_saturation) sensor->set_saturation(sensor, brightLightMode ? -2 : (lowLightMode ? -1 : 0));
+  if (sensor->set_sharpness) sensor->set_sharpness(sensor, uploadMode ? 3 : 1);
+  
+  if (sensor->set_exposure_ctrl) sensor->set_exposure_ctrl(sensor, 1);
+  if (sensor->set_aec2) sensor->set_aec2(sensor, 1);
+  // AE Level is the auto-exposure bias. Higher brightens dark live view.
+  if (sensor->set_ae_level) sensor->set_ae_level(sensor, lowLightMode ? 2 : (brightLightMode ? -2 : 2));
+  if (sensor->set_gain_ctrl) sensor->set_gain_ctrl(sensor, 1);
+  // AGC is the closest OV3660 control to auto ISO. Let it climb in normal rooms.
+  if (sensor->set_agc_gain) sensor->set_agc_gain(sensor, lowLightMode ? 22 : (brightLightMode ? 2 : 14));
+  if (sensor->set_gainceiling) {
+    sensor->set_gainceiling(sensor, lowLightMode ? GAINCEILING_64X
+                                                 : (brightLightMode ? GAINCEILING_4X
+                                                                    : GAINCEILING_32X));
+  }
+  
+  if (sensor->set_whitebal) sensor->set_whitebal(sensor, 1);
+  if (sensor->set_awb_gain) sensor->set_awb_gain(sensor, 1);
+  if (sensor->set_wb_mode) sensor->set_wb_mode(sensor, brightLightMode ? 1 : 0);
+  
+  // Enable built-in ISP corrections to clean up the image
+  if (sensor->set_bpc) sensor->set_bpc(sensor, 1);         // Black pixel correction
+  if (sensor->set_wpc) sensor->set_wpc(sensor, 1);         // White pixel correction
+  if (sensor->set_raw_gma) sensor->set_raw_gma(sensor, 1); // Gamma correction
+  if (sensor->set_lenc) sensor->set_lenc(sensor, 1);       // Lens correction
 }
 
 uint8_t estimateRgb565Luma(const camera_fb_t *fb) {
@@ -829,7 +887,7 @@ bool initCamera() {
   return true;
 }
 
-void switchToUploadMode(framesize_t frameSize, int jpegQuality,
+bool switchToUploadMode(framesize_t frameSize, int jpegQuality,
                         bool lowLightMode, bool brightLightMode = false) {
   esp_camera_deinit();
   delay(100);
@@ -869,18 +927,20 @@ void switchToUploadMode(framesize_t frameSize, int jpegQuality,
   if (err != ESP_OK) {
     Serial.printf("Upload camera init failed: 0x%x\n", err);
     cameraInDetectMode = false;
-    return;
+    return false;
   }
 
   sensor_t *sensor = esp_camera_sensor_get();
   applySensorTuning(sensor, true, lowLightMode, brightLightMode);
 
   cameraInDetectMode = false;
+  return true;
 }
 
-void switchToDetectMode() {
-  if (cameraInDetectMode)
-    return;
+bool switchToDetectMode() {
+  if (cameraInDetectMode) {
+    return true;
+  }
 
   esp_camera_deinit();
   delay(100);
@@ -919,14 +979,15 @@ void switchToDetectMode() {
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Detect camera init failed: 0x%x\n", err);
-    cameraInDetectMode = true;
-    return;
+    cameraInDetectMode = false;
+    return false;
   }
 
   sensor_t *sensor = esp_camera_sensor_get();
   applySensorTuning(sensor, false, false);
 
   cameraInDetectMode = true;
+  return true;
 }
 
 // ===================== DETECTION =====================
@@ -967,12 +1028,25 @@ bool runFaceDetection() {
   int fbWidth  = (int)fb->width;
   int fbHeight = (int)fb->height;
 
-  // MSR01 accepts RGB565 directly. Avoid RGB888 conversion so repeated scans
-  // stay fast and do not depend on large temporary PSRAM buffers.
-  std::list<dl::detect::result_t> &results =
-      s1->infer((uint16_t *)fb->buf, {fbHeight, fbWidth, 3});
-
-  bool detected = results.size() > 0;
+  // Convert RGB565 to RGB888 to guarantee 100% correct color mapping for ESP-DL inference.
+  // Direct uint16_t casting of RGB565 sometimes suffers from byte-order/endianness issues on OV3660.
+  // We allocate in PSRAM since 320x240x3 = 230KB.
+  uint8_t *rgb888_buf = (uint8_t *)heap_caps_malloc(fbWidth * fbHeight * 3, MALLOC_CAP_SPIRAM);
+  bool detected = false;
+  
+  if (rgb888_buf) {
+      if (fmt2rgb888(fb->buf, fb->len, fb->format, rgb888_buf)) {
+          std::list<dl::detect::result_t> &results =
+              s1->infer(rgb888_buf, {fbHeight, fbWidth, 3});
+          detected = results.size() > 0;
+      }
+      heap_caps_free(rgb888_buf);
+  } else {
+      Serial.println(F("Failed to alloc RGB888 buffer, falling back to RGB565..."));
+      std::list<dl::detect::result_t> &results =
+          s1->infer((uint16_t *)fb->buf, {fbHeight, fbWidth, 3});
+      detected = results.size() > 0;
+  }
 
   esp_camera_fb_return(fb);
   return detected;
@@ -1090,8 +1164,8 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
   String endpoint =
       String("http://") + PROXY_HOST + ":" + String(PROXY_PORT) + PROXY_PATH;
 
-  http.setTimeout(90000); // LTE relay can take up to ~60 s for large frames
   http.begin(endpoint);
+  http.setTimeout(65000); // Max safe uint16_t value (~65s) to avoid overflow to 24.4s
   http.addHeader("Content-Type", "image/jpeg");
   // Tell the proxy the Supabase storage path for this image
   http.addHeader("X-Object-Path", objectPath);
@@ -1284,11 +1358,13 @@ void setup() {
   }
 
 // Allocate ESP-Face model
-    s1 = new HumanFaceDetectMSR01(0.1F, 0.5F, 10, 0.2F);
+    // 0.3F scale allows detecting faces that are very close (taking up the entire frame)
+    s1 = new HumanFaceDetectMSR01(0.1F, 0.5F, 10, 0.3F);
 
   // Start HTTP server for /face-status endpoint
   faceServer.begin();
-  Serial.println(F("[HTTP] Face-status server on port 80"));
+  Serial.println(F("[HTTP] Face-status and browser live-view server on port 80"));
+  printBrowserUrls();
 
   // Start Serial2 for UART fallback from Tester board
   Serial2.begin(TESTER_UART_BAUD, SERIAL_8N1, TESTER_UART_RX, TESTER_UART_TX);
@@ -1339,6 +1415,92 @@ bool setCameraSleepMode(bool sleepMode) {
 // Responds to GET /face-status from the GPS/LTE proxy board.
 // Runs face detection on demand. Responds IMMEDIATELY, then defers upload
 // to loop() to avoid deadlock (CAM uploads back to the same proxy).
+void sendBrowserLivePage(WiFiClient &client) {
+  client.print(F(
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: text/html; charset=utf-8\r\n"
+      "Cache-Control: no-store\r\n"
+      "Connection: close\r\n\r\n"
+      "<!doctype html><html><head><meta name='viewport' "
+      "content='width=device-width,initial-scale=1'>"
+      "<title>ESP32-CAM Live View</title>"
+      "<style>"
+      "body{margin:0;background:#101418;color:#edf2f4;font-family:Arial,"
+      "sans-serif}"
+      "main{max-width:980px;margin:0 auto;padding:18px}"
+      "header{display:flex;gap:12px;align-items:center;justify-content:"
+      "space-between;flex-wrap:wrap;margin-bottom:14px}"
+      "h1{font-size:22px;margin:0}.pill{font-size:13px;color:#b8c4cc}"
+      ".viewer{background:#000;border:1px solid #303941;border-radius:8px;"
+      "overflow:hidden;aspect-ratio:4/3;display:flex;align-items:center;"
+      "justify-content:center}"
+      "img{width:100%;height:100%;object-fit:contain;display:block}"
+      ".actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}"
+      "a,button{background:#1f6feb;color:white;border:0;border-radius:6px;"
+      "padding:10px 12px;text-decoration:none;font-size:14px}"
+      "button{cursor:pointer}.secondary{background:#30363d}"
+      "pre{white-space:pre-wrap;background:#161b22;border:1px solid #30363d;"
+      "border-radius:8px;padding:12px;color:#c9d1d9}"
+      "</style></head><body><main>"
+      "<header><div><h1>ESP32-CAM Live View</h1>"
+      "<div class='pill'>Open this from a device connected to the same "
+      "hotspot as the camera.</div></div>"
+      "<a class='secondary' href='/status'>Status</a></header>"
+      "<div class='viewer'><img id='cam' src='/stream' "
+      "alt='ESP32-CAM MJPEG stream'></div>"
+      "<div class='actions'>"
+      "<a href='/stream'>Open raw stream</a>"
+      "<a class='secondary' href='/snapshot'>Open snapshot</a>"
+      "<a class='secondary' href='/face-test'>Test face detection</a>"
+      "<button onclick=\"document.getElementById('cam').src='/stream?ts='+Date.now()\">"
+      "Reconnect stream</button>"
+      "</div><pre>The stream is for diagnostics and auto-closes after 20 seconds. "
+      "Close it before face verification so the detector can use the camera.</pre>"
+      "</main></body></html>"));
+}
+
+void sendBrowserStatus(WiFiClient &client) {
+  String body = "{\n";
+  body += "  \"device_id\": \"" + String(DEVICE_ID) + "\",\n";
+  body += "  \"wifi_ssid\": \"" + String(WIFI_SSID) + "\",\n";
+  body += "  \"ip\": \"" + WiFi.localIP().toString() + "\",\n";
+  body += "  \"rssi_dbm\": " + String(WiFi.RSSI()) + ",\n";
+  body += "  \"camera_sleep\": " + String(cameraSleepMode ? "true" : "false") + ",\n";
+  body += "  \"camera_mode\": \"" + String(cameraInDetectMode ? "detect_rgb565" : "jpeg") + "\",\n";
+  body += "  \"proxy_host\": \"" + String(PROXY_HOST) + "\",\n";
+  body += "  \"pending_upload\": " + String(pendingUpload ? "true" : "false") + "\n";
+  body += "}\n";
+
+  client.print(F("HTTP/1.1 200 OK\r\n"));
+  client.print(F("Content-Type: application/json\r\n"));
+  client.printf("Content-Length: %u\r\n", body.length());
+  client.print(F("Cache-Control: no-store\r\n"));
+  client.print(F("Connection: close\r\n\r\n"));
+  client.print(body);
+}
+
+void sendFaceTestResult(WiFiClient &client, bool detected, bool lowLight,
+                        unsigned long elapsedMs, const char *error = nullptr) {
+  String body = "{\n";
+  body += "  \"detected\": " + String(detected ? "true" : "false") + ",\n";
+  body += "  \"result\": \"" + String(error ? error : (detected ? "FACE_OK" : (lowLight ? "NO_FACE_LOW_LIGHT" : "NO_FACE"))) + "\",\n";
+  body += "  \"elapsed_ms\": " + String(elapsedMs) + ",\n";
+  body += "  \"last_luma\": " + String(lastDetectLuma) + ",\n";
+  body += "  \"low_light\": " + String(lowLight ? "true" : "false") + ",\n";
+  body += "  \"bright_light\": " + String(lastFaceWindowBright ? "true" : "false") + ",\n";
+  body += "  \"camera_sleep\": " + String(cameraSleepMode ? "true" : "false") + ",\n";
+  body += "  \"camera_mode\": \"" + String(cameraInDetectMode ? "detect_rgb565" : "jpeg") + "\",\n";
+  body += "  \"scan_count\": " + String(scanCount) + "\n";
+  body += "}\n";
+
+  client.print(F("HTTP/1.1 200 OK\r\n"));
+  client.print(F("Content-Type: application/json\r\n"));
+  client.printf("Content-Length: %u\r\n", body.length());
+  client.print(F("Cache-Control: no-store\r\n"));
+  client.print(F("Connection: close\r\n\r\n"));
+  client.print(body);
+}
+
 void handleFaceStatusClient() {
   if (!pendingFaceClientActive) {
     WiFiClient incoming = faceServer.available();
@@ -1372,6 +1534,70 @@ void handleFaceStatusClient() {
 
   String requestLine = client.readStringUntil('\n');
   requestLine.trim();
+
+  if (requestLine.startsWith("GET / ") || requestLine.startsWith("GET /live")) {
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) {
+        break;
+      }
+    }
+
+    sendBrowserLivePage(client);
+    client.flush();
+    yield();
+    client.stop();
+    pendingFaceClientActive = false;
+    return;
+  }
+
+  if (requestLine.startsWith("GET /status")) {
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) {
+        break;
+      }
+    }
+
+    sendBrowserStatus(client);
+    client.flush();
+    yield();
+    client.stop();
+    pendingFaceClientActive = false;
+    return;
+  }
+
+  if (requestLine.startsWith("GET /face-test")) {
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) {
+        break;
+      }
+    }
+
+    unsigned long startedAt = millis();
+    bool lowLight = false;
+    bool detected = false;
+    const char *error = nullptr;
+
+    if (cameraSleepMode) {
+      error = "CAMERA_SLEEP";
+    } else if (!cameraInDetectMode && !switchToDetectMode()) {
+      error = "CAMERA_DETECT_MODE_FAILED";
+    } else {
+      detected = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS, &lowLight);
+    }
+
+    sendFaceTestResult(client, detected, lowLight, millis() - startedAt, error);
+    client.flush();
+    yield();
+    client.stop();
+    pendingFaceClientActive = false;
+    return;
+  }
 
   if (requestLine.startsWith("GET /cam-power")) {
     int qIdx = requestLine.indexOf("?mode=");
@@ -1414,6 +1640,180 @@ void handleFaceStatusClient() {
     client.print(resp);
     client.flush();
     yield();
+    client.stop();
+    pendingFaceClientActive = false;
+    return;
+  }
+
+  if (requestLine.startsWith("GET /preview") || requestLine.startsWith("GET /snapshot")) {
+    netLog("[HTTP] Serving browser preview snapshot\n");
+
+    // Read and discard HTTP headers
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) {
+        break;
+      }
+    }
+
+    if (cameraSleepMode) {
+      const char *msg = "Camera is in sleep mode.";
+      char resp[160];
+      snprintf(resp, sizeof(resp),
+               "HTTP/1.1 503 Service Unavailable\r\n"
+               "Content-Type: text/plain\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: close\r\n\r\n"
+               "%s",
+               (int)strlen(msg), msg);
+      client.print(resp);
+      client.flush();
+      yield();
+      client.stop();
+      pendingFaceClientActive = false;
+      return;
+    }
+
+    // Switch to JPEG mode temporarily for a clean snapshot
+    if (!switchToUploadMode(FRAMESIZE_VGA, 12, false, false)) {
+      const char *msg = "Camera JPEG mode failed.";
+      char resp[160];
+      snprintf(resp, sizeof(resp),
+               "HTTP/1.1 500 Internal Server Error\r\n"
+               "Content-Type: text/plain\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: close\r\n\r\n"
+               "%s",
+               (int)strlen(msg), msg);
+      client.print(resp);
+      client.flush();
+      yield();
+      client.stop();
+      pendingFaceClientActive = false;
+      return;
+    }
+    delay(400); // Allow AE/AGC to adjust to current lighting
+
+    // Flush stale frames
+    for (uint8_t i = 0; i < 2; i++) {
+      camera_fb_t *stale = esp_camera_fb_get();
+      if (stale) {
+        esp_camera_fb_return(stale);
+      }
+      delay(50);
+    }
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+      const char *msg = "Failed to capture frame.";
+      char resp[160];
+      snprintf(resp, sizeof(resp),
+               "HTTP/1.1 500 Internal Server Error\r\n"
+               "Content-Type: text/plain\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: close\r\n\r\n"
+               "%s",
+               (int)strlen(msg), msg);
+      client.print(resp);
+    } else {
+      client.print("HTTP/1.1 200 OK\r\n");
+      client.print("Content-Type: image/jpeg\r\n");
+      client.printf("Content-Length: %u\r\n", fb->len);
+      client.print("Connection: close\r\n\r\n");
+      client.write(fb->buf, fb->len);
+      client.flush();
+      esp_camera_fb_return(fb);
+    }
+
+    // Restore detect mode
+    switchToDetectMode();
+
+    yield();
+    client.stop();
+    pendingFaceClientActive = false;
+    return;
+  }
+
+  if (requestLine.startsWith("GET /stream")) {
+    netLog("[HTTP] Starting MJPEG stream for browser\n");
+
+    // Read and discard HTTP headers
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) {
+        break;
+      }
+    }
+
+    if (cameraSleepMode) {
+      const char *msg = "Camera is in sleep mode.";
+      char resp[160];
+      snprintf(resp, sizeof(resp),
+               "HTTP/1.1 503 Service Unavailable\r\n"
+               "Content-Type: text/plain\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: close\r\n\r\n"
+               "%s",
+               (int)strlen(msg), msg);
+      client.print(resp);
+      client.flush();
+      yield();
+      client.stop();
+      pendingFaceClientActive = false;
+      return;
+    }
+
+    // Switch to JPEG mode for video streaming
+    if (!switchToUploadMode(FRAMESIZE_VGA, 12, false, false)) {
+      const char *msg = "Camera JPEG mode failed.";
+      char resp[160];
+      snprintf(resp, sizeof(resp),
+               "HTTP/1.1 500 Internal Server Error\r\n"
+               "Content-Type: text/plain\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: close\r\n\r\n"
+               "%s",
+               (int)strlen(msg), msg);
+      client.print(resp);
+      client.flush();
+      yield();
+      client.stop();
+      pendingFaceClientActive = false;
+      return;
+    }
+
+    // Send MJPEG stream headers after JPEG mode is confirmed.
+    client.print("HTTP/1.1 200 OK\r\n");
+    client.print("Content-Type: multipart/x-mixed-replace; boundary=frame\r\n");
+    client.print("Connection: close\r\n\r\n");
+    delay(200);
+
+    // Continuous capture loop while browser tab remains open. Keep this finite
+    // because face verification uses this same single WiFiServer.
+    unsigned long streamStartedAt = millis();
+    while (client.connected() && (millis() - streamStartedAt) < BROWSER_STREAM_MAX_MS) {
+      camera_fb_t *fb = esp_camera_fb_get();
+      if (fb) {
+        client.print("--frame\r\n");
+        client.print("Content-Type: image/jpeg\r\n");
+        client.printf("Content-Length: %u\r\n\r\n", fb->len);
+        client.write(fb->buf, fb->len);
+        client.print("\r\n");
+        client.flush();
+        esp_camera_fb_return(fb);
+      }
+      
+      // Yield to keep FreeRTOS watchdogs and WiFi layer responsive
+      yield();
+      delay(80); // Cap frame rate to ~10-12 FPS to avoid thermal throttling
+    }
+
+    netLog("[HTTP] MJPEG stream closed; returning camera to detection mode\n");
+
+    // Restore detect mode after user closes streaming tab
+    switchToDetectMode();
     client.stop();
     pendingFaceClientActive = false;
     return;
@@ -1467,6 +1867,25 @@ void handleFaceStatusClient() {
   bool faceFound = false;
   bool lowLight = false;
   if (!cameraSleepMode) {
+    bool detectReady = cameraInDetectMode || switchToDetectMode();
+    if (!detectReady) {
+      netLog("[HTTP] Face check failed: camera detect mode unavailable\n");
+      const char *result = "CAMERA_ERROR\r\n";
+      char resp[128];
+      snprintf(resp, sizeof(resp),
+               "HTTP/1.1 200 OK\r\n"
+               "Content-Type: text/plain\r\n"
+               "Content-Length: %d\r\n"
+               "Connection: close\r\n\r\n"
+               "%s",
+               (int)strlen(result), result);
+      client.print(resp);
+      client.flush();
+      yield();
+      client.stop();
+      pendingFaceClientActive = false;
+      return;
+    }
     faceFound = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS, &lowLight);
   }
 

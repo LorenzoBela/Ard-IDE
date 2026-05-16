@@ -559,7 +559,7 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
   String endpoint =
       String("http://") + PROXY_HOST + ":" + String(PROXY_PORT) + PROXY_PATH;
 
-  http.setTimeout(90000); // LTE relay can take up to ~60 s for large frames
+  http.begin(endpoint);
   http.begin(endpoint);
   http.addHeader("Content-Type", "image/jpeg");
   // Tell the proxy the Supabase storage path for this image

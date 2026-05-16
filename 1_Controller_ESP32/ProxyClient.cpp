@@ -993,10 +993,14 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
   if (body.indexOf("ALLOW_RELOCK") >= 0) {
     return 2;
   }
-  if (body.indexOf("DENY:disabled") >= 0 ||
-      body.indexOf("DENY:missing_pin") >= 0 ||
+  if (body.indexOf("DENY:disabled") >= 0) {
+    return -3;
+  }
+  if (body.indexOf("DENY:sync_failed") >= 0) {
+    return -4;
+  }
+  if (body.indexOf("DENY:missing_pin") >= 0 ||
       body.indexOf("DENY:invalid") >= 0 ||
-      body.indexOf("DENY:sync_failed") >= 0 ||
       body.indexOf("DENY:box_mismatch") >= 0) {
     return -1;
   }

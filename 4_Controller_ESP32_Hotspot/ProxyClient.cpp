@@ -1316,10 +1316,10 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
       uartBody.trim();
       if (uartBody.indexOf("ALLOW_UNLOCK") >= 0) return 1;
       if (uartBody.indexOf("ALLOW_RELOCK") >= 0) return 2;
-      if (uartBody.indexOf("DENY:disabled") >= 0 ||
-          uartBody.indexOf("DENY:missing_pin") >= 0 ||
+      if (uartBody.indexOf("DENY:disabled") >= 0) return -3;
+      if (uartBody.indexOf("DENY:sync_failed") >= 0) return -4;
+      if (uartBody.indexOf("DENY:missing_pin") >= 0 ||
           uartBody.indexOf("DENY:invalid") >= 0 ||
-          uartBody.indexOf("DENY:sync_failed") >= 0 ||
           uartBody.indexOf("DENY:box_mismatch") >= 0) {
         return -1;
       }
@@ -1355,10 +1355,14 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
   if (body.indexOf("ALLOW_RELOCK") >= 0) {
     return 2;
   }
-  if (body.indexOf("DENY:disabled") >= 0 ||
-      body.indexOf("DENY:missing_pin") >= 0 ||
+  if (body.indexOf("DENY:disabled") >= 0) {
+    return -3;
+  }
+  if (body.indexOf("DENY:sync_failed") >= 0) {
+    return -4;
+  }
+  if (body.indexOf("DENY:missing_pin") >= 0 ||
       body.indexOf("DENY:invalid") >= 0 ||
-      body.indexOf("DENY:sync_failed") >= 0 ||
       body.indexOf("DENY:box_mismatch") >= 0) {
     return -1;
   }
@@ -1426,7 +1430,7 @@ int requestFaceCheck() {
       Serial.println(F("[FACE] WiFi down — trying UART fallback..."));
 #endif
 
-  if (proxyUartRequest("GET", facePath, "", uartBody, PROXY_UART_TIMEOUT_MS)) {
+  if (proxyUartRequest("GET", facePath, "", uartBody, FACE_CHECK_WIFI_TIMEOUT_MS)) {
     uartBody.trim();
     if (uartBody.indexOf("FACE_OK") >= 0) return 1;
     if (uartBody.indexOf("NO_FACE_LOW_LIGHT") >= 0) return 2;

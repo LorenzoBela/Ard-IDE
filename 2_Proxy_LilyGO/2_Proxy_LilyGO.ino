@@ -3678,6 +3678,9 @@ void refreshDeliveryContextFromFirebase() {
 
       if (pinRuntimeRefreshed) {
         // Runtime refresh already updated caches.
+      } else if (responseTruncated) {
+        // Avoid wiping cache during truncated responses
+        Serial.println("[PIN] Passing over cache wipe due to truncated response");
       } else if (!hasAnyPersonalPinRuntimeField) {
         if (personalPinEnabled || cachedPersonalPinHashMcu[0] ||
             cachedPersonalPinSalt[0] || cachedPersonalPinRiderId[0]) {

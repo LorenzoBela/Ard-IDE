@@ -16,6 +16,10 @@
 #include <WiFiClientSecure.h>
 #include "mbedtls/sha256.h"
 
+// WiFi HTTPS/mbedTLS plus Firebase JSON handling can exceed Arduino-ESP32's
+// default 8 KB loopTask stack and trigger stack canary resets.
+SET_LOOP_TASK_STACK_SIZE(32768);
+
 #include "LogTee.h"
 
 SerialTee LogSerial(Serial);
@@ -74,6 +78,9 @@ static const uint8_t HOTSPOT_COUNT = sizeof(HOTSPOTS) / sizeof(HOTSPOTS[0]);
 #define PROXY_DISCOVERY_REPLY "SMART_TOP_BOX_PROXY:"
 #define WIFI_CLOUD_HEALTH_INTERVAL_MS 15000
 #define WIFI_CLOUD_FAILURE_LIMIT 3
+// Camera proof uploads are handled by the A7670 modem HTTP engine. The WiFi
+// HTTPS upload path uses mbedTLS on loopTask and can trip the stack canary.
+#define USE_WIFI_SUPABASE_UPLOAD 0
 
 #define AP_PASS "topbox123"
 #define CAM_SERVER_PORT 8080
@@ -462,6 +469,12 @@ static bool queuedLockFaceRetryExhausted = false;
 static bool queuedLockFallbackRequired = false;
 static char queuedLockFailureReason[24] = "";
 static unsigned long queuedLockUnlockLatencyMs = 0;
+static bool commandAckFirebaseWriteQueued = false;
+static char queuedCommandAckCommand[24] = "";
+static char queuedCommandAckStatus[32] = "";
+static char queuedCommandAckDetails[96] = "";
+static bool queuedCommandAckTracked = false;
+static bool returnCompletionFirebaseWriteQueued = false;
 
 // Reliability counters
 uint8_t consecutiveModemFailures = 0;
@@ -542,6 +555,11 @@ static void queueLockEventFirebaseWrite(bool otpValid, bool faceDetected,
                                         bool fallbackRequired,
                                         const char *failureReason,
                                         unsigned long unlockLatencyMs);
+static void queueCommandAckFirebaseWrite(const char *command,
+                                         const char *status,
+                                         const char *details,
+                                         bool trackedAck);
+static void queueReturnCompletionFirebaseWrite();
 String forwardFaceCheck(String deliveryId);
 String forwardCameraPowerCommand(const String &mode);
 
@@ -2473,7 +2491,7 @@ static void handleProxyUartRequest(const String &line) {
     extractJsonStringValue(payload.c_str(), "status", status, sizeof(status));
     extractJsonStringValue(payload.c_str(), "details", details, sizeof(details));
     sendProxyUartResponse(id, 200, "OK");
-    writeCommandAckToFirebase(cmd, status, details);
+    queueCommandAckFirebaseWrite(cmd, status, details, false);
   } else if (method == "POST" && path == "/event") {
     sendProxyUartResponse(id, 200, "OK");
     if (payload.indexOf("\"tamper\":true") >= 0) {
@@ -2668,6 +2686,7 @@ bool uploadToSupabaseViaLTE(const uint8_t *data, size_t len,
 bool uploadClientToSupabaseViaLTE(WiFiClient &source, size_t len,
                                   const String &objectPath) {
   relayDiag = "";
+#if USE_WIFI_SUPABASE_UPLOAD
   if (cloudWifiAvailable()) {
     uint8_t *buf = (uint8_t *)malloc(len);
     if (buf) {
@@ -2711,6 +2730,7 @@ bool uploadClientToSupabaseViaLTE(WiFiClient &source, size_t len,
       relayDiag = "FAIL:wifi_upload_oom";
     }
   }
+#endif
 
   if (!lteConnected) {
     relayDiag = "FAIL:lte_not_connected";
@@ -3617,6 +3637,29 @@ static void queueLockEventFirebaseWrite(bool otpValid, bool faceDetected,
   Serial.println("[EVENT] lock_events write queued");
 }
 
+static void queueCommandAckFirebaseWrite(const char *command,
+                                         const char *status,
+                                         const char *details,
+                                         bool trackedAck) {
+  strncpy(queuedCommandAckCommand, command ? command : "",
+          sizeof(queuedCommandAckCommand) - 1);
+  queuedCommandAckCommand[sizeof(queuedCommandAckCommand) - 1] = '\0';
+  strncpy(queuedCommandAckStatus, status ? status : "unknown",
+          sizeof(queuedCommandAckStatus) - 1);
+  queuedCommandAckStatus[sizeof(queuedCommandAckStatus) - 1] = '\0';
+  strncpy(queuedCommandAckDetails, details ? details : "",
+          sizeof(queuedCommandAckDetails) - 1);
+  queuedCommandAckDetails[sizeof(queuedCommandAckDetails) - 1] = '\0';
+  queuedCommandAckTracked = trackedAck;
+  commandAckFirebaseWriteQueued = true;
+  Serial.println("[CMD_ACK] Firebase write queued");
+}
+
+static void queueReturnCompletionFirebaseWrite() {
+  returnCompletionFirebaseWriteQueued = true;
+  Serial.println("[CMD_ACK] Return completion Firebase write queued");
+}
+
 static void captureSuppressedTamper(unsigned long now) {
   tamperRetriggerPending = true;
   tamperRetriggerAtMs = now;
@@ -4279,6 +4322,9 @@ void refreshDeliveryContextFromFirebase() {
 
       if (pinRuntimeRefreshed) {
         // Runtime refresh already updated caches.
+      } else if (responseTruncated) {
+        // Avoid wiping cache during truncated responses
+        Serial.println("[PIN] Passing over cache wipe due to truncated response");
       } else if (!hasAnyPersonalPinRuntimeField) {
         if (personalPinEnabled || cachedPersonalPinHashMcu[0] ||
             cachedPersonalPinSalt[0] || cachedPersonalPinRiderId[0]) {
@@ -4923,7 +4969,7 @@ String forwardFaceCheck(String deliveryId) {
   unsigned long waitStart = millis();
   String result = "";
   bool headersEnded = false;
-  while (millis() - waitStart < 12000) {
+  while (millis() - waitStart < 18000) {
     if (camClient.available()) {
       String line = camClient.readStringUntil('\n');
       line.trim();
@@ -5500,15 +5546,7 @@ void handleCameraClient() {
     client.flush();
     keepAliveController = client;
     
-    // Now write to Firebase (takes a few seconds)
-    bool ackWritten = writeCommandAckToFirebase(cmd, status, details);
-    if (trackedAck) {
-      if (ackWritten) {
-        markCommandDone();
-      } else {
-        lastCommandAckRetryAt = millis() + COMMAND_ACK_RETRY_INTERVAL_MS;
-      }
-    }
+    queueCommandAckFirebaseWrite(cmd, status, details, trackedAck);
 
     // EC-32: Handle return completion signal from controller.
     // When a return OTP unlock succeeds, the controller sends RETURN_COMPLETE.
@@ -5521,17 +5559,7 @@ void handleCameraClient() {
       cachedReturnOtp[0] = '\0';
       returnOtpCacheValid = false;
 
-      // Write return_completed flag + clear return_active on Firebase.
-      char patchPath[64];
-      snprintf(patchPath, sizeof(patchPath), "/hardware/%s.json", HARDWARE_ID);
-      const char *patchBody =
-          "{\"return_completed\":true,\"return_active\":false,"
-          "\"return_completed_at\":{\".sv\":\"timestamp\"}}";
-
-      Serial.printf("[CMD_ACK] Firebase PATCH: %s\n", patchPath);
-      bool patchOk = httpPatchWithRetry(patchPath, patchBody);
-      Serial.printf("[CMD_ACK] Return completion write: %s\n",
-                    patchOk ? "OK" : "FAIL");
+      queueReturnCompletionFirebaseWrite();
     }
     return;
   }
@@ -7091,6 +7119,48 @@ void loop() {
     controllerContextRefreshQueued = false;
     lastDeliveryContextRead = 0;
     Serial.println("[CONTEXT] Running queued controller refresh");
+  }
+
+  if (lteConnected && commandAckFirebaseWriteQueued && !modemHttpBusy) {
+    char cmd[sizeof(queuedCommandAckCommand)];
+    char status[sizeof(queuedCommandAckStatus)];
+    char details[sizeof(queuedCommandAckDetails)];
+    strncpy(cmd, queuedCommandAckCommand, sizeof(cmd) - 1);
+    cmd[sizeof(cmd) - 1] = '\0';
+    strncpy(status, queuedCommandAckStatus, sizeof(status) - 1);
+    status[sizeof(status) - 1] = '\0';
+    strncpy(details, queuedCommandAckDetails, sizeof(details) - 1);
+    details[sizeof(details) - 1] = '\0';
+    bool tracked = queuedCommandAckTracked;
+    commandAckFirebaseWriteQueued = false;
+    Serial.println("[CMD_ACK] Running queued Firebase write");
+    bool ackWritten = writeCommandAckToFirebase(cmd, status, details);
+    if (tracked) {
+      if (ackWritten) {
+        markCommandDone();
+      } else {
+        commandAckFirebaseWriteQueued = true;
+        lastCommandAckRetryAt = now + COMMAND_ACK_RETRY_INTERVAL_MS;
+      }
+    } else if (!ackWritten) {
+      commandAckFirebaseWriteQueued = true;
+    }
+  }
+
+  if ((wifiCloudHealthy || lteConnected) && returnCompletionFirebaseWriteQueued && !modemHttpBusy) {
+    returnCompletionFirebaseWriteQueued = false;
+    char patchPath[64];
+    snprintf(patchPath, sizeof(patchPath), "/hardware/%s.json", HARDWARE_ID);
+    const char *patchBody =
+        "{\"return_completed\":true,\"return_active\":false,"
+        "\"return_completed_at\":{\".sv\":\"timestamp\"}}";
+    Serial.printf("[CMD_ACK] Running queued return completion write: %s\n",
+                  patchPath);
+    bool patchOk = httpPatchWithRetry(patchPath, patchBody);
+    if (!patchOk) {
+      returnCompletionFirebaseWriteQueued = true;
+      Serial.println("[CMD_ACK] Return completion write failed; will retry");
+    }
   }
 
   if ((wifiCloudHealthy || lteConnected) && tamperFirebaseWriteQueued && !modemHttpBusy) {

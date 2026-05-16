@@ -1457,17 +1457,26 @@ void loop() {
     }
 
     // Long-press '9' to force a delivery context refresh from Firebase.
+    // In pickup rider PIN mode, the first debounced '9' may already have been
+    // buffered as a PIN digit before the hold threshold is reached; treat only
+    // that leading single '9' as the refresh gesture and clear it before sync.
     static unsigned long nineHoldStart = 0;
     static bool nineHoldTriggered = false;
+    bool personalPinLeadingNineHold =
+      (currentState == STATE_PERSONAL_PIN_ENTRY &&
+       personalPinLen <= 1 &&
+       (personalPinLen == 0 || personalPinCode[0] == '9'));
     if (heldKey == '9' &&
         currentState != STATE_ENTERING_PIN &&
-        currentState != STATE_PERSONAL_PIN_ENTRY &&
         currentState != STATE_BOOT_AUTH &&
-        !(currentState == STATE_IDLE && isOtpEntryEligibleNow())) {
+        !(currentState == STATE_IDLE && isOtpEntryEligibleNow()) &&
+        (currentState != STATE_PERSONAL_PIN_ENTRY || personalPinLeadingNineHold)) {
       if (nineHoldStart == 0) nineHoldStart = now;
       if (!nineHoldTriggered && (now - nineHoldStart) >= 1200) {
         inputLen = 0;
         inputCode[0] = '\0';
+        personalPinLen = 0;
+        personalPinCode[0] = '\0';
         drainKeypadBuffer();
         if (!bootPhaseComplete) {
           clearKeypadGeoCheck();
@@ -1669,14 +1678,26 @@ void handleStateMachine(unsigned long now) {
         messageStartAt = now;
         currentState = STATE_SHOW_MESSAGE;
       } else if (decision == -2) {
-        // HTTP/network error — proxy unreachable or errored.
+        // HTTP/network error â€” proxy unreachable or errored.
         if (!isDisplayFailed()) {
           updateDisplay("Network error", "Retry in moment");
         }
         messageStartAt = now;
         currentState = STATE_SHOW_MESSAGE;
+      } else if (decision == -3) {
+        if (!isDisplayFailed()) {
+          updateDisplay("PIN disabled", "Enable in app");
+        }
+        messageStartAt = now;
+        currentState = STATE_SHOW_MESSAGE;
+      } else if (decision == -4) {
+        if (!isDisplayFailed()) {
+          updateDisplay("Proxy syncing...", "Please wait");
+        }
+        messageStartAt = now;
+        currentState = STATE_SHOW_MESSAGE;
       } else if (decision < 0) {
-        // DENY response: disabled, missing_pin, sync_failed, etc.
+        // DENY response: missing_pin, invalid, box_mismatch, etc.
         if (!isDisplayFailed()) {
           updateDisplay("PIN rejected", "Hold 9 re-sync");
         }
@@ -2071,14 +2092,26 @@ void handleStateMachine(unsigned long now) {
             currentState = STATE_SHOW_MESSAGE;
           }
         } else if (decision == -2) {
-          // HTTP/network error — proxy unreachable or errored.
+          // HTTP/network error â€” proxy unreachable or errored.
           if (!isDisplayFailed()) {
             updateDisplay("Network error", "Retry in moment");
           }
           messageStartAt = now;
           currentState = STATE_SHOW_MESSAGE;
+        } else if (decision == -3) {
+          if (!isDisplayFailed()) {
+            updateDisplay("PIN disabled", "Enable in app");
+          }
+          messageStartAt = now;
+          currentState = STATE_SHOW_MESSAGE;
+        } else if (decision == -4) {
+          if (!isDisplayFailed()) {
+            updateDisplay("Proxy syncing...", "Please wait");
+          }
+          messageStartAt = now;
+          currentState = STATE_SHOW_MESSAGE;
         } else if (decision < 0) {
-          // DENY: disabled, missing_pin, sync_failed, etc.
+          // DENY: missing_pin, invalid, box_mismatch, etc.
           if (!isDisplayFailed()) {
             updateDisplay("PIN rejected", "Hold 9 re-sync");
           }
