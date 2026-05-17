@@ -137,7 +137,8 @@ static uint8_t lastDetectLuma = 255;
 static bool lastFaceWindowLowLight = false;
 static bool lastFaceWindowBright = false;
 
-// Deferred upload flag — set by face-check handlers, executed in loop()
+// Deferred upload flag. Face-check handlers capture the evidence JPEG first,
+// then loop() only uploads/retries that frozen frame.
 static bool pendingUpload = false;
 static bool uploadInProgress = false;
 static unsigned long uploadRetryAtMs = 0;
@@ -228,6 +229,10 @@ void netLog(const char *format, ...) {
 bool uploadToSupabase(const uint8_t *data, size_t len,
                       const String &objectPath,
                       const char *proofRole = "full");
+String makeObjectPath(const char *proofRole = "full");
+bool switchToUploadMode(framesize_t frameSize, int jpegQuality,
+                        bool lowLightMode, bool brightLightMode = false);
+bool switchToDetectMode();
 
 static uint32_t fnv1a32(const char *text) {
   const char *src = text ? text : "";
@@ -441,6 +446,82 @@ bool queueSingleUpload(const char *source) {
   return true;
 }
 
+bool queueCapturedUpload(const char *source) {
+  unsigned long now = millis();
+
+  if (uploadInProgress || pendingUpload) {
+    netLog("[UPLOAD] Skip capture from %s (busy)\n", source);
+    return false;
+  }
+
+  if (lastUploadAt != 0 && (now - lastUploadAt) < DETECTION_COOLDOWN_MS) {
+    netLog("[UPLOAD] Skip capture from %s (cooldown)\n", source);
+    return false;
+  }
+
+  if (!payloadStoreReady) {
+    netLog("[UPLOAD] Cannot freeze proof from %s: SPIFFS unavailable\n", source);
+    return false;
+  }
+
+  bool lowLightMode =
+      lastFaceWindowLowLight || lastDetectLuma <= LOW_LIGHT_LUMA_THRESHOLD;
+  bool brightLightMode = !lowLightMode &&
+      (lastFaceWindowBright || lastDetectLuma >= BRIGHT_LIGHT_LUMA_THRESHOLD);
+
+  String objectPath = makeObjectPath("full");
+  unsigned long t0 = millis();
+
+  if (!switchToUploadMode(UPLOAD_FRAME_SIZE, UPLOAD_JPEG_QUALITY, lowLightMode,
+                          brightLightMode)) {
+    switchToDetectMode();
+    return false;
+  }
+
+  delay(lowLightMode ? LOW_LIGHT_EXPOSURE_SETTLE_MS
+                     : UPLOAD_EXPOSURE_SETTLE_MS);
+
+  for (uint8_t i = 0; i < UPLOAD_STALE_FLUSH_FRAMES; i++) {
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (stale) {
+      esp_camera_fb_return(stale);
+    }
+    delay(70);
+  }
+
+  camera_fb_t *photo = esp_camera_fb_get();
+  if (photo && photo->len < 5000) {
+    esp_camera_fb_return(photo);
+    delay(50);
+    photo = esp_camera_fb_get();
+  }
+
+  if (!photo) {
+    netLog("[UPLOAD] Proof capture from %s failed\n", source);
+    switchToDetectMode();
+    return false;
+  }
+
+  bool saved = savePendingPayload(photo->buf, photo->len, objectPath);
+  unsigned int len = (unsigned int)photo->len;
+  esp_camera_fb_return(photo);
+  switchToDetectMode();
+
+  if (!saved) {
+    netLog("[UPLOAD] Proof capture from %s not saved\n", source);
+    clearPendingPayloadStorage();
+    return false;
+  }
+
+  pendingUpload = true;
+  uploadRetryAtMs = millis();
+  pendingUploadRetryCount = 0;
+  persistUploadIntent(true);
+  netLog("[UPLOAD] Frozen proof from %s: %u bytes in %lums\n", source, len,
+         millis() - t0);
+  return true;
+}
+
 void printCommands() {
   Serial.println(F("Commands:"));
   Serial.println(F("  c = force capture & upload (bypass detection)"));
@@ -551,8 +632,10 @@ void logTargetApVisibility() {
 bool discoverProxyUdp(unsigned long timeoutMs = 1500) {
   if (WiFi.status() != WL_CONNECTED) return false;
   WiFiUDP discovery;
-  if (!discovery.begin(0)) {
-    Serial.println(F("[DISCOVERY] UDP begin failed"));
+  // Use a fixed receive port. Some phone hotspots pass broadcast discovery
+  // but drop replies to random high UDP source ports.
+  if (!discovery.begin(PROXY_DISCOVERY_PORT)) {
+    Serial.printf("[DISCOVERY] UDP begin(%d) failed\n", PROXY_DISCOVERY_PORT);
     return false;
   }
   IPAddress broadcast((uint32_t)WiFi.localIP() | ~(uint32_t)WiFi.subnetMask());
@@ -573,6 +656,7 @@ bool discoverProxyUdp(unsigned long timeoutMs = 1500) {
     int size = discovery.parsePacket();
     if (size > 0) {
       int len = discovery.read(packet, sizeof(packet) - 1);
+      if (len < 0) len = 0;
       packet[len] = '\0';
       if (strncmp(packet, PROXY_DISCOVERY_REPLY,
                   strlen(PROXY_DISCOVERY_REPLY)) == 0) {
@@ -888,7 +972,7 @@ bool initCamera() {
 }
 
 bool switchToUploadMode(framesize_t frameSize, int jpegQuality,
-                        bool lowLightMode, bool brightLightMode = false) {
+                        bool lowLightMode, bool brightLightMode) {
   esp_camera_deinit();
   delay(100);
 
@@ -1137,7 +1221,7 @@ bool runFaceDetectionWindow(unsigned long windowMs, bool *lowLightOut = nullptr)
 
 // ===================== UPLOAD =====================
 
-String makeObjectPath(const char *proofRole = "full") {
+String makeObjectPath(const char *proofRole) {
   char filename[128];
   snprintf(filename, sizeof(filename), "%s_%s_%lu.jpg", currentDeliveryId,
            (proofRole && proofRole[0] != '\0') ? proofRole : "full", millis());
@@ -1176,7 +1260,7 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
            (unsigned long)fnv1a32(objectPath.c_str()), (unsigned int)len);
   http.addHeader("X-Idempotency-Key", idempotencyKey);
 
-  Serial.printf("Uploading via LTE proxy (%s)...\n", endpoint.c_str());
+  Serial.printf("Uploading via proxy (%s)...\n", endpoint.c_str());
   int code = http.POST((uint8_t *)data, len);
   String response = http.getString();
   http.end();
@@ -1893,15 +1977,14 @@ void handleFaceStatusClient() {
   if (faceFound) {
     personCount++;
     netLog("[HTTP] Face detected!\n");
-    result = "FACE_OK";
-    queueSingleUpload("HTTP");
+    result = queueCapturedUpload("HTTP") ? "FACE_OK" : "FACE_BUSY";
   } else {
     netLog(lowLight ? "[HTTP] No face detected (low light)\n"
                     : "[HTTP] No face detected\n");
     result = lowLight ? "NO_FACE_LOW_LIGHT" : "NO_FACE";
   }
 
-  // Send HTTP response IMMEDIATELY (before any upload)
+  // Send FACE_OK only after the proof JPEG is already frozen locally.
   String fullResult = String(result) + "\r\n";
   char resp[128];
   snprintf(resp, sizeof(resp),
@@ -1925,22 +2008,23 @@ void loop() {
   handleFaceStatusClient(); // On-demand face-check via WiFi (from proxy)
   handleUartFaceCommand();  // On-demand face-check via UART (from Tester)
 
-  // Deferred upload — runs AFTER face-check response was sent
-  // This avoids deadlock (CAM uploads to the same proxy that requested
-  // face-check)
+  // Deferred upload — runs AFTER face-check response was sent. Face-triggered
+  // uploads replay the already-frozen SPIFFS JPEG instead of recapturing later.
   if (pendingUpload && !uploadInProgress && millis() >= uploadRetryAtMs) {
     uploadInProgress = true;
-    netLog("[UPLOAD] Deferred capture + upload starting...\n");
+    netLog("[UPLOAD] Deferred upload starting...\n");
     bool uploadOk = false;
+    bool hasFrozenPayload = pendingObjectPath[0] != '\0';
 
-    if (payloadStoreReady && pendingObjectPath[0] != '\0' &&
-        SPIFFS.exists(CAM_PENDING_FILE)) {
+    if (payloadStoreReady && hasFrozenPayload && SPIFFS.exists(CAM_PENDING_FILE)) {
       netLog("[UPLOAD] Replaying persisted payload...\n");
       uploadOk = uploadPendingPayloadFromStorage();
     }
 
-    if (!uploadOk) {
+    if (!uploadOk && !hasFrozenPayload) {
       uploadOk = captureHighResAndUpload();
+    } else if (!uploadOk && hasFrozenPayload) {
+      netLog("[UPLOAD] Frozen payload unavailable; keeping original intent for retry\n");
     }
 
     if (uploadOk) {
@@ -2042,11 +2126,10 @@ void handleUartFaceCommand() {
   bool lowLight = false;
   bool detected = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS, &lowLight);
 
-  // Respond IMMEDIATELY
+  // Respond FACE_OK only after the proof JPEG is already frozen locally.
   if (detected) {
     netLog("[UART] Face DETECTED\n");
-    Serial2.println("FACE_OK");
-    queueSingleUpload("UART");
+    Serial2.println(queueCapturedUpload("UART") ? "FACE_OK" : "FACE_BUSY");
   } else {
     Serial.println(lowLight ? F("[UART] No face (low light)") : F("[UART] No face"));
     Serial2.println(lowLight ? "NO_FACE_LOW_LIGHT" : "NO_FACE");

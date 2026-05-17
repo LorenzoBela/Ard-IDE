@@ -20,8 +20,8 @@ char keys[ROWS][COLS] = {
 };
 
 // YUNG CUSTOM PIN MAPPING MO NA GUMAGANA:
-byte rowPins[ROWS] = {13, 23, 19, 26}; 
-byte colPins[COLS] = {14, 25, 18};    
+byte rowPins[ROWS] = {19, 18, 25, 13};
+byte colPins[COLS] = {23, 26, 14};
 
 Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
 

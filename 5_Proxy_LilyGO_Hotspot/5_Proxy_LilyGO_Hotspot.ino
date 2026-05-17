@@ -80,7 +80,7 @@ static const uint8_t HOTSPOT_COUNT = sizeof(HOTSPOTS) / sizeof(HOTSPOTS[0]);
 #define WIFI_CLOUD_FAILURE_LIMIT 3
 // Camera proof uploads are handled by the A7670 modem HTTP engine. The WiFi
 // HTTPS upload path uses mbedTLS on loopTask and can trip the stack canary.
-#define USE_WIFI_SUPABASE_UPLOAD 0
+#define USE_WIFI_SUPABASE_UPLOAD 1
 
 #define AP_PASS "topbox123"
 #define CAM_SERVER_PORT 8080
@@ -92,7 +92,7 @@ static const uint8_t HOTSPOT_COUNT = sizeof(HOTSPOTS) / sizeof(HOTSPOTS[0]);
 //   GND shared
 #define PROXY_UART_RX 22
 #define PROXY_UART_TX 21
-#define PROXY_UART_BAUD 115200
+#define PROXY_UART_BAUD 9600
 
 // Supabase Storage (matches ESP32-CAM sketch)
 #define SUPABASE_URL "https://lvpneakciqegwyymtqno.supabase.co"
@@ -177,6 +177,8 @@ static bool controllerContextRefreshQueued = false;
 bool apStarted = false;
 String relayDiag =
     ""; // Diagnostics forwarded to ESP32-CAM via HTTP response body
+static uint8_t hotspotScanStart = 0;
+static int8_t selectedHotspotCredential = -1;
 static bool photoUploadActive = false;
 static int photoUploadProgress = 0;
 static char photoUploadStatus[16] = "IDLE";
@@ -2195,7 +2197,8 @@ static int selectBestHotspot(char *ssidOut, size_t ssidLen,
     Serial.printf("[WIFI]   %s (%d dBm)\n", ssid.c_str(), WiFi.RSSI(i));
   }
 
-  for (uint8_t h = 0; h < HOTSPOT_COUNT && bestIdx < 0; h++) {
+  for (uint8_t offset = 0; offset < HOTSPOT_COUNT && bestIdx < 0; offset++) {
+    uint8_t h = (hotspotScanStart + offset) % HOTSPOT_COUNT;
     if (!HOTSPOTS[h].ssid || HOTSPOTS[h].ssid[0] == '\0') continue;
     for (int i = 0; i < n; i++) {
       if (WiFi.SSID(i) == HOTSPOTS[h].ssid && WiFi.RSSI(i) > bestRssi) {
@@ -2213,8 +2216,17 @@ static int selectBestHotspot(char *ssidOut, size_t ssidLen,
   ssidOut[ssidLen - 1] = '\0';
   strncpy(passOut, HOTSPOTS[bestCredential].password, passLen - 1);
   passOut[passLen - 1] = '\0';
+  selectedHotspotCredential = bestCredential;
   WiFi.scanDelete();
   return bestRssi;
+}
+
+static void advanceHotspotCandidate(const char *reason) {
+  if (selectedHotspotCredential >= 0 && HOTSPOT_COUNT > 0) {
+    hotspotScanStart = ((uint8_t)selectedHotspotCredential + 1) % HOTSPOT_COUNT;
+    Serial.printf("[WIFI] Advancing hotspot after %s; next scan starts at #%u\n",
+                  reason ? reason : "failure", hotspotScanStart);
+  }
 }
 
 static void startHotspotStation() {
@@ -2256,6 +2268,7 @@ static void startHotspotStation() {
     apStarted = true;
   } else {
     Serial.println("[WIFI] Hotspot connect failed; LTE fallback remains available");
+    advanceHotspotCandidate("connect_failed");
   }
 }
 
@@ -2339,7 +2352,11 @@ static uint8_t uartChecksum8(const char *text) {
 }
 
 static void beginProxyUart() {
+  pinMode(PROXY_UART_RX, INPUT_PULLUP);
+  pinMode(PROXY_UART_TX, OUTPUT);
+  digitalWrite(PROXY_UART_TX, HIGH);
   proxySerial.begin(PROXY_UART_BAUD, SERIAL_8N1, PROXY_UART_RX, PROXY_UART_TX);
+  proxySerial.setTimeout(5000);
   Serial.printf("[PROXY-UART] Serial2 ready RX=%d TX=%d baud=%d\n",
                 PROXY_UART_RX, PROXY_UART_TX, PROXY_UART_BAUD);
 }
@@ -2351,6 +2368,9 @@ static void sendProxyUartResponse(uint16_t id, int status, const String &body) {
   proxySerial.print("|");
   if (sum < 16) proxySerial.print("0");
   proxySerial.println(sum, HEX);
+  proxySerial.flush();
+  Serial.printf("[PROXY-UART] Response id=%u status=%d len=%u\n",
+                (unsigned int)id, status, (unsigned int)body.length());
 }
 
 static String buildControllerOtpBody() {
@@ -2461,9 +2481,7 @@ static void handleProxyUartRequest(const String &line) {
     sendProxyUartResponse(id, 200, buildDiagBody());
   } else if (method == "GET" && path.startsWith("/refresh-context")) {
     bool ok = wifiCloudHealthy || lteConnected;
-    if (ok && !modemHttpBusy) {
-      refreshAuthoritativeDeliveryFieldsFromFirebase();
-    } else if (ok) {
+    if (ok) {
       controllerContextRefreshQueued = true;
     }
     sendProxyUartResponse(id, 200, ok ? "OK" : "NO_CLOUD");
@@ -2688,46 +2706,71 @@ bool uploadClientToSupabaseViaLTE(WiFiClient &source, size_t len,
   relayDiag = "";
 #if USE_WIFI_SUPABASE_UPLOAD
   if (cloudWifiAvailable()) {
-    uint8_t *buf = (uint8_t *)malloc(len);
-    if (buf) {
-      size_t received = 0;
-      unsigned long deadline = millis() + 30000;
-      while (received < len && millis() < deadline) {
-        if (source.available()) {
-          received += source.readBytes(buf + received, len - received);
+    // Max buffer for WiFi path. Preview images are ~10-15KB; full proofs
+    // can be ~40KB. Beyond this cap we fall through to LTE chunked relay.
+    static const size_t WIFI_BUF_CAP = 48 * 1024;
+
+    if (len <= WIFI_BUF_CAP) {
+      uint8_t *buf = (uint8_t *)malloc(len);
+      if (buf) {
+        // ── Step 1: Drain the camera stream into RAM quickly ──
+        // We MUST finish reading before starting the TLS handshake
+        // to Supabase, otherwise the camera's HTTPClient times out
+        // waiting for the proxy to accept its payload (HTTP -3).
+        source.setTimeout(15000);
+        size_t received = 0;
+        unsigned long deadline = millis() + 20000;
+        while (received < len && millis() < deadline) {
+          if (source.available()) {
+            size_t chunk = source.readBytes(buf + received, len - received);
+            received += chunk;
+          } else {
+            delay(2);
+            esp_task_wdt_reset();
+          }
+        }
+
+        if (received == len) {
+          // ── Step 2: Upload buffered data to Supabase via WiFi ──
+          Serial.printf("[RELAY] WiFi upload: buffered %u bytes, starting HTTPS...\n", len);
+          WiFiClientSecure secure;
+          secure.setInsecure();
+          HTTPClient http;
+          String url = String(SUPABASE_URL) + "/storage/v1/object/" +
+                       String(SUPABASE_BUCKET) + "/" + objectPath;
+          bool ok = false;
+
+          if (http.begin(secure, url)) {
+            http.addHeader("Content-Type", "image/jpeg");
+            http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
+            http.setTimeout(30000);
+            int code = http.POST(buf, len);
+            ok = (code == 200 || code == 201);
+            relayDiag = ok ? "OK:wifi_supabase"
+                            : ("FAIL:wifi_supabase_http_" + String(code));
+            Serial.printf("[RELAY] WiFi Supabase upload HTTP %d\n", code);
+            http.end();
+          }
+
+          if (!ok && lteConnected) {
+            // Buffer is still valid — try LTE with the in-memory copy
+            ok = uploadToSupabaseViaLTE(buf, len, objectPath);
+          }
+          free(buf);
+          return ok;
         } else {
-          delay(5);
-          yield();
+          free(buf);
+          relayDiag = "FAIL:wifi_read_timeout";
+          Serial.printf("[RELAY] WiFi buf read timeout: got %u/%u\n",
+                        (unsigned)received, (unsigned)len);
         }
-      }
-      if (received == len) {
-        WiFiClientSecure secure;
-        secure.setInsecure();
-        HTTPClient http;
-        String url = String(SUPABASE_URL) + "/storage/v1/object/" +
-                     String(SUPABASE_BUCKET) + "/" + objectPath;
-        bool ok = false;
-        if (http.begin(secure, url)) {
-          http.addHeader("Content-Type", "image/jpeg");
-          http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
-          http.setTimeout(30000);
-          int code = http.POST(buf, len);
-          ok = (code == 200 || code == 201);
-          relayDiag = ok ? "OK:wifi_supabase" : ("FAIL:wifi_supabase_http_" + String(code));
-          Serial.printf("[RELAY] WiFi Supabase upload HTTP %d\n", code);
-          http.end();
-        }
-        if (!ok && lteConnected) {
-          ok = uploadToSupabaseViaLTE(buf, len, objectPath);
-        }
-        free(buf);
-        return ok;
       } else {
-        free(buf);
-        relayDiag = "FAIL:wifi_read_timeout";
+        relayDiag = "FAIL:wifi_upload_oom";
+        Serial.printf("[RELAY] WiFi buf OOM for %u bytes\n", (unsigned)len);
       }
     } else {
-      relayDiag = "FAIL:wifi_upload_oom";
+      Serial.printf("[RELAY] Image %u bytes > WiFi cap %u, using LTE stream\n",
+                    (unsigned)len, (unsigned)WIFI_BUF_CAP);
     }
   }
 #endif
