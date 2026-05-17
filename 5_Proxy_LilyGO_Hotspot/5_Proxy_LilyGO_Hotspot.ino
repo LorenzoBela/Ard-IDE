@@ -2718,9 +2718,9 @@ bool uploadClientToSupabaseViaLTE(WiFiClient &source, size_t len,
         // We MUST finish reading before starting the TLS handshake
         // to Supabase, otherwise the camera's HTTPClient times out
         // waiting for the proxy to accept its payload (HTTP -3).
-        source.setTimeout(15000);
+        source.setTimeout(10000);
         size_t received = 0;
-        unsigned long deadline = millis() + 20000;
+        unsigned long deadline = millis() + 15000;
         while (received < len && millis() < deadline) {
           if (source.available()) {
             size_t chunk = source.readBytes(buf + received, len - received);
@@ -2733,6 +2733,7 @@ bool uploadClientToSupabaseViaLTE(WiFiClient &source, size_t len,
 
         if (received == len) {
           // ── Step 2: Upload buffered data to Supabase via WiFi ──
+          unsigned long uploadStart = millis();
           Serial.printf("[RELAY] WiFi upload: buffered %u bytes, starting HTTPS...\n", len);
           WiFiClientSecure secure;
           secure.setInsecure();
@@ -2744,12 +2745,13 @@ bool uploadClientToSupabaseViaLTE(WiFiClient &source, size_t len,
           if (http.begin(secure, url)) {
             http.addHeader("Content-Type", "image/jpeg");
             http.addHeader("Authorization", String("Bearer ") + SUPABASE_ANON_KEY);
-            http.setTimeout(30000);
+            http.setTimeout(60000);
             int code = http.POST(buf, len);
             ok = (code == 200 || code == 201);
             relayDiag = ok ? "OK:wifi_supabase"
                             : ("FAIL:wifi_supabase_http_" + String(code));
-            Serial.printf("[RELAY] WiFi Supabase upload HTTP %d\n", code);
+            Serial.printf("[RELAY] WiFi Supabase upload HTTP %d (%u bytes in %lums)\n",
+                          code, (unsigned)len, millis() - uploadStart);
             http.end();
           }
 
@@ -5383,7 +5385,22 @@ void handleCameraClient() {
         bool usedPhoneFallback = false;
         distMeters = (int)geoProxy.snap.distanceM;
 
+        // CRITICAL: Force an inline phone location refresh if we have no GPS
+        // AND phone data is stale/missing. The main-loop refresh might not have
+        // run yet (modem was busy with hardware fetch) — we need fresh phone
+        // data RIGHT NOW for the pickup geofence during GPS-loss.
         bool phoneOk = phoneFixValid;
+        if (!phoneOk && !modemHttpBusy && lteConnected) {
+          Serial.println("[AP] GEO: No GPS + no phone data — forcing inline phone refresh");
+          lastPhoneFetchAtMs = 0;  // Reset rate limiter
+          refreshPhoneLocationIfNeeded();
+          phoneOk = phoneFixValid;
+          if (phoneOk) {
+            Serial.println("[AP] GEO: Inline phone refresh SUCCESS");
+          } else {
+            Serial.println("[AP] GEO: Inline phone refresh FAILED (no data in Firebase)");
+          }
+        }
         bool phoneFresh = false;
         unsigned long phoneAgeSec = 0;
         if (phoneOk) {
@@ -5463,6 +5480,40 @@ void handleCameraClient() {
           Serial.println("[AP] GPS-loss fallback: RETURNING status + returnActive, granting GEO:1");
         } else if (insideGeo && usedLastConfirmed && !usedPhoneFallback) {
           Serial.println("[AP] GPS-loss fallback: using last confirmed ARRIVED state");
+        }
+
+        // PICKUP-phase last-resort: if we're in PICKUP (not return, not ARRIVED),
+        // pickupCoordsValid is true, and pickupInside is STILL false after all
+        // fallbacks, try one more forced phone refresh before giving up.
+        if (!returnActive && pickupCoordsValid && !pickupInside &&
+            strcmp(cachedDeliveryStatus, "ARRIVED") != 0 &&
+            strcmp(cachedDeliveryStatus, "IN_TRANSIT") != 0 &&
+            strcmp(cachedDeliveryStatus, "PICKED_UP") != 0) {
+          // We're in PICKUP phase with no way to verify location.
+          // If phone data exists but was stale, try refreshing once more.
+          if (!phoneOk && !modemHttpBusy && lteConnected) {
+            lastPhoneFetchAtMs = 0;
+            refreshPhoneLocationIfNeeded();
+            if (phoneFixValid) {
+              // Re-evaluate pickup with freshly fetched phone location
+              double pDist = haversineMeters(phoneLat, phoneLon, pickupLat, pickupLon);
+              if (pDist <= GEO_OUTER_RADIUS_M) {
+                pickupInside = true;
+                distMeters = (int)(pDist + 0.5);
+                Serial.printf("[AP] PICKUP last-resort phone refresh -> dist=%.0fm -> PUP:1\n", pDist);
+              } else {
+                Serial.printf("[AP] PICKUP last-resort phone refresh -> dist=%.0fm (too far) -> PUP:0\n", pDist);
+              }
+            }
+          }
+          if (!pickupInside) {
+            Serial.printf("[AP] PICKUP geofence BLOCKED: gps=%d/%d phoneFix=%d pickupValid=%d "
+                          "gpsAt0=%d modemBusy=%d lte=%d\n",
+                          gpsFix, (gpsLat != 0.0 || gpsLon != 0.0) ? 1 : 0,
+                          phoneFixValid ? 1 : 0, pickupCoordsValid ? 1 : 0,
+                          (gpsLat == 0.0 && gpsLon == 0.0) ? 1 : 0,
+                          modemHttpBusy ? 1 : 0, lteConnected ? 1 : 0);
+          }
         }
       } else if (!haveTargets && activeContextForController) {
         // Destination coords missing (Firebase JSON truncated, field not yet
@@ -6258,7 +6309,7 @@ static bool refreshTargetCoordsFromDelivery(const char *deliveryId) {
     }
   }
 
-  return destCoordsValid;
+  return destCoordsValid || pickupCoordsValid;
 }
 
 static bool fetchFirebaseStringValue(const char *path, char *out, size_t outLen) {

@@ -78,12 +78,12 @@ char PROXY_HOST[16] = "";
 
 char DEVICE_ID[24] = "OV3660_CAM_001";
 #define FILE_PREFIX "capture"
-#define MAX_UPLOAD_RETRIES 3
-#define UPLOAD_RETRY_BASE_MS 5000
+#define MAX_UPLOAD_RETRIES 6
+#define UPLOAD_RETRY_BASE_MS 2000
 #define UPLOAD_RETRY_MAX_MS 60000
 
 // ===================== DETECTION CONFIG =====================
-#define DETECTION_COOLDOWN_MS 5000 // Min time between uploads
+#define DETECTION_COOLDOWN_MS 2000 // Min time between uploads
 #define PREVIEW_FRAME_SIZE FRAMESIZE_VGA
 #define PREVIEW_JPEG_QUALITY 12
 #define UPLOAD_FRAME_SIZE FRAMESIZE_SVGA

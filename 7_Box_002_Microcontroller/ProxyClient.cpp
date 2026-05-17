@@ -13,6 +13,18 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
+#ifndef DISABLE_PROXY_UART
+#define DISABLE_PROXY_UART 0
+#endif
+
+#ifndef DISABLE_PROXY_KEEPALIVE
+#define DISABLE_PROXY_KEEPALIVE 0
+#endif
+
+#ifndef PROXY_UART_TIMEOUT_MS
+#define PROXY_UART_TIMEOUT_MS 300
+#endif
+
 // ── Box identity (populated by scanForProxy()) ──
 char WIFI_SSID[33]     = "";
 char WIFI_PASSWORD[65] = "";
@@ -61,6 +73,7 @@ static void clearDiscoveredProxy(const char *reason) {
   PROXY_HOST[0] = '\0';
 }
 
+#if !DISABLE_PROXY_UART
 static uint8_t checksum8(const char *text) {
   uint8_t sum = 0;
   if (!text) return 0;
@@ -241,13 +254,44 @@ static bool proxyUartPrimaryRequest(const char *method, const char *path,
   if (proxyUartFailCount < 20) {
     proxyUartFailCount++;
   }
-  unsigned long cooldown = 250UL + ((unsigned long)proxyUartFailCount * 150UL);
-  if (cooldown > 1500UL) {
-    cooldown = 1500UL;
+  unsigned long cooldown = 5000UL + ((unsigned long)proxyUartFailCount * 500UL);
+  if (cooldown > 10000UL) {
+    cooldown = 10000UL;
   }
   proxyUartRetryAt = now + cooldown;
   return false;
 }
+#else
+static void startProxyUart() {}
+
+static void resetProxyUart(const char *reason) {
+  (void)reason;
+}
+
+static bool proxyUartRequest(const char *method, const char *path,
+                             const char *payload, String &bodyOut,
+                             unsigned long timeoutMs = 0) {
+  (void)method;
+  (void)path;
+  (void)payload;
+  (void)bodyOut;
+  (void)timeoutMs;
+  return false;
+}
+
+static bool proxyUartPrimaryRequest(const char *method, const char *path,
+                                    const char *payload, String &bodyOut,
+                                    unsigned long timeoutMs,
+                                    bool force = false) {
+  (void)method;
+  (void)path;
+  (void)payload;
+  (void)bodyOut;
+  (void)timeoutMs;
+  (void)force;
+  return false;
+}
+#endif
 
 static bool discoverProxyUdp(unsigned long timeoutMs = 1200) {
   if (WiFi.status() != WL_CONNECTED) return false;
@@ -315,7 +359,7 @@ static bool discoverProxyUdp(unsigned long timeoutMs = 1200) {
 
 // ── Fetch reliability controls ──
 static const uint16_t FETCH_HTTP_TIMEOUT_MS = 5000;
-static const uint16_t REFRESH_HTTP_TIMEOUT_MS = 15000;
+static const uint16_t REFRESH_HTTP_TIMEOUT_MS = 2500;
 static unsigned long lastFetchSuccessAt = 0;
 static uint8_t fetchFailCount = 0;
 static const uint8_t FETCH_FAIL_RESET_THRESHOLD = 20;
@@ -447,7 +491,7 @@ bool scanForProxy() {
 #endif
   }
 
-  for (uint8_t offset = 0; offset < HOTSPOT_COUNT && bestIdx < 0; offset++) {
+  for (uint8_t offset = 0; offset < HOTSPOT_COUNT; offset++) {
     uint8_t h = (hotspotScanStart + offset) % HOTSPOT_COUNT;
     if (!HOTSPOTS[h].ssid || HOTSPOTS[h].ssid[0] == '\0') continue;
     for (int i = 0; i < n; i++) {
@@ -922,40 +966,31 @@ static void parseOtpBody(const String &body) {
 bool fetchDeliveryContext() {
   String uartBody;
 
-  // Treat UART as a primary control transport too. If the dedicated RX/TX
-  // link is healthy, boot context does not wait on WiFi discovery/TCP.
-  if (proxyUartPrimaryRequest("GET", "/otp", "", uartBody,
-                              PROXY_UART_TIMEOUT_MS)) {
-    netLog("[FETCH] UART primary OK\n");
-    parseOtpBody(uartBody);
-    return true;
-  }
-
   if (WiFi.status() != WL_CONNECTED) {
-    netLog("[FETCH] Skip — no primary transport available\n");
     closePersistentConnection();
-    return false;
-  }
-
-  String httpBody;
-  int httpCode = httpGetOnce("/otp", httpBody, REFRESH_HTTP_TIMEOUT_MS);
-  if (httpCode == 200) {
-    parseOtpBody(httpBody);
-    return true;
-  }
-  if (httpCode > 0) {
-    noteFetchFailure("http_non_200");
-    return false;
-  }
-
-  // Ensure persistent TCP socket is alive.
-  if (!ensurePersistentConnection()) {
     if (proxyUartPrimaryRequest("GET", "/otp", "", uartBody,
-                                PROXY_UART_TIMEOUT_MS, true)) {
-      netLog("[FETCH] UART retry OK\n");
+                                PROXY_UART_TIMEOUT_MS)) {
+      netLog("[FETCH] UART fallback OK\n");
       parseOtpBody(uartBody);
       return true;
     }
+    netLog("[FETCH] Skip — no primary transport available\n");
+    return false;
+  }
+
+#if DISABLE_PROXY_KEEPALIVE
+  String body = "";
+  int code = httpGetOnce("/otp", body, FETCH_HTTP_TIMEOUT_MS);
+  netLog("[FETCH] HTTP %d\n", code);
+  if (code != 200) {
+    noteFetchFailure("http_non_200");
+    return false;
+  }
+  parseOtpBody(body);
+  return true;
+#else
+  // Ensure persistent TCP socket is alive.
+  if (!ensurePersistentConnection()) {
     noteFetchFailure("tcp_connect");
     return false;
   }
@@ -976,12 +1011,6 @@ bool fetchDeliveryContext() {
     closePersistentConnection();
     // One retry with fresh connection
     if (!ensurePersistentConnection()) {
-      if (proxyUartPrimaryRequest("GET", "/otp", "", uartBody,
-                                  PROXY_UART_TIMEOUT_MS, true)) {
-        netLog("[FETCH] UART retry OK\n");
-        parseOtpBody(uartBody);
-        return true;
-      }
       noteFetchFailure("tcp_retry");
       return false;
     }
@@ -994,12 +1023,6 @@ bool fetchDeliveryContext() {
     body = "";
     code = readHttpResponse(body, REFRESH_HTTP_TIMEOUT_MS);
     if (code < 0) {
-      if (proxyUartPrimaryRequest("GET", "/otp", "", uartBody,
-                                  PROXY_UART_TIMEOUT_MS, true)) {
-        netLog("[FETCH] UART retry OK\n");
-        parseOtpBody(uartBody);
-        return true;
-      }
       noteFetchFailure("http_retry");
       closePersistentConnection();
       return false;
@@ -1009,42 +1032,40 @@ bool fetchDeliveryContext() {
   netLog("[FETCH] HTTP %d\n", code);
   if (code != 200) {
     noteFetchFailure("http_non_200");
-    if (proxyUartPrimaryRequest("GET", "/otp", "", uartBody,
-                                PROXY_UART_TIMEOUT_MS, true)) {
-      netLog("[FETCH] UART OK\n");
-      parseOtpBody(uartBody);
-      return true;
-    }
     return false;
   }
 
   parseOtpBody(body);
   return true;
+#endif
 }
 
 bool requestContextRefresh() {
   String uartBody;
 
-  if (proxyUartPrimaryRequest("GET", "/refresh-context", "", uartBody,
-                              PROXY_UART_TIMEOUT_MS)) {
-    uartBody.trim();
-    netLog("[REFRESH] UART primary body='%s'\n", uartBody.c_str());
-    return uartBody.startsWith("OK");
-  }
-
   if (WiFi.status() != WL_CONNECTED) {
-    netLog("[REFRESH] Skip — no primary transport available\n");
     closePersistentConnection();
+    if (proxyUartPrimaryRequest("GET", "/refresh-context", "", uartBody,
+                                PROXY_UART_TIMEOUT_MS)) {
+      uartBody.trim();
+      netLog("[REFRESH] UART fallback body='%s'\n", uartBody.c_str());
+      return uartBody.startsWith("OK");
+    }
+    netLog("[REFRESH] Skip — no primary transport available\n");
     return false;
   }
 
+#if DISABLE_PROXY_KEEPALIVE
+  String body = "";
+  int code = httpGetOnce("/refresh-context", body, FETCH_HTTP_TIMEOUT_MS);
+  body.trim();
+  netLog("[REFRESH] HTTP %d body='%s'\n", code, body.c_str());
+  if (code == 200 && body.startsWith("OK")) {
+    return true;
+  }
+  return false;
+#else
   if (!ensurePersistentConnection()) {
-    if (proxyUartPrimaryRequest("GET", "/refresh-context", "", uartBody,
-                                PROXY_UART_TIMEOUT_MS, true)) {
-      uartBody.trim();
-      netLog("[REFRESH] UART retry body='%s'\n", uartBody.c_str());
-      return uartBody.startsWith("OK");
-    }
     netLog("[REFRESH] TCP connect failed\n");
     return false;
   }
@@ -1062,12 +1083,6 @@ bool requestContextRefresh() {
     netLog("[REFRESH] Read failed — reconnecting\n");
     closePersistentConnection();
     if (!ensurePersistentConnection()) {
-      if (proxyUartPrimaryRequest("GET", "/refresh-context", "", uartBody,
-                                  PROXY_UART_TIMEOUT_MS, true)) {
-        uartBody.trim();
-        netLog("[REFRESH] UART retry body='%s'\n", uartBody.c_str());
-        return uartBody.startsWith("OK");
-      }
       netLog("[REFRESH] TCP retry failed\n");
       return false;
     }
@@ -1080,12 +1095,6 @@ bool requestContextRefresh() {
     body = "";
     code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
     if (code < 0) {
-      if (proxyUartPrimaryRequest("GET", "/refresh-context", "", uartBody,
-                                  PROXY_UART_TIMEOUT_MS, true)) {
-        uartBody.trim();
-        netLog("[REFRESH] UART retry body='%s'\n", uartBody.c_str());
-        return uartBody.startsWith("OK");
-      }
       netLog("[REFRESH] Retry failed\n");
       closePersistentConnection();
       return false;
@@ -1097,33 +1106,32 @@ bool requestContextRefresh() {
   if (code == 200 && body.startsWith("OK")) {
     return true;
   }
-  if (proxyUartPrimaryRequest("GET", "/refresh-context", "", uartBody,
-                              PROXY_UART_TIMEOUT_MS, true)) {
-    uartBody.trim();
-    netLog("[REFRESH] UART retry body='%s'\n", uartBody.c_str());
-    return uartBody.startsWith("OK");
-  }
   return false;
+#endif
 }
 
 bool requestProxyPing() {
   String uartBody;
 
-  if (proxyUartPrimaryRequest("GET", "/ping", "", uartBody, PROXY_UART_TIMEOUT_MS)) {
-    uartBody.trim();
-    return uartBody.startsWith("OK");
-  }
-
   if (WiFi.status() != WL_CONNECTED) {
     closePersistentConnection();
-    return false;
-  }
-
-  if (!ensurePersistentConnection()) {
-    if (proxyUartPrimaryRequest("GET", "/ping", "", uartBody, PROXY_UART_TIMEOUT_MS, true)) {
+    if (proxyUartPrimaryRequest("GET", "/ping", "", uartBody, PROXY_UART_TIMEOUT_MS)) {
       uartBody.trim();
       return uartBody.startsWith("OK");
     }
+    return false;
+  }
+
+#if DISABLE_PROXY_KEEPALIVE
+  String body = "";
+  int code = httpGetOnce("/ping", body, 1000);
+  body.trim();
+  if (code == 200 && body.startsWith("OK")) {
+    return true;
+  }
+  return false;
+#else
+  if (!ensurePersistentConnection()) {
     return false;
   }
 
@@ -1138,10 +1146,6 @@ bool requestProxyPing() {
   int code = readHttpResponse(body, 1000);
   if (code < 0) {
     closePersistentConnection();
-    if (proxyUartPrimaryRequest("GET", "/ping", "", uartBody, PROXY_UART_TIMEOUT_MS, true)) {
-      uartBody.trim();
-      return uartBody.startsWith("OK");
-    }
     return false;
   }
 
@@ -1149,11 +1153,8 @@ bool requestProxyPing() {
   if (code == 200 && body.startsWith("OK")) {
     return true;
   }
-  if (proxyUartPrimaryRequest("GET", "/ping", "", uartBody, PROXY_UART_TIMEOUT_MS, true)) {
-    uartBody.trim();
-    return uartBody.startsWith("OK");
-  }
   return false;
+#endif
 }
 
 bool fetchDiagnostics(ControllerDiagData &out) {
@@ -1326,19 +1327,29 @@ bool fetchDiagnostics(ControllerDiagData &out) {
 static int sendRawPost(const char *path, const char *json) {
   String uartBody;
 
-  if (proxyUartPrimaryRequest("POST", path, json, uartBody,
-                              PROXY_UART_TIMEOUT_MS)) {
-    return 200;
-  }
-
   if (WiFi.status() != WL_CONNECTED) {
-    return -1;
-  }
-  if (!ensurePersistentConnection()) {
     if (proxyUartPrimaryRequest("POST", path, json, uartBody,
-                                PROXY_UART_TIMEOUT_MS, true)) {
+                                PROXY_UART_TIMEOUT_MS)) {
       return 200;
     }
+    return -1;
+  }
+#if DISABLE_PROXY_KEEPALIVE
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
+    return -1;
+  }
+  WiFiClient client;
+  HTTPClient http;
+  char url[96];
+  snprintf(url, sizeof(url), "http://%s:%d%s", PROXY_HOST, PROXY_PORT, path);
+  http.setTimeout(FETCH_HTTP_TIMEOUT_MS);
+  http.begin(client, url);
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST((uint8_t *)json, strlen(json));
+  http.end();
+  return code;
+#else
+  if (!ensurePersistentConnection()) {
     return -1;
   }
 
@@ -1360,10 +1371,6 @@ static int sendRawPost(const char *path, const char *json) {
     netLog("[POST] %s failed — reconnecting\n", path);
     closePersistentConnection();
     if (!ensurePersistentConnection()) {
-      if (proxyUartPrimaryRequest("POST", path, json, uartBody,
-                                  PROXY_UART_TIMEOUT_MS, true)) {
-        return 200;
-      }
       return -1;
     }
     persistentClient.printf(
@@ -1378,20 +1385,11 @@ static int sendRawPost(const char *path, const char *json) {
     code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
     if (code < 0) {
       closePersistentConnection();
-      if (proxyUartPrimaryRequest("POST", path, json, uartBody,
-                                  PROXY_UART_TIMEOUT_MS, true)) {
-        return 200;
-      }
       return -1;
     }
   }
-  if (code < 200 || code >= 300) {
-    if (proxyUartPrimaryRequest("POST", path, json, uartBody,
-                                PROXY_UART_TIMEOUT_MS, true)) {
-      return 200;
-    }
-  }
   return code;
+#endif
 }
 
 // ==================== REPORT EVENT ====================
@@ -1482,21 +1480,15 @@ bool requestCameraPowerMode(bool wakeMode) {
   String uartBody;
   const char *path = wakeMode ? "/cam-power?mode=wake" : "/cam-power?mode=sleep";
 
-  if (proxyUartPrimaryRequest("GET", path, "", uartBody,
-                              PROXY_UART_TIMEOUT_MS)) {
-    uartBody.trim();
-    return uartBody.indexOf("CAM_") >= 0 || uartBody.indexOf("OK") >= 0;
-  }
-
   if (WiFi.status() != WL_CONNECTED) {
-    return false;
-  }
-  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
     if (proxyUartPrimaryRequest("GET", path, "", uartBody,
-                                PROXY_UART_TIMEOUT_MS, true)) {
+                                PROXY_UART_TIMEOUT_MS)) {
       uartBody.trim();
       return uartBody.indexOf("CAM_") >= 0 || uartBody.indexOf("OK") >= 0;
     }
+    return false;
+  }
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
     return false;
   }
 
@@ -1521,11 +1513,6 @@ bool requestCameraPowerMode(bool wakeMode) {
   }
 
   http.end();
-  if (!ok && proxyUartPrimaryRequest("GET", path, "", uartBody,
-                                     PROXY_UART_TIMEOUT_MS, true)) {
-    uartBody.trim();
-    ok = uartBody.indexOf("CAM_") >= 0 || uartBody.indexOf("OK") >= 0;
-  }
   return ok;
 }
 
@@ -1555,21 +1542,15 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
 
   String uartBody;
 
-  if (proxyUartPrimaryRequest("POST", "/personal-pin-verify", json, uartBody,
-                              PROXY_UART_TIMEOUT_MS)) {
-    uartBody.trim();
-    return parsePersonalPinResponse(uartBody);
-  }
-
   if (WiFi.status() != WL_CONNECTED) {
-    return 0;
-  }
-  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
     if (proxyUartPrimaryRequest("POST", "/personal-pin-verify", json, uartBody,
-                                PROXY_UART_TIMEOUT_MS, true)) {
+                                PROXY_UART_TIMEOUT_MS)) {
       uartBody.trim();
       return parsePersonalPinResponse(uartBody);
     }
+    return 0;
+  }
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
     return -2;
   }
 
@@ -1587,11 +1568,6 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
     Serial.printf("[PIN] verify HTTP %d\n", code);
 #endif
     http.end();
-    if (proxyUartPrimaryRequest("POST", "/personal-pin-verify", json, uartBody,
-                                PROXY_UART_TIMEOUT_MS, true)) {
-      uartBody.trim();
-      return parsePersonalPinResponse(uartBody);
-    }
     return -2;
   }
 
@@ -1602,11 +1578,6 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
   int parsed = parsePersonalPinResponse(body);
   if (parsed != 0) {
     return parsed;
-  }
-  if (proxyUartPrimaryRequest("POST", "/personal-pin-verify", json, uartBody,
-                              PROXY_UART_TIMEOUT_MS, true)) {
-    uartBody.trim();
-    return parsePersonalPinResponse(uartBody);
   }
   return 0;
 }
@@ -1623,14 +1594,6 @@ int requestFaceCheck() {
   }
 
   String uartBody;
-
-  if (proxyUartPrimaryRequest("GET", facePath, "", uartBody,
-                              FACE_CHECK_WIFI_TIMEOUT_MS)) {
-    uartBody.trim();
-    if (uartBody.indexOf("FACE_OK") >= 0) return 1;
-    if (uartBody.indexOf("NO_FACE_LOW_LIGHT") >= 0) return 2;
-    if (uartBody.indexOf("NO_FACE") >= 0) return 0;
-  }
 
   // ── WiFi via proxy ──
   if (WiFi.status() == WL_CONNECTED) {
@@ -1675,13 +1638,18 @@ int requestFaceCheck() {
     }
     }
   }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return -1;
+  }
+
   // ── Fallback: UART Serial2 to ESP32-CAM directly ──
 #if CONTROLLER_VERBOSE_LOGS
       Serial.println(F("[FACE] WiFi down — trying UART fallback..."));
 #endif
 
   if (proxyUartPrimaryRequest("GET", facePath, "", uartBody,
-                              FACE_CHECK_WIFI_TIMEOUT_MS, true)) {
+                              FACE_CHECK_WIFI_TIMEOUT_MS)) {
     uartBody.trim();
     if (uartBody.indexOf("FACE_OK") >= 0) return 1;
     if (uartBody.indexOf("NO_FACE_LOW_LIGHT") >= 0) return 2;
