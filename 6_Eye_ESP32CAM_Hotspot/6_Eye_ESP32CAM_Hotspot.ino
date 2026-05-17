@@ -63,6 +63,7 @@ char PROXY_HOST[16] = "";
 #define PROXY_DISCOVERY_PORT 5115
 #define PROXY_DISCOVERY_QUERY "SMART_TOP_BOX_PROXY?"
 #define PROXY_DISCOVERY_REPLY "SMART_TOP_BOX_PROXY:"
+#define CAM_ANNOUNCE_INTERVAL_MS 5000
 
 // Supabase credentials kept here for reference (used by GPS/LTE board for
 // relay)
@@ -165,6 +166,7 @@ static unsigned long wifiNextAttemptAt = 0;
 static unsigned long wifiBackoffMs = WIFI_RETRY_BASE_MS;
 static unsigned long wifiReconnectStartAt = 0;
 static unsigned long lastWifiReconnectLatencyMs = 0;
+static unsigned long lastCamAnnounceAt = 0;
 
 // Write telemetry (hourly)
 static unsigned long camNvsWritesThisWindow = 0;
@@ -553,7 +555,7 @@ void scanForProxyAP() {
     Serial.printf("[WIFI]   %s (%d dBm)\n", ssid.c_str(), WiFi.RSSI(i));
   }
 
-  for (uint8_t h = 0; h < HOTSPOT_COUNT && bestIdx < 0; h++) {
+  for (uint8_t h = 0; h < HOTSPOT_COUNT; h++) {
     if (!HOTSPOTS[h].ssid || HOTSPOTS[h].ssid[0] == '\0') continue;
     for (int i = 0; i < n; i++) {
       if (WiFi.SSID(i) == HOTSPOTS[h].ssid && WiFi.RSSI(i) > bestRssi) {
@@ -693,6 +695,29 @@ bool discoverProxyUdp(unsigned long timeoutMs = 1500) {
   discovery.stop();
   Serial.println(F("[DISCOVERY] Proxy not found"));
   return false;
+}
+
+static void announceCamToProxy() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  unsigned long now = millis();
+  if (now - lastCamAnnounceAt < CAM_ANNOUNCE_INTERVAL_MS) return;
+  lastCamAnnounceAt = now;
+
+  if (PROXY_HOST[0] != '\0') {
+    IPAddress proxyIp;
+    if (proxyIp.fromString(PROXY_HOST)) {
+      udpClient.beginPacket(proxyIp, PROXY_DISCOVERY_PORT);
+      udpClient.print("SMART_TOP_BOX_CAM:");
+      udpClient.print(DEVICE_ID);
+      udpClient.endPacket();
+    }
+  }
+
+  IPAddress broadcast((uint32_t)WiFi.localIP() | ~(uint32_t)WiFi.subnetMask());
+  udpClient.beginPacket(broadcast, PROXY_DISCOVERY_PORT);
+  udpClient.print("SMART_TOP_BOX_CAM:");
+  udpClient.print(DEVICE_ID);
+  udpClient.endPacket();
 }
 
 bool connectWiFi(unsigned long timeoutMs = WIFI_BOOT_CONNECT_TIMEOUT_MS) {
@@ -2004,6 +2029,7 @@ void handleFaceStatusClient() {
 void loop() {
   handleSerialCommands();
   maintainWiFiConnection();
+  announceCamToProxy();
   maybePublishWriteMetrics(millis());
   handleFaceStatusClient(); // On-demand face-check via WiFi (from proxy)
   handleUartFaceCommand();  // On-demand face-check via UART (from Tester)

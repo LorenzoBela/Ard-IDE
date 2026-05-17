@@ -90,6 +90,7 @@ static const uint8_t HOTSPOT_COUNT = sizeof(HOTSPOTS) / sizeof(HOTSPOTS[0]);
 //   LilyGO GPIO21 TX -> Controller GPIO33 RX
 //   LilyGO GPIO22 RX <- Controller GPIO27 TX
 //   GND shared
+#define DISABLE_PROXY_UART 1
 #define PROXY_UART_RX 22
 #define PROXY_UART_TX 21
 #define PROXY_UART_BAUD 9600
@@ -2197,7 +2198,7 @@ static int selectBestHotspot(char *ssidOut, size_t ssidLen,
     Serial.printf("[WIFI]   %s (%d dBm)\n", ssid.c_str(), WiFi.RSSI(i));
   }
 
-  for (uint8_t offset = 0; offset < HOTSPOT_COUNT && bestIdx < 0; offset++) {
+  for (uint8_t offset = 0; offset < HOTSPOT_COUNT; offset++) {
     uint8_t h = (hotspotScanStart + offset) % HOTSPOT_COUNT;
     if (!HOTSPOTS[h].ssid || HOTSPOTS[h].ssid[0] == '\0') continue;
     for (int i = 0; i < n; i++) {
@@ -4528,7 +4529,7 @@ void refreshDeliveryContextFromFirebase() {
       if (targetChanged || !lastReturnActive) {
         geoProxy.setTarget(pickupLat, pickupLon);
         theftGuardSetGeofence((float)pickupLat, (float)pickupLon, TG_GEOFENCE_RADIUS_KM);
-        Serial.printf("[EC-32] Return mode: target->PICKUP %.6f, %.6f\n", pickupLat, pickupLon);
+        Serial.printf("[EC-32] Return mode: target->PICKUP %.6f, %.6f (hysteresis reset)\n", pickupLat, pickupLon);
       }
     } else if (!returnActive && destCoordsValid) {
       bool targetChanged = (geoProxy.targetLat != destLat) || (geoProxy.targetLon != destLon);
@@ -5322,12 +5323,15 @@ void handleCameraClient() {
       // Still calculate geofence status for the response fields (LCD distance display)
       // Diagnostic: log preconditions for geofence so serial monitor reveals why
       // the controller is seeing "No GPS" when it shouldn't be.
-      Serial.printf("[AP] GEO pre: destValid=%d gpsFix=%d delStatus='%s'\n",
-                    destCoordsValid, gpsFix, cachedDeliveryStatus);
+      Serial.printf("[AP] GEO pre: destValid=%d pickupValid=%d gpsFix=%d phoneOk=%d delStatus='%s'\n",
+                    destCoordsValid, pickupCoordsValid, gpsFix, phoneFixValid, cachedDeliveryStatus);
 
-    bool haveTargets = activeContextForController && destCoordsValid;
+    bool haveTargets = activeContextForController && (destCoordsValid || pickupCoordsValid);
     if (!haveTargets && activeContextForController && !modemHttpBusy) {
       haveTargets = refreshTargetCoordsFromDelivery(cachedDeliveryId);
+      // refreshTargetCoordsFromDelivery fetches both dest AND pickup coords,
+      // so re-check both after refresh.
+      if (!haveTargets && pickupCoordsValid) haveTargets = true;
     } else if (!haveTargets && activeContextForController && modemHttpBusy) {
       Serial.println("[AP] Target refresh deferred - modem busy");
     }
@@ -5361,6 +5365,19 @@ void handleCameraClient() {
           pickupInside = insideGeo;
         } else {
           dropoffInside = insideGeo;
+        }
+        // GPS-loss: also evaluate the pickup fence from the last known GPS
+        // position when pickup coords are available.  Without this, losing GPS
+        // indoors at the pickup location leaves pickupInside=false and locks
+        // the rider out of personal-PIN entry during PICKUP phase.
+        // gpsLat/gpsLon retain their last valid values after gpsFix drops.
+        if (!returnActive && pickupCoordsValid) {
+          double lastPickupDist = haversineMeters(gpsLat, gpsLon,
+                                                   pickupLat, pickupLon);
+          if (gpsLat != 0.0 && gpsLon != 0.0 &&
+              lastPickupDist <= GEO_OUTER_RADIUS_M) {
+            pickupInside = true;
+          }
         }
         bool usedLastConfirmed = insideGeo;
         bool usedPhoneFallback = false;
@@ -5435,6 +5452,15 @@ void handleCameraClient() {
           distMeters = 0;
           dropoffInside = true;
           Serial.println("[AP] GPS-loss fallback: Firebase status ARRIVED, granting GEO:1");
+        } else if (!insideGeo && returnActive &&
+                   strcmp(cachedDeliveryStatus, "RETURNING") == 0) {
+          // EC-32: During a return trip with no GPS, the mobile app already
+          // confirmed the rider is heading back. Grant GEO:1 so the controller
+          // can accept the return OTP at the pickup location.
+          insideGeo = true;
+          distMeters = 0;
+          pickupInside = true;
+          Serial.println("[AP] GPS-loss fallback: RETURNING status + returnActive, granting GEO:1");
         } else if (insideGeo && usedLastConfirmed && !usedPhoneFallback) {
           Serial.println("[AP] GPS-loss fallback: using last confirmed ARRIVED state");
         }
@@ -5448,6 +5474,11 @@ void handleCameraClient() {
           distMeters = 0;
           dropoffInside = true;
           Serial.println("[AP] No dest coords — Firebase ARRIVED override, granting GEO:1");
+        } else if (returnActive && strcmp(cachedDeliveryStatus, "RETURNING") == 0) {
+          insideGeo = true;
+          distMeters = 0;
+          pickupInside = true;
+          Serial.println("[AP] No dest coords — RETURNING override, granting GEO:1");
         } else {
           Serial.printf("[AP] No dest coords, delivery active but status='%s' — GEO:0\n",
                         cachedDeliveryStatus);
@@ -6831,7 +6862,11 @@ void setup() {
 
   // Initialize modem with proper power sequence
   modemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+#if !DISABLE_PROXY_UART
   beginProxyUart();
+#else
+  Serial.println("[PROXY-UART] Disabled (WiFi-first)");
+#endif
   powerModem();
 
   modemOK = initModem();
@@ -6989,7 +7024,9 @@ void loop() {
   maintainHotspotStation(now);
   pollWifiCloudHealth(now);
   pollDiscoveryServer();
+#if !DISABLE_PROXY_UART
   pollProxyUart();
+#endif
   enforceTamperSuppressionTimeout(now);
   maybeEvaluateConnectivityMatrix(now);
 

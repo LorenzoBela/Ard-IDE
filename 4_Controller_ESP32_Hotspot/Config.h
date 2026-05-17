@@ -12,7 +12,7 @@
 
 // Keep verbose subsystem logs off on the ESP32 controller. Direct boot
 // checkpoints in setup() stay active for crash isolation.
-#define CONTROLLER_VERBOSE_LOGS 0
+#define CONTROLLER_VERBOSE_LOGS 1
 
 #if CONTROLLER_VERBOSE_LOGS
 #define CTRL_LOG_PRINT(...) Serial.print(__VA_ARGS__)
@@ -56,7 +56,14 @@ static const int  PROXY_PORT   = 8080;
 // Hardware ID (derived from proxy's AP SSID at runtime)
 extern char HARDWARE_ID[12];
 
-// ==================== UART (ESP32-CAM fallback) ====================
+// TEMP: Disable HTTP keep-alive if the controller sees frequent read timeouts.
+#define DISABLE_PROXY_KEEPALIVE 1
+
+// ==================== UART (DISABLED — WiFi-only mode) ====================
+// RX/TX serial links temporarily disabled. All controller<->proxy
+// communication now goes through WiFi HTTP + UDP discovery.
+#define DISABLE_PROXY_UART 1
+
 #define CAM_UART_RX   16
 #define CAM_UART_TX   17
 #define CAM_UART_BAUD 9600
@@ -66,11 +73,12 @@ extern char HARDWARE_ID[12];
 //   LilyGO GPIO21 TX -> Controller GPIO33 RX
 //   LilyGO GPIO22 RX <- Controller GPIO27 TX
 //   GND shared
-#define PROXY_UART_RX   33
-#define PROXY_UART_TX   27
-#define PROXY_UART_BAUD 9600
-#define PROXY_UART_TIMEOUT_MS 1800
-#define PROXY_UART_GET_RETRIES 2
+// NOTE: Temporarily disabled — all comms via WiFi
+// #define PROXY_UART_RX   33
+// #define PROXY_UART_TX   27
+// #define PROXY_UART_BAUD 9600
+// #define PROXY_UART_TIMEOUT_MS 300
+// #define PROXY_UART_GET_RETRIES 1
 
 // ==================== PINS ====================
 #define LOCK_PIN          32    // Relay / MOSFET control pin

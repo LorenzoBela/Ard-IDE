@@ -700,7 +700,11 @@ static void showOtpEntryBlockedMessage(unsigned long now) {
     if (!hasActiveDelivery) {
       updateDisplay("No delivery", "Check app");
     } else if (isPhase("PICKUP")) {
-      updateDisplay("Pickup phase", "Enter rider PIN");
+      // Pickup requires geofence confirmation.  This branch is only reached
+      // when pickupInsideFence is false (otherwise the digit routes to the
+      // personal-PIN flow).  Show a clear "not ready" message so the rider
+      // knows to move closer or wait for GPS lock.
+      updateDisplay("Outside pickup", "Hold 9 to sync");
     } else if (isPhase("IN_TRANSIT")) {
       updateDisplay("In transit", "PIN disabled");
     } else if (isPhase("DROPOFF")) {
@@ -1021,17 +1025,13 @@ void renderUtilityMode(unsigned long now) {
     snprintf(line1, sizeof(line1), "GPS:%s %s", diagCache.gpsFix ? "LOCK" : "WAIT",
              fresh ? "LIVE" : (diagCacheValid ? "STALE" : "NO DATA"));
   } else {
-    if (diagCache.lteConnected || diagCache.modemOk) {
-      snprintf(line0, sizeof(line0), "Net: CONNECTED");
-    } else {
-      snprintf(line0, sizeof(line0), "Net: OFFLINE");
-    }
+    char pCode = peerHealthCode(proxyHealthState);
+    char cCode = peerHealthCode(camHealthState);
+    bool peersReady = (proxyHealthState != PEER_DOWN) && (camHealthState != PEER_DOWN);
+    const char *freshTag = fresh ? "LIVE" : (diagCacheValid ? "STALE" : "NODATA");
 
-    if (diagCache.timeSynced && diagCache.firebaseFailures == 0) {
-      snprintf(line1, sizeof(line1), "Sync: OK");
-    } else {
-      snprintf(line1, sizeof(line1), "HTTP/Sync Err:%d", diagCache.firebaseFailures);
-    }
+    snprintf(line0, sizeof(line0), "Peers P:%c C:%c", pCode, cCode);
+    snprintf(line1, sizeof(line1), "Sync:%s %s", peersReady ? "OK" : "WAIT", freshTag);
   }
 
   updateDisplay(line0, line1);
@@ -1212,6 +1212,15 @@ void setup() {
 // ==================== MAIN LOOP (non-blocking) ====================
 void loop() {
   unsigned long now = millis();
+  static unsigned long lastHeartbeatLog = 0;
+  if (now - lastHeartbeatLog >= 5000) {
+    lastHeartbeatLog = now;
+    Serial.printf("[HB] state=%d wifi=%d proxy=%s active=%d\n",
+                  (int)currentState, (int)WiFi.status(),
+                  PROXY_HOST[0] ? PROXY_HOST : "?",
+                  hasActiveDelivery ? 1 : 0);
+    Serial.flush();
+  }
 
   // ── 1. WiFi monitoring (runs in all states except boot self-test) ──
   wl_status_t wifiStatus = WiFi.status();

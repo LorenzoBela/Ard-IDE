@@ -77,7 +77,29 @@ struct GeofenceProxy {
     warehouseEntryMs   = 0;
   }
 
-  void setTarget(double lat, double lon) { targetLat = lat; targetLon = lon; }
+  /** Reset hysteresis counters without clearing target/pickup coords.
+   *  Call when the active geofence target changes so the state machine
+   *  evaluates the new location from scratch instead of carrying stale
+   *  arrival/departure state from the previous target. */
+  void resetHysteresis() {
+    snap.stableState     = GEO_OUTSIDE;
+    snap.rawState        = GEO_OUTSIDE;
+    snap.distanceM       = 0;
+    snap.urbanCanyon     = false;
+    snap.warehouseReturn = false;
+    snap.hysteresisCount = 0;
+    prevConfirmed        = GEO_OUTSIDE;
+    consecState          = GEO_OUTSIDE;
+    consecCount          = 0;
+    warehouseEntryMs     = 0;
+  }
+
+  void setTarget(double lat, double lon) {
+    bool changed = (lat != targetLat || lon != targetLon);
+    targetLat = lat;
+    targetLon = lon;
+    if (changed) resetHysteresis();
+  }
 
   void setPickup(double lat, double lon) {
     pickupLat = lat; pickupLon = lon;
