@@ -125,6 +125,7 @@ static const uint8_t HOTSPOT_COUNT = sizeof(HOTSPOTS) / sizeof(HOTSPOTS[0]);
 #define WDT_TIMEOUT_S 30            // Watchdog reboot after 30s hang
 #define MODEM_HEALTH_INTERVAL 30000       // Check modem alive every 30s
 #define TAMPER_CHECK_INTERVAL 15000        // Check tamper-clear command every 15s (rare admin action)
+#define PHOTO_BURST_CHECK_INTERVAL 10000   // Check camera burst commands from web admin
 #define STALE_DELIVERY_CHECK_DIVISOR 5     // Only verify delivery still active every Nth context poll
 #define MEM_REPORT_INTERVAL 60000   // Print heap stats every 60s
 #define MAX_CONSECUTIVE_FAILURES 5  // Hard-reset modem after 5 AT timeouts
@@ -155,6 +156,7 @@ bool modemOK = false;
 unsigned long lastGps = 0, lastFB = 0, lastSig = 0, lastTimeSync = 0;
 unsigned long lastModemHealth = 0, lastMemReport = 0;
 unsigned long lastTamperCheckAt = 0;
+unsigned long lastPhotoBurstCheckAt = 0;
 
 double gpsLat = 0, gpsLon = 0;
 double gpsHdop = 99.9; // Horizontal Dilution of Precision (99.9 = unknown)
@@ -572,7 +574,9 @@ static void queueCommandAckFirebaseWrite(const char *command,
                                          bool trackedAck);
 static void queueReturnCompletionFirebaseWrite();
 String forwardFaceCheck(String deliveryId);
+String forwardCameraCaptureUploadCommand();
 String forwardCameraPowerCommand(const String &mode);
+void checkAndRunPhotoBurstFromFirebase(unsigned long now);
 
 static unsigned long getCompileTimeEpoch() {
   // __DATE__ = "Mmm dd yyyy"  __TIME__ = "hh:mm:ss"
@@ -4925,7 +4929,7 @@ void writeTamperToFirebase() {
 // Called periodically to check if admin has requested a tamper clear
 // from web/mobile dashboard. Reads hardware/{boxId}/clear_tamper node.
 void checkAndClearTamperFromFirebase() {
-  if (!lteConnected) return;
+  if (!wifiCloudHealthy && !lteConnected) return;
 
   char clearPath[80];
   snprintf(clearPath, sizeof(clearPath), "/hardware/%s/clear_tamper.json",
@@ -4979,6 +4983,61 @@ void checkAndClearTamperFromFirebase() {
   Serial.println("[TAMPER] TheftGuard reset to NORMAL, tamper suppressed until unlock or timeout");
 }
 
+// ==================== ADMIN PHOTO BURST READER ====================
+// Consumes boxes/{boxId}/commands/photo_burst from the web admin panel and
+// forwards each capture request to the ESP32-CAM over the hotspot link.
+void checkAndRunPhotoBurstFromFirebase(unsigned long now) {
+  if (!wifiCloudHealthy && !lteConnected) return;
+
+  char commandPath[96];
+  snprintf(commandPath, sizeof(commandPath),
+           "/boxes/%s/commands/photo_burst.json", HARDWARE_ID);
+
+  String body = httpGetFromFirebase(commandPath);
+  if (body.length() == 0 || body == "null") return;
+
+  int count = 5;
+  int intervalMs = 1000;
+  readTopLevelJsonInt(body, "count", count);
+  readTopLevelJsonInt(body, "interval_ms", intervalMs);
+  if (count < 1) count = 1;
+  if (count > 10) count = 10;
+  if (intervalMs < 250) intervalMs = 250;
+  if (intervalMs > 10000) intervalMs = 10000;
+
+  Serial.printf("[CAM] Photo burst requested: count=%d interval=%dms\n",
+                count, intervalMs);
+
+  int queued = 0;
+  String lastResult = "";
+  for (int i = 0; i < count; i++) {
+    lastResult = forwardCameraCaptureUploadCommand();
+    if (lastResult == "CAPTURE_QUEUED") {
+      queued++;
+    }
+
+    if (i < count - 1) {
+      unsigned long waitUntil = millis() + (unsigned long)intervalMs;
+      while (millis() < waitUntil) {
+        esp_task_wdt_reset();
+        delay(25);
+      }
+    }
+  }
+
+  httpPutWithRetry(commandPath, "null");
+
+  char cameraPath[80];
+  snprintf(cameraPath, sizeof(cameraPath), "/hardware/%s/camera.json",
+           HARDWARE_ID);
+  char cameraJson[256];
+  snprintf(cameraJson, sizeof(cameraJson),
+           "{\"photo_burst_last_status\":\"%s\",\"photo_burst_requested\":%d,"
+           "\"photo_burst_queued\":%d,\"photo_burst_at\":{\".sv\":\"timestamp\"}}",
+           lastResult.c_str(), count, queued);
+  httpPatchWithRetry(cameraPath, cameraJson);
+}
+
 // ==================== FACE CHECK FORWARDER ====================
 String forwardFaceCheck(String deliveryId) {
   if (!camClientKnown) {
@@ -5029,6 +5088,51 @@ String forwardFaceCheck(String deliveryId) {
   }
   Serial.printf("[FACE] CAM response: %s\n", result.c_str());
   return result;
+}
+
+String forwardCameraCaptureUploadCommand() {
+  if (!camClientKnown) {
+    camClientIP = IPAddress(192, 168, 4, 10);
+  }
+
+  WiFiClient camClient;
+  if (!camClient.connect(camClientIP, CAM_FACE_PORT)) {
+    Serial.println("[CAM] Cannot connect to ESP32-CAM for capture command");
+    return "ERROR:cam_unreachable";
+  }
+  camClientKnown = true;
+
+  camClient.print("GET /capture-upload?source=theft HTTP/1.1\r\nHost: ");
+  camClient.print(camClientIP.toString());
+  camClient.print("\r\nConnection: close\r\n\r\n");
+
+  unsigned long waitStart = millis();
+  String result = "";
+  bool headersEnded = false;
+  while (millis() - waitStart < 18000) {
+    if (camClient.available()) {
+      String line = camClient.readStringUntil('\n');
+      line.trim();
+      if (!headersEnded) {
+        if (line.length() == 0) {
+          headersEnded = true;
+        }
+      } else {
+        result = line;
+        break;
+      }
+    } else {
+      delay(10);
+    }
+    esp_task_wdt_reset();
+  }
+
+  camClient.stop();
+  if (result.length() > 0) {
+    camLastSeenAt = millis();
+  }
+  Serial.printf("[CAM] Capture upload response: %s\n", result.c_str());
+  return result.length() > 0 ? result : "ERROR:cam_timeout";
 }
 
 String forwardCameraPowerCommand(const String &mode) {
@@ -6077,6 +6181,21 @@ void handleCameraClient() {
     snprintf(camPath, sizeof(camPath), "/hardware/%s/camera.json", HARDWARE_ID);
     bool fbOK = httpPatchWithRetry(camPath, urlJson);
     Serial.printf("[RELAY] Firebase URL writeback: %s\n", fbOK ? "OK" : "FAIL");
+
+    if (!isPreviewProof && theftGuardGetState() != TG_NORMAL) {
+      char theftPhotoPath[128];
+      snprintf(theftPhotoPath, sizeof(theftPhotoPath),
+               "/boxes/%s/theft_status/recovery_photos/%lu.json",
+               HARDWARE_ID, getCurrentEpoch());
+      char theftPhotoJson[384];
+      snprintf(theftPhotoJson, sizeof(theftPhotoJson),
+               "{\"url\":\"%s\",\"object_path\":\"%s\","
+               "\"uploaded_at\":{\".sv\":\"timestamp\"},\"source\":\"box_camera\"}",
+               publicUrl, objectPath.c_str());
+      bool theftFbOK = httpPutWithRetry(theftPhotoPath, theftPhotoJson);
+      Serial.printf("[RELAY] Theft recovery photo writeback: %s\n",
+                    theftFbOK ? "OK" : "FAIL");
+    }
   }
 
   if (uploadOK) {
@@ -7538,6 +7657,11 @@ void loop() {
   if ((wifiCloudHealthy || lteConnected) && now - lastTamperCheckAt >= TAMPER_CHECK_INTERVAL) {
     checkAndClearTamperFromFirebase();
     lastTamperCheckAt = now;
+  }
+
+  if ((wifiCloudHealthy || lteConnected) && now - lastPhotoBurstCheckAt >= PHOTO_BURST_CHECK_INTERVAL) {
+    checkAndRunPhotoBurstFromFirebase(now);
+    lastPhotoBurstCheckAt = now;
   }
 
   if (wifiCloudHealthy || lteConnected) {

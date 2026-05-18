@@ -1754,6 +1754,38 @@ void handleFaceStatusClient() {
     return;
   }
 
+  if (requestLine.startsWith("GET /capture-upload")) {
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.length() == 0) {
+        break;
+      }
+    }
+
+    const char *result = "CAPTURE_BUSY";
+    if (cameraSleepMode) {
+      result = "CAMERA_SLEEP";
+    } else if (queueCapturedUpload("PHOTO_BURST")) {
+      result = "CAPTURE_QUEUED";
+    }
+
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+             "HTTP/1.1 200 OK\r\n"
+             "Content-Type: text/plain\r\n"
+             "Content-Length: %d\r\n"
+             "Connection: close\r\n\r\n"
+             "%s",
+             (int)strlen(result), result);
+    client.print(resp);
+    client.flush();
+    yield();
+    client.stop();
+    pendingFaceClientActive = false;
+    return;
+  }
+
   if (requestLine.startsWith("GET /preview") || requestLine.startsWith("GET /snapshot")) {
     netLog("[HTTP] Serving browser preview snapshot\n");
 

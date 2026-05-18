@@ -4934,7 +4934,7 @@ void writeTamperToFirebase() {
 // Called periodically to check if admin has requested a tamper clear
 // from web/mobile dashboard. Reads hardware/{boxId}/clear_tamper node.
 void checkAndClearTamperFromFirebase() {
-  if (!lteConnected) return;
+  if (!wifiCloudHealthy && !lteConnected) return;
 
   char clearPath[80];
   snprintf(clearPath, sizeof(clearPath), "/hardware/%s/clear_tamper.json",
