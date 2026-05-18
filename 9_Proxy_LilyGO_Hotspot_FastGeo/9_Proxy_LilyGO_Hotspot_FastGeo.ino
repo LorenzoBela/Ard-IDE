@@ -334,7 +334,7 @@ bool camClientKnown = false;
 static unsigned long camLastSeenAt = 0;
 #define CAM_LIVENESS_STALE_MS 120000
 static unsigned long lastCamProbeAt = 0;
-#define CAM_PROBE_INTERVAL_MS 10000
+#define CAM_PROBE_INTERVAL_MS 15000
 static unsigned long controllerLastSeenAt = 0;
 #define CONTROLLER_LIVENESS_STALE_MS 30000
 #define MANUAL_REFRESH_BURST_MS 15000UL
