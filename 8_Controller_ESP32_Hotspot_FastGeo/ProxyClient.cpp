@@ -64,6 +64,11 @@ static bool proxyBssidKnown = false;
 static int32_t proxyChannel = 0;
 static uint8_t hotspotScanStart = 0;
 static int8_t selectedHotspotCredential = -1;
+static unsigned long nextProxyDiscoveryAt = 0;
+static unsigned long nextProxySubnetProbeAt = 0;
+static unsigned long proxyMissingReconnectAt = 0;
+static uint8_t proxyDiscoveryMisses = 0;
+static uint8_t subnetProbeHost = 2;
 
 static void clearDiscoveredProxy(const char *reason) {
   if (PROXY_HOST[0] != '\0') {
@@ -71,6 +76,103 @@ static void clearDiscoveredProxy(const char *reason) {
                   PROXY_HOST, reason ? reason : "unknown");
   }
   PROXY_HOST[0] = '\0';
+  nextProxyDiscoveryAt = 0;
+}
+
+static void rememberDiscoveredProxy(const IPAddress &ip, const char *hardwareId,
+                                    const char *source) {
+  String ipStr = ip.toString();
+  strncpy(PROXY_HOST, ipStr.c_str(), sizeof(PROXY_HOST) - 1);
+  PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
+  if (hardwareId && hardwareId[0] != '\0') {
+    strncpy(HARDWARE_ID, hardwareId, sizeof(HARDWARE_ID) - 1);
+    HARDWARE_ID[sizeof(HARDWARE_ID) - 1] = '\0';
+  } else if (HARDWARE_ID[0] == '\0') {
+    snprintf(HARDWARE_ID, sizeof(HARDWARE_ID), "BOX_001");
+  }
+  proxyDiscoveryMisses = 0;
+  nextProxyDiscoveryAt = millis() + 5000UL;
+  nextProxySubnetProbeAt = millis() + 15000UL;
+  proxyMissingReconnectAt = 0;
+  Serial.printf("[DISCOVERY] Proxy at %s:%d via %s\n",
+                PROXY_HOST, PROXY_PORT, source ? source : "probe");
+}
+
+static bool pingProxyAt(const IPAddress &ip, unsigned long timeoutMs) {
+  WiFiClient client;
+  client.setTimeout(1);
+  bool connected = false;
+#if defined(ESP_ARDUINO_VERSION_MAJOR)
+  connected = client.connect(ip, PROXY_PORT, (int32_t)timeoutMs);
+#else
+  connected = client.connect(ip, PROXY_PORT);
+#endif
+  if (!connected) {
+    client.stop();
+    return false;
+  }
+
+  client.printf(
+      "GET /ping HTTP/1.1\r\n"
+      "Host: %s:%d\r\n"
+      "Connection: close\r\n"
+      "\r\n",
+      ip.toString().c_str(), PROXY_PORT);
+
+  unsigned long deadline = millis() + timeoutMs;
+  bool sawHttpOk = false;
+  bool sawBodyOk = false;
+  while (millis() < deadline && (client.connected() || client.available())) {
+    if (!client.available()) {
+      yield();
+      continue;
+    }
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200")) {
+      sawHttpOk = true;
+    }
+    if (line == "OK") {
+      sawBodyOk = true;
+      break;
+    }
+  }
+  client.stop();
+  return sawHttpOk || sawBodyOk;
+}
+
+static bool tryProxyCandidate(const IPAddress &ip, const char *source,
+                              unsigned long timeoutMs = 180) {
+  if (ip == IPAddress(0, 0, 0, 0) || ip == WiFi.localIP()) return false;
+  if (pingProxyAt(ip, timeoutMs)) {
+    rememberDiscoveredProxy(ip, NULL, source);
+    return true;
+  }
+  return false;
+}
+
+static bool probeLikelyProxyHosts(uint8_t maxHosts = 6) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  IPAddress gateway = WiFi.gatewayIP();
+  if (tryProxyCandidate(gateway, "gateway")) return true;
+
+  IPAddress local = WiFi.localIP();
+
+  uint8_t tried = 0;
+  while (tried < maxHosts) {
+    if (subnetProbeHost == 0 || subnetProbeHost == 255) subnetProbeHost = 2;
+    IPAddress candidate(local[0], local[1], local[2], subnetProbeHost);
+    subnetProbeHost++;
+    tried++;
+    if ((uint32_t)candidate == (uint32_t)local ||
+        (uint32_t)candidate == (uint32_t)gateway) {
+      continue;
+    }
+    if (tryProxyCandidate(candidate, "subnet")) return true;
+  }
+
+  return false;
 }
 
 #if !DISABLE_PROXY_UART
@@ -334,15 +436,10 @@ static bool discoverProxyUdp(unsigned long timeoutMs = 1200) {
                             replyIp, &replyPort, replyHardware);
         IPAddress ip;
         if (parsed >= 1 && ip.fromString(replyIp)) {
-          strncpy(PROXY_HOST, replyIp, sizeof(PROXY_HOST) - 1);
+          rememberDiscoveredProxy(ip, parsed >= 3 ? replyHardware : NULL, "udp");
         } else {
           ip = discovery.remoteIP();
-          strncpy(PROXY_HOST, ip.toString().c_str(), sizeof(PROXY_HOST) - 1);
-        }
-        PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
-        if (parsed >= 3 && replyHardware[0] != '\0') {
-          strncpy(HARDWARE_ID, replyHardware, sizeof(HARDWARE_ID) - 1);
-          HARDWARE_ID[sizeof(HARDWARE_ID) - 1] = '\0';
+          rememberDiscoveredProxy(ip, parsed >= 3 ? replyHardware : NULL, "udp_remote");
         }
         Serial.printf("[DISCOVERY] Proxy at %s:%d (%s)\n",
                       PROXY_HOST, replyPort, packet);
@@ -353,7 +450,16 @@ static bool discoverProxyUdp(unsigned long timeoutMs = 1200) {
     delay(20);
   }
   discovery.stop();
-  Serial.println(F("[DISCOVERY] Proxy discovery timed out"));
+  if (proxyDiscoveryMisses < 255) proxyDiscoveryMisses++;
+  Serial.printf("[DISCOVERY] Proxy discovery timed out (%u)\n",
+                proxyDiscoveryMisses);
+  if (proxyDiscoveryMisses >= 3 && millis() >= nextProxySubnetProbeAt) {
+    nextProxySubnetProbeAt = millis() + 3000UL;
+    Serial.println(F("[DISCOVERY] UDP failed; probing likely proxy IPs"));
+    if (probeLikelyProxyHosts()) {
+      return true;
+    }
+  }
   return false;
 }
 
@@ -606,8 +712,30 @@ static void closePersistentConnection();
 
 void maintainWiFiConnection(unsigned long now) {
   if (WiFi.status() == WL_CONNECTED) {
-    if (PROXY_HOST[0] == '\0') {
-      discoverProxyUdp(250);
+    if (PROXY_HOST[0] == '\0' && now >= nextProxyDiscoveryAt) {
+      nextProxyDiscoveryAt = now + 1500UL;
+      if (!discoverProxyUdp(350) && proxyDiscoveryMisses >= 8 &&
+          now >= nextProxySubnetProbeAt) {
+        nextProxySubnetProbeAt = now + 3000UL;
+        probeLikelyProxyHosts(8);
+      }
+    }
+    if (PROXY_HOST[0] == '\0' && proxyDiscoveryMisses >= 24) {
+      if (proxyMissingReconnectAt == 0) {
+        proxyMissingReconnectAt = now + 3000UL;
+      } else if (now >= proxyMissingReconnectAt) {
+        Serial.println(F("[DISCOVERY] Proxy still missing; rescanning hotspots"));
+        closePersistentConnection();
+        advanceHotspotCandidate("proxy_missing");
+        WiFi.disconnect();
+        scanForProxy();
+        beginProxyConnection("proxy_missing");
+        proxyDiscoveryMisses = 0;
+        proxyMissingReconnectAt = 0;
+        return;
+      }
+    } else {
+      proxyMissingReconnectAt = 0;
     }
     wifiBackoffMs = WIFI_RETRY_BASE_MS;
     wifiRetryAt = now + WIFI_FIRST_RETRY_DELAY_MS;
@@ -667,7 +795,8 @@ static bool ensurePersistentConnection() {
   if (persistentConnected && persistentClient.connected()) {
     return true;
   }
-  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp(700) &&
+      !probeLikelyProxyHosts(10)) {
     netLog("[FETCH] Proxy discovery failed\n");
     return false;
   }
@@ -689,7 +818,10 @@ static int httpGetOnce(const char *path, String &bodyOut,
                        unsigned long timeoutMs = FETCH_HTTP_TIMEOUT_MS) {
   bodyOut = "";
   if (WiFi.status() != WL_CONNECTED) return -1;
-  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) return -1;
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp(700) &&
+      !probeLikelyProxyHosts(10)) {
+    return -1;
+  }
 
   WiFiClient client;
   client.setTimeout(timeoutMs / 1000);
@@ -1193,7 +1325,8 @@ bool fetchDiagnostics(ControllerDiagData &out) {
     }
     return false;
   }
-  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) return false;
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp(700) &&
+      !probeLikelyProxyHosts(8)) return false;
 
   WiFiClient client;
   HTTPClient http;
@@ -1335,7 +1468,8 @@ static int sendRawPost(const char *path, const char *json) {
     return -1;
   }
 #if DISABLE_PROXY_KEEPALIVE
-  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp(700) &&
+      !probeLikelyProxyHosts(8)) {
     return -1;
   }
   WiFiClient client;
@@ -1488,7 +1622,8 @@ bool requestCameraPowerMode(bool wakeMode) {
     }
     return false;
   }
-  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp(700) &&
+      !probeLikelyProxyHosts(8)) {
     return false;
   }
 
@@ -1550,7 +1685,8 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
     }
     return 0;
   }
-  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp(700) &&
+      !probeLikelyProxyHosts(8)) {
     return -2;
   }
 
@@ -1597,7 +1733,8 @@ int requestFaceCheck() {
 
   // ── WiFi via proxy ──
   if (WiFi.status() == WL_CONNECTED) {
-    if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
+    if (PROXY_HOST[0] == '\0' && !discoverProxyUdp(700) &&
+        !probeLikelyProxyHosts(8)) {
 #if CONTROLLER_VERBOSE_LOGS
       Serial.println(F("[FACE] Proxy discovery failed"));
 #endif

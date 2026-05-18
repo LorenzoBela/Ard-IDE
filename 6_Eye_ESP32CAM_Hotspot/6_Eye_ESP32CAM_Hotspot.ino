@@ -107,6 +107,11 @@ char DEVICE_ID[24] = "OV3660_CAM_001";
 #define WIFI_RETRY_BASE_MS 2000
 #define WIFI_RETRY_MAX_MS 30000
 #define WIFI_RETRY_JITTER_MS 400
+#define PROXY_DISCOVERY_RETRY_MS 1500
+#define PROXY_SUBNET_PROBE_RETRY_MS 3000
+#define PROXY_MISSING_RECONNECT_MS 45000
+#define PROXY_DIAG_INTERVAL_MS 15000
+#define PROXY_DIAG_FAIL_LIMIT 3
 
 // ===================== CAMERA PINS: AI THINKER =====================
 #define PWDN_GPIO_NUM 32
@@ -167,6 +172,14 @@ static unsigned long wifiBackoffMs = WIFI_RETRY_BASE_MS;
 static unsigned long wifiReconnectStartAt = 0;
 static unsigned long lastWifiReconnectLatencyMs = 0;
 static unsigned long lastCamAnnounceAt = 0;
+static unsigned long nextProxyDiscoveryAt = 0;
+static unsigned long nextProxySubnetProbeAt = 0;
+static unsigned long proxyMissingSince = 0;
+static unsigned long lastProxyDiagAt = 0;
+static uint8_t proxyDiscoveryMisses = 0;
+static uint8_t proxyDiagFailCount = 0;
+static uint8_t subnetProbeHost = 2;
+static int8_t selectedHotspotCredential = -1;
 
 // Write telemetry (hourly)
 static unsigned long camNvsWritesThisWindow = 0;
@@ -220,7 +233,7 @@ void netLog(const char *format, ...) {
 
   Serial.print(buf);
 
-  if (WiFi.status() == WL_CONNECTED) {
+  if (WiFi.status() == WL_CONNECTED && PROXY_HOST[0] != '\0') {
     udpClient.beginPacket(PROXY_HOST, UDP_LOG_PORT);
     udpClient.print("[CAM] ");
     udpClient.print(buf);
@@ -573,6 +586,7 @@ void scanForProxyAP() {
     strncpy(WIFI_PASSWORD, HOTSPOTS[bestCredential].password,
             sizeof(WIFI_PASSWORD) - 1);
     WIFI_PASSWORD[sizeof(WIFI_PASSWORD) - 1] = '\0';
+    selectedHotspotCredential = bestCredential;
 
     snprintf(DEVICE_ID, sizeof(DEVICE_ID), "OV3660_CAM_001");
 
@@ -679,6 +693,10 @@ bool discoverProxyUdp(unsigned long timeoutMs = 1500) {
 
         strncpy(PROXY_HOST, replyIp.c_str(), sizeof(PROXY_HOST) - 1);
         PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
+        proxyDiscoveryMisses = 0;
+        proxyMissingSince = 0;
+        nextProxyDiscoveryAt = millis() + 5000UL;
+        nextProxySubnetProbeAt = millis() + 15000UL;
         Serial.printf("[DISCOVERY] Proxy at %s:%d (%s)\n", PROXY_HOST, replyPort, packet);
 
         discovery.beginPacket(ip, PROXY_DISCOVERY_PORT);
@@ -694,7 +712,163 @@ bool discoverProxyUdp(unsigned long timeoutMs = 1500) {
   }
   discovery.stop();
   Serial.println(F("[DISCOVERY] Proxy not found"));
+  if (proxyDiscoveryMisses < 255) proxyDiscoveryMisses++;
   return false;
+}
+
+static void rememberProxyHost(const IPAddress &ip, const char *source) {
+  String ipStr = ip.toString();
+  strncpy(PROXY_HOST, ipStr.c_str(), sizeof(PROXY_HOST) - 1);
+  PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
+  proxyDiscoveryMisses = 0;
+  proxyDiagFailCount = 0;
+  proxyMissingSince = 0;
+  nextProxyDiscoveryAt = millis() + 5000UL;
+  nextProxySubnetProbeAt = millis() + 15000UL;
+  Serial.printf("[DISCOVERY] Proxy at %s:%d via %s\n",
+                PROXY_HOST, PROXY_PORT, source ? source : "probe");
+}
+
+static bool pingProxyAt(const IPAddress &ip, unsigned long timeoutMs = 200) {
+  if (ip == IPAddress(0, 0, 0, 0) || ip == WiFi.localIP()) return false;
+
+  WiFiClient client;
+  client.setTimeout(1);
+  bool connected = client.connect(ip, PROXY_PORT, (int32_t)timeoutMs);
+  if (!connected) {
+    client.stop();
+    return false;
+  }
+
+  client.printf(
+      "GET /ping HTTP/1.1\r\n"
+      "Host: %s:%d\r\n"
+      "Connection: close\r\n"
+      "\r\n",
+      ip.toString().c_str(), PROXY_PORT);
+
+  unsigned long deadline = millis() + timeoutMs;
+  bool ok = false;
+  while (millis() < deadline && (client.connected() || client.available())) {
+    if (!client.available()) {
+      yield();
+      continue;
+    }
+    String line = client.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200") ||
+        line == "OK") {
+      ok = true;
+      break;
+    }
+  }
+  client.stop();
+  return ok;
+}
+
+static bool probeLikelyProxyHosts(uint8_t maxHosts = 8) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  IPAddress gateway = WiFi.gatewayIP();
+  if (pingProxyAt(gateway)) {
+    rememberProxyHost(gateway, "gateway");
+    return true;
+  }
+
+  IPAddress local = WiFi.localIP();
+  uint8_t tried = 0;
+  while (tried < maxHosts) {
+    if (subnetProbeHost == 0 || subnetProbeHost == 255) subnetProbeHost = 2;
+    IPAddress candidate(local[0], local[1], local[2], subnetProbeHost);
+    subnetProbeHost++;
+    tried++;
+    if ((uint32_t)candidate == (uint32_t)local ||
+        (uint32_t)candidate == (uint32_t)gateway) {
+      continue;
+    }
+    if (pingProxyAt(candidate)) {
+      rememberProxyHost(candidate, "subnet");
+      return true;
+    }
+  }
+  return false;
+}
+
+static void rotateHotspotCandidate(const char *reason) {
+  if (selectedHotspotCredential >= 0 && HOTSPOT_COUNT > 1) {
+    uint8_t next = ((uint8_t)selectedHotspotCredential + 1) % HOTSPOT_COUNT;
+    strncpy(WIFI_SSID, HOTSPOTS[next].ssid, sizeof(WIFI_SSID) - 1);
+    WIFI_SSID[sizeof(WIFI_SSID) - 1] = '\0';
+    strncpy(WIFI_PASSWORD, HOTSPOTS[next].password, sizeof(WIFI_PASSWORD) - 1);
+    WIFI_PASSWORD[sizeof(WIFI_PASSWORD) - 1] = '\0';
+    selectedHotspotCredential = next;
+    Serial.printf("[WIFI] Rotating hotspot after %s -> %s\n",
+                  reason ? reason : "proxy_missing", WIFI_SSID);
+  } else {
+    WIFI_SSID[0] = '\0';
+    WIFI_PASSWORD[0] = '\0';
+  }
+  PROXY_HOST[0] = '\0';
+  proxyDiscoveryMisses = 0;
+  proxyMissingSince = 0;
+  wifiConnectInProgress = false;
+  wifiNextAttemptAt = 0;
+}
+
+static bool parseDiagField(const String &body, const char *key, String &out) {
+  String token = String(key) + "=";
+  int start = body.indexOf(token);
+  if (start < 0) return false;
+  start += token.length();
+  int end = body.indexOf(',', start);
+  if (end < 0) end = body.length();
+  out = body.substring(start, end);
+  out.trim();
+  return out.length() > 0;
+}
+
+static void pollProxyHealthIfDue() {
+  unsigned long now = millis();
+  if (WiFi.status() != WL_CONNECTED || PROXY_HOST[0] == '\0') return;
+  if (now - lastProxyDiagAt < PROXY_DIAG_INTERVAL_MS) return;
+  lastProxyDiagAt = now;
+
+  WiFiClient client;
+  HTTPClient http;
+  String url = String("http://") + PROXY_HOST + ":" + String(PROXY_PORT) + "/diag";
+  http.setTimeout(1000);
+  http.begin(client, url);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    if (proxyDiagFailCount < 255) proxyDiagFailCount++;
+    netLog("[LIVENESS] Proxy diag HTTP %d fail=%u\n", code,
+           (unsigned int)proxyDiagFailCount);
+    if (proxyDiagFailCount >= PROXY_DIAG_FAIL_LIMIT) {
+      netLog("[LIVENESS] Proxy diag stale; clearing proxy host\n");
+      PROXY_HOST[0] = '\0';
+      nextProxyDiscoveryAt = 0;
+      proxyDiagFailCount = 0;
+    }
+    return;
+  }
+
+  String body = http.getString();
+  http.end();
+  proxyDiagFailCount = 0;
+
+  String ctrlUp, camUp, connState, ctrlAge, camAge;
+  parseDiagField(body, "ctrl_up", ctrlUp);
+  parseDiagField(body, "cam_up", camUp);
+  parseDiagField(body, "conn_state", connState);
+  parseDiagField(body, "ctrl_age", ctrlAge);
+  parseDiagField(body, "cam_age", camAge);
+  netLog("[LIVENESS] Proxy diag ctrl=%s age=%s cam=%s age=%s conn=%s\n",
+         ctrlUp.length() ? ctrlUp.c_str() : "?",
+         ctrlAge.length() ? ctrlAge.c_str() : "?",
+         camUp.length() ? camUp.c_str() : "?",
+         camAge.length() ? camAge.c_str() : "?",
+         connState.length() ? connState.c_str() : "?");
 }
 
 static void announceCamToProxy() {
@@ -790,8 +964,26 @@ void maintainWiFiConnection() {
   unsigned long now = millis();
 
   if (WiFi.status() == WL_CONNECTED) {
+    if (PROXY_HOST[0] == '\0' && now >= nextProxyDiscoveryAt) {
+      nextProxyDiscoveryAt = now + PROXY_DISCOVERY_RETRY_MS;
+      if (!discoverProxyUdp(350) && proxyDiscoveryMisses >= 3 &&
+          now >= nextProxySubnetProbeAt) {
+        nextProxySubnetProbeAt = now + PROXY_SUBNET_PROBE_RETRY_MS;
+        Serial.println(F("[DISCOVERY] UDP failed; probing proxy by HTTP /ping"));
+        probeLikelyProxyHosts(8);
+      }
+    }
+
     if (PROXY_HOST[0] == '\0') {
-      discoverProxyUdp(250);
+      if (proxyMissingSince == 0) proxyMissingSince = now;
+      if ((now - proxyMissingSince) >= PROXY_MISSING_RECONNECT_MS) {
+        Serial.println(F("[DISCOVERY] Proxy still missing; rotating/reconnecting WiFi"));
+        rotateHotspotCandidate("proxy_missing");
+        WiFi.disconnect(false, false);
+        return;
+      }
+    } else {
+      proxyMissingSince = 0;
     }
     if (wifiReconnectStartAt != 0) {
       lastWifiReconnectLatencyMs = now - wifiReconnectStartAt;
@@ -1263,7 +1455,8 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
       return false;
     }
   }
-  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp()) {
+  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp(700) &&
+      !probeLikelyProxyHosts(10)) {
     Serial.println(F("Upload skipped: proxy discovery failed."));
     return false;
   }
@@ -2062,6 +2255,7 @@ void loop() {
   handleSerialCommands();
   maintainWiFiConnection();
   announceCamToProxy();
+  pollProxyHealthIfDue();
   maybePublishWriteMetrics(millis());
   handleFaceStatusClient(); // On-demand face-check via WiFi (from proxy)
   handleUartFaceCommand();  // On-demand face-check via UART (from Tester)

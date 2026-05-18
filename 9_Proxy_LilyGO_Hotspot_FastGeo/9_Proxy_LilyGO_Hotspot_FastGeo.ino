@@ -333,6 +333,8 @@ bool camClientKnown = false;
 #define CAM_FACE_PORT 80 // ESP32-CAM runs a tiny HTTP server on port 80
 static unsigned long camLastSeenAt = 0;
 #define CAM_LIVENESS_STALE_MS 120000
+static unsigned long lastCamProbeAt = 0;
+#define CAM_PROBE_INTERVAL_MS 10000
 static unsigned long controllerLastSeenAt = 0;
 #define CONTROLLER_LIVENESS_STALE_MS 30000
 #define MANUAL_REFRESH_BURST_MS 15000UL
@@ -554,6 +556,7 @@ static bool readTopLevelJsonBool(const String &json, const char *key, bool &outV
 static bool readTopLevelJsonInt(const String &json, const char *key, int &outVal);
 static bool readTopLevelJsonDouble(const String &json, const char *key, double &outVal);
 static bool verifyPersonalPinLocal(const char *pin);
+static void probeCameraIfDue(unsigned long now);
 void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked,
                               int faceAttempts,
                               bool faceRetryExhausted,
@@ -1939,6 +1942,59 @@ void maybeEvaluateConnectivityMatrix(unsigned long now) {
       rebootAllWaitLogged = false;
     }
     lastConnectivityState = connectivityState;
+  }
+}
+
+static void probeCameraIfDue(unsigned long now) {
+  if (!apStarted || !camClientKnown || camClientIP == IPAddress(0, 0, 0, 0)) {
+    return;
+  }
+  if (now - lastCamProbeAt < CAM_PROBE_INTERVAL_MS) {
+    return;
+  }
+  lastCamProbeAt = now;
+
+  unsigned long camAgeMs = (camLastSeenAt > 0) ? (now - camLastSeenAt) : 0;
+  if (camAgeMs <= CAM_LIVENESS_STALE_MS / 2) {
+    return;
+  }
+
+  WiFiClient camClient;
+  camClient.setTimeout(1);
+  if (!camClient.connect(camClientIP, CAM_FACE_PORT)) {
+    if (camAgeMs > CAM_LIVENESS_STALE_MS) {
+      Serial.printf("[LIVENESS] CAM probe failed; marking stale ip=%s age=%lums\n",
+                    camClientIP.toString().c_str(), camAgeMs);
+      camClientKnown = false;
+    }
+    camClient.stop();
+    return;
+  }
+
+  camClient.print("GET /status HTTP/1.1\r\nHost: ");
+  camClient.print(camClientIP);
+  camClient.print("\r\nConnection: close\r\n\r\n");
+
+  unsigned long deadline = millis() + 500UL;
+  bool ok = false;
+  while (millis() < deadline && (camClient.connected() || camClient.available())) {
+    if (!camClient.available()) {
+      delay(5);
+      esp_task_wdt_reset();
+      continue;
+    }
+    String line = camClient.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200")) {
+      ok = true;
+      break;
+    }
+  }
+  camClient.stop();
+
+  if (ok) {
+    camLastSeenAt = now;
+    camClientKnown = true;
   }
 }
 
@@ -7388,6 +7444,7 @@ void loop() {
   maintainHotspotStation(now);
   pollWifiCloudHealth(now);
   pollDiscoveryServer();
+  probeCameraIfDue(now);
 #if !DISABLE_PROXY_UART
   pollProxyUart();
 #endif
