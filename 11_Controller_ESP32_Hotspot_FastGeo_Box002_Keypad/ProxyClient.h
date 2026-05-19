@@ -30,6 +30,10 @@ extern bool    isReturning;      // True if return-to-sender mode is active
 extern char    deliveryPhase[12]; // PICKUP | IN_TRANSIT | DROPOFF | RETURN | NONE
 extern bool    pickupInsideFence; // Inside pickup geofence
 extern bool    dropoffInsideFence; // Inside dropoff geofence
+extern char    deliveryContextState[12]; // FRESH | STALE | UNVERIFIED
+extern bool    deliveryContextStale;
+extern bool    proxyRefreshQueued;
+extern char    lastContextRefreshStatus[32];
 
 /** True when the cached geofence fields came from a recent proxy response. */
 bool isGeoContextFresh(unsigned long maxAgeMs);

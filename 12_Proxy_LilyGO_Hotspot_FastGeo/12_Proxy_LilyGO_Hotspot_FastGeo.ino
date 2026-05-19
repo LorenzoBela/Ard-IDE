@@ -187,6 +187,9 @@ static volatile unsigned long modemLockStartedAt = 0;
 static volatile unsigned long modemLockMaxHeldMs = 0;
 static volatile uint8_t modemLockDepth = 0;
 static bool controllerContextRefreshQueued = false;
+static unsigned long controllerContextRefreshQueuedAt = 0;
+static bool deliveryContextStale = false;
+static char lastRefreshStatus[24] = "BOOT";
 bool apStarted = false;
 String relayDiag =
     ""; // Diagnostics forwarded to ESP32-CAM via HTTP response body
@@ -438,6 +441,9 @@ static void clearDeliveryContextCaches(const char *reason, bool patchHardware) {
   lastDeliveryVerifyAtMs = 0;
   lastVerifiedDeliveryId[0] = '\0';
   contextFetchFailCount = 0;
+  deliveryContextStale = false;
+  strncpy(lastRefreshStatus, "CLEARED", sizeof(lastRefreshStatus) - 1);
+  lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
 
   phoneLat = 0.0;
   phoneLon = 0.0;
@@ -2180,19 +2186,17 @@ void publishPhotoUploadState(const char *status, int progress,
   photoUploadError[sizeof(photoUploadError) - 1] = '\0';
   photoUploadUpdatedAt = millis();
 
-  bool terminalState = strcmp(safeStatus, "COMPLETED") == 0 ||
-                       strcmp(safeStatus, "FAILED") == 0;
-  if (!terminalState || !lteConnected) {
+  if (!lteConnected) {
     return;
   }
 
-  char json[384];
+  char json[448];
   snprintf(json, sizeof(json),
            "{\"delivery_id\":\"%s\",\"status\":\"%s\","
            "\"progress_percent\":%d,\"original_size_bytes\":%lu,"
            "\"compressed_size_bytes\":%lu,\"compression_ratio\":1,"
            "\"retry_count\":0,\"error_message\":\"%s\","
-           "\"upload_started_at\":{\".sv\":\"timestamp\"}}",
+           "\"upload_updated_at\":{\".sv\":\"timestamp\"}}",
            safeDelivery, safeStatus, clampedProgress,
            (unsigned long)originalSize, (unsigned long)originalSize,
            errorMessage ? errorMessage : "");
@@ -2541,8 +2545,13 @@ static String buildControllerOtpBody() {
   String otpPart = returnActive
                        ? (returnOtpCacheValid ? String(cachedReturnOtp) : "NO_OTP")
                        : (otpCacheValid ? String(cachedOtp) : "NO_OTP");
+  bool cloudReachable = wifiCloudHealthy || lteConnected;
+  bool staleUsableContext =
+      deliveryIdCacheValid && cachedDeliveryId[0] != '\0' &&
+      (deliveryContextStale || !cloudReachable || lastContextFetchOkAtMs == 0);
   bool activeContextForController =
-      deliveryIdCacheValid && cachedDeliveryId[0] != '\0' && deliveryContextTrusted;
+      deliveryIdCacheValid && cachedDeliveryId[0] != '\0' &&
+      (deliveryContextTrusted || staleUsableContext);
   String delPart = activeContextForController ? String(cachedDeliveryId) : "NO_DELIVERY";
   String body = otpPart + "," + delPart + ",";
 
@@ -2562,11 +2571,14 @@ static String buildControllerOtpBody() {
                           (strcmp(cachedDeliveryStatus, "ARRIVED") == 0 ? "DROPOFF" :
                            (strcmp(cachedDeliveryStatus, "IN_TRANSIT") == 0 ||
                             strcmp(cachedDeliveryStatus, "PICKED_UP") == 0 ? "IN_TRANSIT" : "PICKUP")));
-  char geoFields[96];
+  char geoFields[144];
   snprintf(geoFields, sizeof(geoFields),
-           ",DIST:%d,GEO:%d,RET:%d,PHASE:%s,PUP:%d,DRO:%d",
+           ",DIST:%d,GEO:%d,RET:%d,PHASE:%s,PUP:%d,DRO:%d,CTX:%s,REFQ:%d",
            distMeters, insideGeo ? 1 : 0, returnActive ? 1 : 0,
-           phaseStr, pickupCoordsValid ? 1 : 0, insideGeo ? 1 : 0);
+           phaseStr, pickupCoordsValid ? 1 : 0, insideGeo ? 1 : 0,
+           deliveryContextStale ? "STALE" :
+               (deliveryContextTrusted ? "FRESH" : "UNVERIFIED"),
+           controllerContextRefreshQueued ? 1 : 0);
   body += String(geoFields);
   return body;
 }
@@ -2644,11 +2656,15 @@ static void handleProxyUartRequest(const String &line) {
   } else if (method == "GET" && path.startsWith("/diag")) {
     sendProxyUartResponse(id, 200, buildDiagBody());
   } else if (method == "GET" && path.startsWith("/refresh-context")) {
-    bool ok = wifiCloudHealthy || lteConnected;
-    if (ok) {
-      controllerContextRefreshQueued = true;
-    }
-    sendProxyUartResponse(id, 200, ok ? "OK" : "NO_CLOUD");
+    bool cloudReachable = wifiCloudHealthy || lteConnected;
+    controllerContextRefreshQueued = true;
+    controllerContextRefreshQueuedAt = millis();
+    if (!cloudReachable) deliveryContextStale = true;
+    strncpy(lastRefreshStatus,
+            cloudReachable ? "OK:REFRESH_QUEUED" : "WAIT:REFRESH_QUEUED",
+            sizeof(lastRefreshStatus) - 1);
+    lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
+    sendProxyUartResponse(id, 200, lastRefreshStatus);
   } else if (method == "GET" && path.startsWith("/face-check")) {
     String result = forwardFaceCheck("");
     sendProxyUartResponse(id, 200, result);
@@ -4212,10 +4228,20 @@ static bool refreshAuthoritativeDeliveryFieldsFromFirebase() {
 void refreshDeliveryContextFromFirebase() {
   if (!wifiCloudHealthy && !lteConnected) {
     Serial.println("[CONTEXT] Skip Firebase fetch - no cloud transport");
+    if (deliveryIdCacheValid && cachedDeliveryId[0] != '\0') {
+      deliveryContextStale = true;
+      strncpy(lastRefreshStatus, "STALE:LTE_OFFLINE", sizeof(lastRefreshStatus) - 1);
+      lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
+    }
     return;
   }
   if (wifiCloudHealthy && !lteConnected) {
-    refreshAuthoritativeDeliveryFieldsFromFirebase();
+    if (refreshAuthoritativeDeliveryFieldsFromFirebase()) {
+      deliveryContextStale = false;
+      deliveryContextTrusted = deliveryIdCacheValid && cachedDeliveryId[0] != '\0';
+      strncpy(lastRefreshStatus, "OK:REFRESHED", sizeof(lastRefreshStatus) - 1);
+      lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
+    }
     lastContextFetchOkAtMs = millis();
     return;
   }
@@ -4223,6 +4249,11 @@ void refreshDeliveryContextFromFirebase() {
   unsigned long nowMs = millis();
   if (modemHttpBusy) {
     Serial.println("[CONTEXT] Skip Firebase fetch - modem HTTP busy");
+    if (deliveryIdCacheValid && cachedDeliveryId[0] != '\0') {
+      deliveryContextStale = true;
+      strncpy(lastRefreshStatus, "ERR:MODEM_BUSY", sizeof(lastRefreshStatus) - 1);
+      lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
+    }
     return;
   }
   ModemLockGuard modemLock("refreshDeliveryContextFromFirebase", 250);
@@ -4302,23 +4333,26 @@ void refreshDeliveryContextFromFirebase() {
     sendATAndWait("+HTTPTERM", 1000);
     modemHttpBusy = false;
     contextFetchFailCount++;
-    bool withinSticky =
-        (lastContextFetchOkAtMs > 0) &&
-        ((nowMs - lastContextFetchOkAtMs) <= CONTEXT_STICKY_GRACE_MS);
-    if (!deliveryContextValidated &&
-        (nowMs - deliveryContextBootAtMs) > DELIVERY_CONTEXT_VALIDATE_GRACE_MS) {
-      clearDeliveryContextCaches("boot_validate_timeout", false);
-    } else if (!withinSticky &&
-               contextFetchFailCount >= CONTEXT_FAIL_RESET_THRESHOLD) {
-      clearDeliveryContextCaches("context_fetch_failed", false);
-    } else if (withinSticky) {
-      Serial.println("[CONTEXT] Fetch failed but within sticky grace window");
+    if (deliveryIdCacheValid && cachedDeliveryId[0] != '\0') {
+      deliveryContextStale = true;
+      controllerContextRefreshQueued = true;
+      controllerContextRefreshQueuedAt = millis();
+      strncpy(lastRefreshStatus, "STALE:FETCH_FAILED", sizeof(lastRefreshStatus) - 1);
+      lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
+      Serial.printf("[CONTEXT] Fetch failed; keeping cached delivery %s stale (fail=%u)\n",
+                    cachedDeliveryId, (unsigned int)contextFetchFailCount);
+    } else {
+      strncpy(lastRefreshStatus, "ERR:NO_CONTEXT", sizeof(lastRefreshStatus) - 1);
+      lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
     }
     return;
   }
 
   contextFetchFailCount = 0;
   lastContextFetchOkAtMs = nowMs;
+  deliveryContextStale = false;
+  strncpy(lastRefreshStatus, "OK:REFRESHED", sizeof(lastRefreshStatus) - 1);
+  lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
 
   if (actionOK && httpStatus == 200) {
     // A7670E/A7672X caps each AT+HTTPREAD at 1024 bytes, so page the
@@ -5502,24 +5536,28 @@ void handleCameraClient() {
 
   if (strcmp(method, "GET") == 0 && reqPathStr.startsWith("/refresh-context")) {
     controllerLastSeenAt = millis();
-    bool ok = lteConnected;
-    bool activeAfterRefresh = false;
+    bool cloudReachable = wifiCloudHealthy || lteConnected;
     bool geoRefreshRequested = reqPathStr.indexOf("geo=1") >= 0;
-    const char *geoStatus = "OK";
-
-    if (ok) {
+    controllerContextRefreshQueued = true;
+    controllerContextRefreshQueuedAt = millis();
+    if (!cloudReachable) {
+      deliveryContextStale = true;
+    } else {
       unsigned long nowMs = millis();
       manualRefreshBurstUntil = nowMs + MANUAL_REFRESH_BURST_MS;
       lastDeliveryContextRead = 0;
       lastPhoneFetchAtMs = 0;
-      controllerContextRefreshQueued = true;
-      if (geoRefreshRequested) geoStatus = "OK:QUEUED";
-      Serial.println("[CONTEXT] Keypad refresh requested - queued to background task");
     }
+    strncpy(lastRefreshStatus,
+            cloudReachable ? (geoRefreshRequested ? "OK:REFRESH_QUEUED"
+                                                  : "OK:QUEUED")
+                           : "WAIT:REFRESH_QUEUED",
+            sizeof(lastRefreshStatus) - 1);
+    lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
+    Serial.printf("[CONTEXT] Keypad refresh queued (cloud=%d stale=%d)\n",
+                  cloudReachable ? 1 : 0, deliveryContextStale ? 1 : 0);
 
-    const char *body = ok ? (geoRefreshRequested ? geoStatus :
-                             (activeAfterRefresh ? "OK_ACTIVE" : "OK"))
-                          : "NO_CLOUD";
+    const char *body = lastRefreshStatus;
     String resp =
         "HTTP/1.1 200 OK\r\n"
         "Connection: keep-alive\r\n"
@@ -5554,9 +5592,13 @@ void handleCameraClient() {
     controllerLastSeenAt = millis();
     String otpPart, delPart;
     unsigned long nowMs = millis();
+    bool cloudReachable = wifiCloudHealthy || lteConnected;
+    bool staleUsableContext =
+        deliveryIdCacheValid && cachedDeliveryId[0] != '\0' &&
+        (deliveryContextStale || !cloudReachable || lastContextFetchOkAtMs == 0);
     bool activeContextForController =
         deliveryIdCacheValid && cachedDeliveryId[0] != '\0' &&
-        deliveryContextTrusted;
+        (deliveryContextTrusted || staleUsableContext);
 
     // Compute geofence state for structured response fields.
     bool insideGeo = false;
@@ -5580,8 +5622,11 @@ void handleCameraClient() {
         otpPart = otpCacheValid ? String(cachedOtp) : "NO_OTP";
       }
       delPart = activeContextForController ? String(cachedDeliveryId) : "NO_DELIVERY";
-      if (deliveryIdCacheValid && !deliveryContextTrusted) {
+      if (deliveryIdCacheValid && !deliveryContextTrusted && !staleUsableContext) {
         Serial.printf("[AP] Delivery %s held from controller until DB verifies active\n",
+                      cachedDeliveryId);
+      } else if (staleUsableContext && !deliveryContextTrusted) {
+        Serial.printf("[AP] Serving stale cached delivery %s while cloud unavailable/unverified\n",
                       cachedDeliveryId);
       }
 
@@ -5836,13 +5881,16 @@ void handleCameraClient() {
       body += ",";
     }
 
-    // Append structured geofence fields: DIST:N,GEO:0|1,RET:0|1,PHASE:*,PUP:0|1,DRO:0|1
-    char geoFields[96];
+    // Append structured geofence fields and context health.
+    char geoFields[144];
     snprintf(geoFields, sizeof(geoFields),
-         ",DIST:%d,GEO:%d,RET:%d,PHASE:%s,PUP:%d,DRO:%d",
+         ",DIST:%d,GEO:%d,RET:%d,PHASE:%s,PUP:%d,DRO:%d,CTX:%s,REFQ:%d",
          distMeters, insideGeo ? 1 : 0, returnActive ? 1 : 0,
          phaseStr ? phaseStr : "NONE", pickupInside ? 1 : 0,
-         dropoffInside ? 1 : 0);
+         dropoffInside ? 1 : 0,
+         deliveryContextStale ? "STALE" :
+             (deliveryContextTrusted ? "FRESH" : "UNVERIFIED"),
+         controllerContextRefreshQueued ? 1 : 0);
     body += String(geoFields);
 
     Serial.printf("[AP] -> GET /otp  serving: '%s'\n", body.c_str());
@@ -6253,6 +6301,10 @@ void handleCameraClient() {
       snprintf(deliveryPath, sizeof(deliveryPath),
                "/deliveries/%s.json", cachedDeliveryId);
       bool deliveryFbOK = httpPatchWithRetry(deliveryPath, deliveryJson);
+      if (!deliveryFbOK) {
+        delay(250);
+        deliveryFbOK = httpPatchWithRetry(deliveryPath, deliveryJson);
+      }
       Serial.printf("[RELAY] Delivery proof writeback: %s\n",
                     deliveryFbOK ? "OK" : "FAIL");
 
@@ -6274,7 +6326,13 @@ void handleCameraClient() {
       char auditPath[96];
       snprintf(auditPath, sizeof(auditPath),
                "/audit_logs/%s.json", cachedDeliveryId);
-      httpPatchWithRetry(auditPath, auditJson);
+      bool auditFbOK = httpPatchWithRetry(auditPath, auditJson);
+      if (!auditFbOK) {
+        delay(250);
+        auditFbOK = httpPatchWithRetry(auditPath, auditJson);
+      }
+      Serial.printf("[RELAY] Audit proof writeback: %s\n",
+                    auditFbOK ? "OK" : "FAIL");
 
       // CRITICAL: The Web Tracking page Server-Side-Render uses the Supabase 'deliveries' table directly.
       // We must write the proof_photo_url to Supabase via REST API right after upload.
@@ -6282,7 +6340,13 @@ void handleCameraClient() {
         char supabaseDeliveryJson[320];
         snprintf(supabaseDeliveryJson, sizeof(supabaseDeliveryJson),
                  "{\"proof_photo_url\":\"%s\"}", publicUrl);
-        httpPatchSupabase("deliveries", cachedDeliveryId, supabaseDeliveryJson);
+        bool supabaseWritebackOK =
+            httpPatchSupabase("deliveries", cachedDeliveryId, supabaseDeliveryJson);
+        if (!supabaseWritebackOK) {
+          delay(250);
+          supabaseWritebackOK =
+              httpPatchSupabase("deliveries", cachedDeliveryId, supabaseDeliveryJson);
+        }
       }
     }
 
@@ -6296,6 +6360,10 @@ void handleCameraClient() {
     char camPath[64];
     snprintf(camPath, sizeof(camPath), "/hardware/%s/camera.json", HARDWARE_ID);
     bool fbOK = httpPatchWithRetry(camPath, urlJson);
+    if (!fbOK) {
+      delay(250);
+      fbOK = httpPatchWithRetry(camPath, urlJson);
+    }
     Serial.printf("[RELAY] Firebase URL writeback: %s\n", fbOK ? "OK" : "FAIL");
 
     if (!isPreviewProof && theftGuardGetState() != TG_NORMAL) {
@@ -7453,6 +7521,11 @@ void setup() {
       strncpy(cachedDeliveryId, restoredDeliveryId, sizeof(cachedDeliveryId) - 1);
       cachedDeliveryId[sizeof(cachedDeliveryId) - 1] = '\0';
       deliveryIdCacheValid = true;
+      deliveryContextStale = true;
+      controllerContextRefreshQueued = true;
+      controllerContextRefreshQueuedAt = millis();
+      strncpy(lastRefreshStatus, "OK:CACHED_STALE", sizeof(lastRefreshStatus) - 1);
+      lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
       Serial.printf("[DP] Restored DeliveryID from NVS: %s\n", cachedDeliveryId);
     }
   }
@@ -7529,6 +7602,8 @@ void firebaseSyncTask(void *pvParameters) {
     if ((wifiCloudHealthy || lteConnected) && controllerContextRefreshQueued && !modemHttpBusy) {
       controllerContextRefreshQueued = false;
       lastDeliveryContextRead = 0;
+      strncpy(lastRefreshStatus, "OK:REFRESHING", sizeof(lastRefreshStatus) - 1);
+      lastRefreshStatus[sizeof(lastRefreshStatus) - 1] = '\0';
       Serial.println("[CONTEXT] Running queued controller refresh");
     }
 

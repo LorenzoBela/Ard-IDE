@@ -112,6 +112,10 @@ bool    isReturning          = false;
 char    deliveryPhase[12]    = "NONE";
 bool    pickupInsideFence    = false;
 bool    dropoffInsideFence   = false;
+char    deliveryContextState[12] = "UNKNOWN";
+bool    deliveryContextStale = false;
+bool    proxyRefreshQueued = false;
+char    lastContextRefreshStatus[32] = "NONE";
 
 // ── WiFi backoff state ──
 static unsigned long wifiRetryAt    = 0;
@@ -588,6 +592,10 @@ static void hardResetDeliveryContext(const char *reason) {
   deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
   pickupInsideFence = false;
   dropoffInsideFence = false;
+  strncpy(deliveryContextState, "UNKNOWN", sizeof(deliveryContextState) - 1);
+  deliveryContextState[sizeof(deliveryContextState) - 1] = '\0';
+  deliveryContextStale = false;
+  proxyRefreshQueued = false;
   netLog("[FETCH] Hard reset delivery context (%s)\n",
          reason ? reason : "unknown");
 }
@@ -612,9 +620,12 @@ static void noteFetchFailure(const char *stage) {
       lastFetchSuccessAt > 0 &&
       (now - lastFetchSuccessAt) <= FETCH_CONTEXT_STICKY_MS;
 
-  if (hasFreshContext) {
-    netLog("[FETCH] Preserving cached delivery during WiFi blip (%lums old)\n",
-           now - lastFetchSuccessAt);
+  if (hasFreshContext || hasActiveDelivery) {
+    deliveryContextStale = true;
+    strncpy(deliveryContextState, "STALE", sizeof(deliveryContextState) - 1);
+    deliveryContextState[sizeof(deliveryContextState) - 1] = '\0';
+    netLog("[FETCH] Preserving cached delivery during proxy/cloud blip (%lums old)\n",
+           lastFetchSuccessAt > 0 ? (now - lastFetchSuccessAt) : 0);
     fetchFailCount = FETCH_FAIL_RESET_THRESHOLD / 2;
     return;
   }
@@ -1102,6 +1113,10 @@ static void parseOtpBody(const String &body, bool updateStatusCommand = true) {
   deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
   pickupInsideFence = false;
   dropoffInsideFence = false;
+  strncpy(deliveryContextState, "UNKNOWN", sizeof(deliveryContextState) - 1);
+  deliveryContextState[sizeof(deliveryContextState) - 1] = '\0';
+  deliveryContextStale = false;
+  proxyRefreshQueued = false;
 
   netLog("[FETCH] Body: '%s'\n", body.c_str());
 
@@ -1173,6 +1188,23 @@ static void parseOtpBody(const String &body, bool updateStatusCommand = true) {
       dropoffInsideFence = (body.charAt(droIdx + 4) == '1');
       sawGeoToken = true;
     }
+    int ctxIdx = body.indexOf("CTX:");
+    if (ctxIdx >= 0) {
+      int valStart = ctxIdx + 4;
+      int valEnd = body.indexOf(',', valStart);
+      if (valEnd < 0) valEnd = body.length();
+      String ctx = body.substring(valStart, valEnd);
+      ctx.trim();
+      if (ctx.length() > 0 && ctx.length() < (int)sizeof(deliveryContextState)) {
+        strncpy(deliveryContextState, ctx.c_str(), sizeof(deliveryContextState) - 1);
+        deliveryContextState[sizeof(deliveryContextState) - 1] = '\0';
+      }
+      deliveryContextStale = (strcmp(deliveryContextState, "STALE") == 0);
+    }
+    int refqIdx = body.indexOf("REFQ:");
+    if (refqIdx >= 0) {
+      proxyRefreshQueued = (body.charAt(refqIdx + 5) == '1');
+    }
 
     bool validOtp = (otpPart != "NO_OTP" && otpPart != "null" &&
                      otpPart.length() > 0 && otpPart.length() <= 6);
@@ -1198,6 +1230,8 @@ static void parseOtpBody(const String &body, bool updateStatusCommand = true) {
       deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
       pickupInsideFence = false;
       dropoffInsideFence = false;
+      deliveryContextStale = false;
+      proxyRefreshQueued = false;
     }
     geoContextKnown = hasActiveDelivery && sawGeoToken;
     if (geoContextKnown) {
@@ -1220,12 +1254,20 @@ static void parseOtpBody(const String &body, bool updateStatusCommand = true) {
     hasActiveDelivery = true;
     geoContextKnown = false;
     lastGeoContextAt = 0;
+    strncpy(deliveryContextState, "LEGACY", sizeof(deliveryContextState) - 1);
+    deliveryContextState[sizeof(deliveryContextState) - 1] = '\0';
+    deliveryContextStale = false;
+    proxyRefreshQueued = false;
   } else {
     currentOtp[0] = '\0';
     activeDeliveryId[0] = '\0';
     hasActiveDelivery = false;
     geoContextKnown = false;
     lastGeoContextAt = 0;
+    strncpy(deliveryContextState, "UNKNOWN", sizeof(deliveryContextState) - 1);
+    deliveryContextState[sizeof(deliveryContextState) - 1] = '\0';
+    deliveryContextStale = false;
+    proxyRefreshQueued = false;
   }
 }
 
@@ -1324,8 +1366,12 @@ bool requestContextRefresh() {
     if (proxyUartPrimaryRequest("GET", "/refresh-context", "", uartBody,
                                 PROXY_UART_TIMEOUT_MS)) {
       uartBody.trim();
+      strncpy(lastContextRefreshStatus, uartBody.c_str(),
+              sizeof(lastContextRefreshStatus) - 1);
+      lastContextRefreshStatus[sizeof(lastContextRefreshStatus) - 1] = '\0';
       netLog("[REFRESH] UART fallback body='%s'\n", uartBody.c_str());
-      return uartBody.startsWith("OK");
+      return uartBody.startsWith("OK") || uartBody.startsWith("WAIT") ||
+             uartBody.startsWith("STALE");
     }
     netLog("[REFRESH] Skip — no primary transport available\n");
     return false;
@@ -1338,8 +1384,12 @@ bool requestContextRefresh() {
   String body = "";
   int code = httpGetOnce("/refresh-context?geo=1", body, FETCH_HTTP_TIMEOUT_MS);
   body.trim();
+  strncpy(lastContextRefreshStatus, body.c_str(),
+          sizeof(lastContextRefreshStatus) - 1);
+  lastContextRefreshStatus[sizeof(lastContextRefreshStatus) - 1] = '\0';
   netLog("[REFRESH] HTTP %d body='%s'\n", code, body.c_str());
-  if (code == 200 && body.startsWith("OK")) {
+  if (code == 200 && (body.startsWith("OK") || body.startsWith("WAIT") ||
+                      body.startsWith("STALE"))) {
     return true;
   }
   return false;
@@ -1381,8 +1431,12 @@ bool requestContextRefresh() {
   }
 
   body.trim();
+  strncpy(lastContextRefreshStatus, body.c_str(),
+          sizeof(lastContextRefreshStatus) - 1);
+  lastContextRefreshStatus[sizeof(lastContextRefreshStatus) - 1] = '\0';
   netLog("[REFRESH] HTTP %d body='%s'\n", code, body.c_str());
-  if (code == 200 && body.startsWith("OK")) {
+  if (code == 200 && (body.startsWith("OK") || body.startsWith("WAIT") ||
+                      body.startsWith("STALE"))) {
     return true;
   }
   return false;

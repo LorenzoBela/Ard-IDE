@@ -743,6 +743,14 @@ static void showKeypadStatusMessage(unsigned long now, bool refreshOk) {
     return;
   }
 
+  if (strstr(lastContextRefreshStatus, "WAIT:") == lastContextRefreshStatus ||
+      strstr(lastContextRefreshStatus, "STALE:") == lastContextRefreshStatus) {
+    updateDisplay("Refresh queued", hasActiveDelivery ? "Using cached" : "Signal weak");
+    messageStartAt = now;
+    currentState = STATE_SHOW_MESSAGE;
+    return;
+  }
+
   if (!hasActiveDelivery) {
     updateDisplay("No delivery", "Check app");
     messageStartAt = now;
@@ -936,6 +944,14 @@ static void processKeypadGeoCheck(unsigned long now) {
     if (!isDisplayFailed()) {
       updateDisplay("Proxy offline", "Waiting...");
     }
+    return;
+  }
+
+  if (deliveryContextStale || proxyRefreshQueued) {
+    updateDisplay(deliveryContextStale ? "Using cached" : "Refresh queued",
+                  proxyRefreshQueued ? "Auto refresh" : "Signal weak");
+    messageStartAt = now;
+    currentState = STATE_SHOW_MESSAGE;
     return;
   }
 
