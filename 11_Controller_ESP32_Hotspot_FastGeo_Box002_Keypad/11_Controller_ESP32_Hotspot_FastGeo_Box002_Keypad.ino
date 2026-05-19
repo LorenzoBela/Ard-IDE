@@ -76,6 +76,7 @@ static unsigned long lastDisplayCheck         = 0;
 static unsigned long personalPinExpiresAt     = 0;
 static const unsigned long KEYPAD_GEO_CHECK_FIRST_DELAY_MS = 800;
 static const unsigned long KEYPAD_GEO_CHECK_RETRY_DELAY_MS = 900;
+static const unsigned long KEYPAD_GEO_CACHE_FRESH_MS = 6000;
 static const uint8_t KEYPAD_GEO_CHECK_ATTEMPTS = 5;
 static unsigned long keypadGeoCheckAt = 0;
 static uint8_t keypadGeoChecksRemaining = 0;
@@ -923,9 +924,13 @@ static void processKeypadGeoCheck(unsigned long now) {
     return;
   }
 
-  bool refreshOk = requestContextRefresh();
-  bool fetchOk = fetchDeliveryContext();
-  lastDeliveryContextFetch = now;
+  bool fetchOk = true;
+  bool refreshOk = true;
+  if (!isGeoContextFresh(KEYPAD_GEO_CACHE_FRESH_MS)) {
+    refreshOk = requestContextRefresh();
+    fetchOk = fetchDeliveryContext();
+    lastDeliveryContextFetch = now;
+  }
 
   if (!fetchOk) {
     if (!isDisplayFailed()) {

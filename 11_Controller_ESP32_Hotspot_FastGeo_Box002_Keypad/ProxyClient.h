@@ -31,6 +31,12 @@ extern char    deliveryPhase[12]; // PICKUP | IN_TRANSIT | DROPOFF | RETURN | NO
 extern bool    pickupInsideFence; // Inside pickup geofence
 extern bool    dropoffInsideFence; // Inside dropoff geofence
 
+/** True when the cached geofence fields came from a recent proxy response. */
+bool isGeoContextFresh(unsigned long maxAgeMs);
+
+/** Age of the last parsed geofence context; 0xFFFFFFFF means never received. */
+unsigned long getGeoContextAgeMs();
+
 struct ControllerDiagData {
 	int battPct;
 	float battVoltage;

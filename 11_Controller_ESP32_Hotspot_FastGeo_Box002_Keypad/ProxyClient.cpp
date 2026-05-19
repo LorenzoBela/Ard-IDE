@@ -36,10 +36,70 @@ static WiFiUDP udpClient;
 static HardwareSerial proxySerial(1);
 static bool proxyUartStarted = false;
 static SemaphoreHandle_t proxyUartMutex = NULL;
+static SemaphoreHandle_t proxyIoMutex = NULL;
+static QueueHandle_t proxyPostQueue = NULL;
+static TaskHandle_t proxyPostTaskHandle = NULL;
 static uint16_t proxyRequestId = 1;
 static unsigned long proxyUartRetryAt = 0;
 static uint8_t proxyUartFailCount = 0;
 static uint8_t proxyUartResetCount = 0;
+static volatile uint32_t proxyPostQueuedCount = 0;
+static volatile uint32_t proxyPostSentCount = 0;
+static volatile uint32_t proxyPostFailCount = 0;
+static volatile uint32_t proxyPostDropCount = 0;
+static volatile uint32_t proxyIoBusyCount = 0;
+static const char *volatile proxyIoOwner = "none";
+
+struct ProxyPostJob {
+  char path[32];
+  char json[512];
+  uint8_t attempts;
+};
+
+static void proxyPostTask(void *pvParameters);
+
+static void ensureProxyAsync() {
+  if (proxyIoMutex == NULL) {
+    proxyIoMutex = xSemaphoreCreateRecursiveMutex();
+  }
+  if (proxyPostQueue == NULL) {
+    proxyPostQueue = xQueueCreate(10, sizeof(ProxyPostJob));
+  }
+  if (proxyPostTaskHandle == NULL && proxyPostQueue != NULL) {
+    xTaskCreatePinnedToCore(proxyPostTask, "ProxyPost", 6144, NULL, 1,
+                            &proxyPostTaskHandle, 0);
+  }
+}
+
+static bool takeProxyIo(uint32_t timeoutMs, const char *owner) {
+  ensureProxyAsync();
+  if (proxyIoMutex == NULL) return true;
+  if (xSemaphoreTakeRecursive(proxyIoMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE) {
+    proxyIoOwner = owner ? owner : "unknown";
+    return true;
+  }
+  proxyIoBusyCount++;
+  return false;
+}
+
+static void giveProxyIo() {
+  if (proxyIoMutex == NULL) return;
+  proxyIoOwner = "none";
+  xSemaphoreGiveRecursive(proxyIoMutex);
+}
+
+class ProxyIoGuard {
+public:
+  ProxyIoGuard(const char *owner, uint32_t timeoutMs)
+      : _locked(takeProxyIo(timeoutMs, owner)) {}
+  ~ProxyIoGuard() {
+    if (_locked) giveProxyIo();
+  }
+  bool ok() const { return _locked; }
+
+private:
+  bool _locked;
+};
 
 // ── Delivery context ──
 char  currentOtp[8]          = "";
@@ -494,8 +554,20 @@ static bool discoverProxyUdp(unsigned long timeoutMs = 1200) {
 static const uint16_t FETCH_HTTP_TIMEOUT_MS = 5000;
 static const uint16_t REFRESH_HTTP_TIMEOUT_MS = 2500;
 static unsigned long lastFetchSuccessAt = 0;
+static unsigned long lastGeoContextAt = 0;
 static uint8_t fetchFailCount = 0;
+static bool geoContextKnown = false;
 static const uint8_t FETCH_FAIL_RESET_THRESHOLD = 20;
+
+bool isGeoContextFresh(unsigned long maxAgeMs) {
+  if (!geoContextKnown || lastGeoContextAt == 0) return false;
+  return (millis() - lastGeoContextAt) <= maxAgeMs;
+}
+
+unsigned long getGeoContextAgeMs() {
+  if (!geoContextKnown || lastGeoContextAt == 0) return 0xFFFFFFFFUL;
+  return millis() - lastGeoContextAt;
+}
 
 static void hardResetDeliveryContext(const char *reason) {
   if (!hasActiveDelivery && currentOtp[0] == '\0' && activeDeliveryId[0] == '\0' &&
@@ -510,6 +582,8 @@ static void hardResetDeliveryContext(const char *reason) {
   geoDistMeters = -1;
   geoInsideFence = false;
   isReturning = false;
+  geoContextKnown = false;
+  lastGeoContextAt = 0;
   strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
   deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
   pickupInsideFence = false;
@@ -721,6 +795,7 @@ static void beginProxyConnection(const char *reason) {
 }
 
 void startWiFiConnection() {
+  ensureProxyAsync();
   startProxyUart();
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
@@ -1012,14 +1087,17 @@ static int readHttpResponse(String &bodyOut, unsigned long timeoutMs) {
   return statusCode;
 }
 
-static void parseOtpBody(const String &body) {
+static void parseOtpBody(const String &body, bool updateStatusCommand = true) {
   fetchFailCount = 0;
   lastFetchSuccessAt = millis();
 
-  lastStatusCommand = "";
+  if (updateStatusCommand) {
+    lastStatusCommand = "";
+  }
   geoDistMeters = -1;
   geoInsideFence = false;
   isReturning = false;
+  geoContextKnown = false;
   strncpy(deliveryPhase, "NONE", sizeof(deliveryPhase) - 1);
   deliveryPhase[sizeof(deliveryPhase) - 1] = '\0';
   pickupInsideFence = false;
@@ -1044,17 +1122,25 @@ static void parseOtpBody(const String &body) {
       delPart = body.substring(firstComma + 1);
     }
 
-    lastStatusCommand = normalizeStatusToken(statusPart);
+    String parsedStatusCommand = normalizeStatusToken(statusPart);
+    if (updateStatusCommand) {
+      lastStatusCommand = parsedStatusCommand;
+    }
 
+    bool sawGeoToken = false;
     int distIdx = body.indexOf("DIST:");
     if (distIdx >= 0) {
       int valStart = distIdx + 5;
       int valEnd = body.indexOf(',', valStart);
       if (valEnd < 0) valEnd = body.length();
       geoDistMeters = (int16_t)body.substring(valStart, valEnd).toInt();
+      sawGeoToken = true;
     }
     int geoIdx = body.indexOf("GEO:");
-    if (geoIdx >= 0) geoInsideFence = (body.charAt(geoIdx + 4) == '1');
+    if (geoIdx >= 0) {
+      geoInsideFence = (body.charAt(geoIdx + 4) == '1');
+      sawGeoToken = true;
+    }
     int retIdx = body.indexOf("RET:");
     if (retIdx >= 0) isReturning = (body.charAt(retIdx + 4) == '1');
 
@@ -1078,9 +1164,15 @@ static void parseOtpBody(const String &body) {
     }
 
     int pupIdx = body.indexOf("PUP:");
-    if (pupIdx >= 0) pickupInsideFence = (body.charAt(pupIdx + 4) == '1');
+    if (pupIdx >= 0) {
+      pickupInsideFence = (body.charAt(pupIdx + 4) == '1');
+      sawGeoToken = true;
+    }
     int droIdx = body.indexOf("DRO:");
-    if (droIdx >= 0) dropoffInsideFence = (body.charAt(droIdx + 4) == '1');
+    if (droIdx >= 0) {
+      dropoffInsideFence = (body.charAt(droIdx + 4) == '1');
+      sawGeoToken = true;
+    }
 
     bool validOtp = (otpPart != "NO_OTP" && otpPart != "null" &&
                      otpPart.length() > 0 && otpPart.length() <= 6);
@@ -1107,6 +1199,12 @@ static void parseOtpBody(const String &body) {
       pickupInsideFence = false;
       dropoffInsideFence = false;
     }
+    geoContextKnown = hasActiveDelivery && sawGeoToken;
+    if (geoContextKnown) {
+      lastGeoContextAt = millis();
+    } else {
+      lastGeoContextAt = 0;
+    }
     netLog("[FETCH] otp=%d del=%d dist=%d geo=%d ret=%d phase=%s pup=%d dro=%d cmd='%s'\n",
            validOtp, validDel, geoDistMeters, geoInsideFence ? 1 : 0,
            isReturning ? 1 : 0, deliveryPhase,
@@ -1120,14 +1218,18 @@ static void parseOtpBody(const String &body) {
     strncpy(currentOtp, body.c_str(), sizeof(currentOtp) - 1);
     currentOtp[sizeof(currentOtp) - 1] = '\0';
     hasActiveDelivery = true;
+    geoContextKnown = false;
+    lastGeoContextAt = 0;
   } else {
     currentOtp[0] = '\0';
     activeDeliveryId[0] = '\0';
     hasActiveDelivery = false;
+    geoContextKnown = false;
+    lastGeoContextAt = 0;
   }
 }
 
-bool fetchDeliveryContext() {
+static bool fetchDeliveryContextInternal(bool updateStatusCommand) {
   String uartBody;
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -1135,10 +1237,16 @@ bool fetchDeliveryContext() {
     if (proxyUartPrimaryRequest("GET", "/otp", "", uartBody,
                                 PROXY_UART_TIMEOUT_MS)) {
       netLog("[FETCH] UART fallback OK\n");
-      parseOtpBody(uartBody);
+      parseOtpBody(uartBody, updateStatusCommand);
       return true;
     }
     netLog("[FETCH] Skip — no primary transport available\n");
+    return false;
+  }
+
+  ProxyIoGuard io(updateStatusCommand ? "fetchDeliveryContext" : "geoCacheFetch", 100);
+  if (!io.ok()) {
+    if (updateStatusCommand) noteFetchFailure("proxy_io_busy");
     return false;
   }
 
@@ -1147,15 +1255,15 @@ bool fetchDeliveryContext() {
   int code = httpGetOnce("/otp", body, FETCH_HTTP_TIMEOUT_MS);
   netLog("[FETCH] HTTP %d\n", code);
   if (code != 200) {
-    noteFetchFailure("http_non_200");
+    if (updateStatusCommand) noteFetchFailure("http_non_200");
     return false;
   }
-  parseOtpBody(body);
+  parseOtpBody(body, updateStatusCommand);
   return true;
 #else
   // Ensure persistent TCP socket is alive.
   if (!ensurePersistentConnection()) {
-    noteFetchFailure("tcp_connect");
+    if (updateStatusCommand) noteFetchFailure("tcp_connect");
     return false;
   }
 
@@ -1175,7 +1283,7 @@ bool fetchDeliveryContext() {
     closePersistentConnection();
     // One retry with fresh connection
     if (!ensurePersistentConnection()) {
-      noteFetchFailure("tcp_retry");
+      if (updateStatusCommand) noteFetchFailure("tcp_retry");
       return false;
     }
     persistentClient.printf(
@@ -1187,7 +1295,7 @@ bool fetchDeliveryContext() {
     body = "";
     code = readHttpResponse(body, REFRESH_HTTP_TIMEOUT_MS);
     if (code < 0) {
-      noteFetchFailure("http_retry");
+      if (updateStatusCommand) noteFetchFailure("http_retry");
       closePersistentConnection();
       return false;
     }
@@ -1195,13 +1303,17 @@ bool fetchDeliveryContext() {
 
   netLog("[FETCH] HTTP %d\n", code);
   if (code != 200) {
-    noteFetchFailure("http_non_200");
+    if (updateStatusCommand) noteFetchFailure("http_non_200");
     return false;
   }
 
-  parseOtpBody(body);
+  parseOtpBody(body, updateStatusCommand);
   return true;
 #endif
+}
+
+bool fetchDeliveryContext() {
+  return fetchDeliveryContextInternal(true);
 }
 
 bool requestContextRefresh() {
@@ -1218,6 +1330,9 @@ bool requestContextRefresh() {
     netLog("[REFRESH] Skip — no primary transport available\n");
     return false;
   }
+
+  ProxyIoGuard io("requestContextRefresh", 250);
+  if (!io.ok()) return false;
 
 #if DISABLE_PROXY_KEEPALIVE
   String body = "";
@@ -1285,6 +1400,9 @@ bool requestProxyPing() {
     }
     return false;
   }
+
+  ProxyIoGuard io("requestProxyPing", 50);
+  if (!io.ok()) return false;
 
 #if DISABLE_PROXY_KEEPALIVE
   String body = "";
@@ -1359,6 +1477,9 @@ bool fetchDiagnostics(ControllerDiagData &out) {
   }
   if (PROXY_HOST[0] == '\0' && !discoverProxyUdp(PROXY_DISCOVERY_FAST_MS) &&
       !probeLikelyProxyHosts(PROXY_SUBNET_PROBE_HOSTS + 6)) return false;
+
+  ProxyIoGuard io("fetchDiagnostics", 50);
+  if (!io.ok()) return false;
 
   WiFiClient client;
   HTTPClient http;
@@ -1490,6 +1611,10 @@ bool fetchDiagnostics(ControllerDiagData &out) {
 // Reuses the keep-alive socket for fire-and-forget POSTs during the
 // unlock flow, avoiding ~150ms TCP handshake per call.
 static int sendRawPost(const char *path, const char *json) {
+  ProxyIoGuard io("sendRawPost", 2500);
+  if (!io.ok()) {
+    return -2;
+  }
   String uartBody;
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -1558,6 +1683,54 @@ static int sendRawPost(const char *path, const char *json) {
 #endif
 }
 
+static bool enqueueProxyPost(const char *path, const char *json) {
+  ensureProxyAsync();
+  if (proxyPostQueue == NULL || path == NULL || json == NULL) return false;
+
+  ProxyPostJob job;
+  memset(&job, 0, sizeof(job));
+  strncpy(job.path, path, sizeof(job.path) - 1);
+  strncpy(job.json, json, sizeof(job.json) - 1);
+  job.attempts = 0;
+
+  if (xQueueSend(proxyPostQueue, &job, 0) != pdTRUE) {
+    ProxyPostJob dropped;
+    if (xQueueReceive(proxyPostQueue, &dropped, 0) == pdTRUE) {
+      proxyPostDropCount++;
+    }
+    if (xQueueSend(proxyPostQueue, &job, 0) != pdTRUE) {
+      proxyPostDropCount++;
+      return false;
+    }
+  }
+  proxyPostQueuedCount++;
+  return true;
+}
+
+static void proxyPostTask(void *pvParameters) {
+  (void)pvParameters;
+  ProxyPostJob job;
+  for (;;) {
+    if (proxyPostQueue != NULL &&
+        xQueueReceive(proxyPostQueue, &job, pdMS_TO_TICKS(250)) == pdTRUE) {
+      int code = sendRawPost(job.path, job.json);
+      if (code == 200 || code == 201) {
+        proxyPostSentCount++;
+      } else {
+        proxyPostFailCount++;
+        job.attempts++;
+        if (job.attempts < 3) {
+          vTaskDelay(pdMS_TO_TICKS(500 + (job.attempts * 500)));
+          if (xQueueSend(proxyPostQueue, &job, 0) != pdTRUE) {
+            proxyPostDropCount++;
+          }
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
 // ==================== REPORT EVENT ====================
 bool reportEventToProxy(bool otpValid,
                         bool faceDetected,
@@ -1585,12 +1758,12 @@ bool reportEventToProxy(bool otpValid,
            fallbackRequired ? "true" : "false", safeReason,
            unlockLatencyMs);
 
-  int code = sendRawPost("/event", json);
+  bool queued = enqueueProxyPost("/event", json);
 #if CONTROLLER_VERBOSE_LOGS
-  Serial.printf("[EVENT] POST → HTTP %d\n", code);
+  Serial.printf("[EVENT] queued=%d\n", queued ? 1 : 0);
 #endif
 
-  return (code == 200 || code == 201);
+  return queued;
 }
 
 // ==================== ALERT REPORTING ====================
@@ -1601,12 +1774,12 @@ bool reportAlertToProxy(const char *alertType, const char *details) {
            "\"box_id\":\"%s\",\"delivery_id\":\"%s\"}",
            alertType, details, HARDWARE_ID, activeDeliveryId);
 
-  int code = sendRawPost("/event", json);
+  bool queued = enqueueProxyPost("/event", json);
 #if CONTROLLER_VERBOSE_LOGS
-  Serial.printf("[ALERT] %s → HTTP %d\n", alertType, code);
+  Serial.printf("[ALERT] %s queued=%d\n", alertType, queued ? 1 : 0);
 #endif
 
-  return (code == 200 || code == 201);
+  return queued;
 }
 
 // ==================== TAMPER REPORT ====================
@@ -1617,12 +1790,12 @@ bool reportTamperToProxy() {
            "\"box_id\":\"%s\",\"delivery_id\":\"%s\",\"tamper\":true}",
            HARDWARE_ID, activeDeliveryId);
 
-  int code = sendRawPost("/event", json);
+  bool queued = enqueueProxyPost("/event", json);
 #if CONTROLLER_VERBOSE_LOGS
-  Serial.printf("[TAMPER] Report → HTTP %d\n", code);
+  Serial.printf("[TAMPER] queued=%d\n", queued ? 1 : 0);
 #endif
 
-  return (code == 200 || code == 201);
+  return queued;
 }
 
 // ==================== COMMAND ACK REPORT ====================
@@ -1634,12 +1807,12 @@ bool reportCommandAckToProxy(const char *command, const char *status, const char
            command ? command : "", status ? status : "", details ? details : "",
            HARDWARE_ID, activeDeliveryId);
 
-  int code = sendRawPost("/command-ack", json);
+  bool queued = enqueueProxyPost("/command-ack", json);
 #if CONTROLLER_VERBOSE_LOGS
-  Serial.printf("[CMD_ACK] %s/%s -> HTTP %d\n", command ? command : "", status ? status : "", code);
+  Serial.printf("[CMD_ACK] %s/%s queued=%d\n", command ? command : "", status ? status : "", queued ? 1 : 0);
 #endif
 
-  return (code == 200 || code == 201);
+  return queued;
 }
 
 bool requestCameraPowerMode(bool wakeMode) {
@@ -1658,6 +1831,9 @@ bool requestCameraPowerMode(bool wakeMode) {
       !probeLikelyProxyHosts(PROXY_SUBNET_PROBE_HOSTS + 6)) {
     return false;
   }
+
+  ProxyIoGuard io("requestCameraPowerMode", 250);
+  if (!io.ok()) return false;
 
   HTTPClient http;
   char url[96];
@@ -1722,6 +1898,9 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
     return -2;
   }
 
+  ProxyIoGuard io("requestPersonalPinToggle", 250);
+  if (!io.ok()) return -2;
+
   HTTPClient http;
   char url[96];
   snprintf(url, sizeof(url), "http://%s:%d/personal-pin-verify", PROXY_HOST,
@@ -1771,6 +1950,8 @@ int requestFaceCheck() {
       Serial.println(F("[FACE] Proxy discovery failed"));
 #endif
     } else {
+    ProxyIoGuard io("requestFaceCheck", 250);
+    if (!io.ok()) return -1;
     HTTPClient http;
     char url[128];
     if (strlen(activeDeliveryId) > 0 &&

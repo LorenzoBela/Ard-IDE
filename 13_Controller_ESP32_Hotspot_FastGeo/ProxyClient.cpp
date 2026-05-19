@@ -39,7 +39,6 @@ static SemaphoreHandle_t proxyUartMutex = NULL;
 static SemaphoreHandle_t proxyIoMutex = NULL;
 static QueueHandle_t proxyPostQueue = NULL;
 static TaskHandle_t proxyPostTaskHandle = NULL;
-static TaskHandle_t proxyGeoTaskHandle = NULL;
 static uint16_t proxyRequestId = 1;
 static unsigned long proxyUartRetryAt = 0;
 static uint8_t proxyUartFailCount = 0;
@@ -58,7 +57,6 @@ struct ProxyPostJob {
 };
 
 static void proxyPostTask(void *pvParameters);
-static void proxyGeoTask(void *pvParameters);
 
 static void ensureProxyAsync() {
   if (proxyIoMutex == NULL) {
@@ -70,10 +68,6 @@ static void ensureProxyAsync() {
   if (proxyPostTaskHandle == NULL && proxyPostQueue != NULL) {
     xTaskCreatePinnedToCore(proxyPostTask, "ProxyPost", 6144, NULL, 1,
                             &proxyPostTaskHandle, 0);
-  }
-  if (proxyGeoTaskHandle == NULL) {
-    xTaskCreatePinnedToCore(proxyGeoTask, "ProxyGeo", 6144, NULL, 1,
-                            &proxyGeoTaskHandle, 0);
   }
 }
 
@@ -559,9 +553,6 @@ static bool discoverProxyUdp(unsigned long timeoutMs = 1200) {
 // ── Fetch reliability controls ──
 static const uint16_t FETCH_HTTP_TIMEOUT_MS = 5000;
 static const uint16_t REFRESH_HTTP_TIMEOUT_MS = 2500;
-static const unsigned long GEO_CONTEXT_FRESH_MS = 6000UL;
-static const unsigned long GEO_BACKGROUND_ACTIVE_MS = 3000UL;
-static const unsigned long GEO_BACKGROUND_IDLE_MS = 10000UL;
 static unsigned long lastFetchSuccessAt = 0;
 static unsigned long lastGeoContextAt = 0;
 static uint8_t fetchFailCount = 0;
@@ -1737,32 +1728,6 @@ static void proxyPostTask(void *pvParameters) {
       }
     }
     vTaskDelay(pdMS_TO_TICKS(20));
-  }
-}
-
-static void proxyGeoTask(void *pvParameters) {
-  (void)pvParameters;
-  unsigned long lastPollAt = 0;
-
-  for (;;) {
-    unsigned long now = millis();
-    unsigned long interval = hasActiveDelivery ? GEO_BACKGROUND_ACTIVE_MS
-                                               : GEO_BACKGROUND_IDLE_MS;
-    bool staleActiveGeo =
-        hasActiveDelivery && !isGeoContextFresh(GEO_CONTEXT_FRESH_MS);
-
-    if (WiFi.status() == WL_CONNECTED &&
-        PROXY_HOST[0] != '\0' &&
-        (staleActiveGeo || now - lastPollAt >= interval)) {
-      lastPollAt = now;
-
-      if (hasActiveDelivery) {
-        requestContextRefresh();
-      }
-      fetchDeliveryContextInternal(false);
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(250));
   }
 }
 
