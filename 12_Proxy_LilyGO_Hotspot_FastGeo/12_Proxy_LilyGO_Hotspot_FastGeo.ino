@@ -122,7 +122,7 @@ static const uint8_t HOTSPOT_COUNT = sizeof(HOTSPOTS) / sizeof(HOTSPOTS[0]);
 #define TIME_SYNC_INTERVAL 1800000 // Re-sync time every 30 minutes
 
 // Reliability
-#define WDT_TIMEOUT_S 30            // Watchdog reboot after 30s hang
+#define WDT_TIMEOUT_S 90            // Allow slow cellular/WiFi calls without false reboot
 #define MODEM_HEALTH_INTERVAL 30000       // Check modem alive every 30s
 #define TAMPER_CHECK_INTERVAL 15000        // Check tamper-clear command every 15s (rare admin action)
 #define PHOTO_BURST_CHECK_INTERVAL 10000   // Check camera burst commands from web admin
@@ -175,9 +175,10 @@ WiFiServer camServer(CAM_SERVER_PORT);
 // the existing one so we can read subsequent requests on the same TCP pipe.
 static WiFiClient keepAliveController;
 static bool inApRequestHandler = false;
-static bool modemHttpBusy = false;
+static volatile bool modemHttpBusy = false;
 SemaphoreHandle_t stateMutex = NULL;
 SemaphoreHandle_t modemMutex = NULL;
+TaskHandle_t smartBoxLoopTaskHandle = NULL;
 TaskHandle_t firebaseSyncTaskHandle = NULL;
 static volatile uint32_t modemLockSkipCount = 0;
 static volatile uint32_t stateLockSkipCount = 0;
@@ -566,11 +567,13 @@ static bool wifiPutToFirebase(const char *path, const String &jsonData);
 static bool wifiPatchToFirebase(const char *path, const String &jsonData);
 static bool wifiGetFromFirebase(const char *path, String &bodyOut);
 static void pollWifiCloudHealth(unsigned long now);
+static const char *connectivityStateStr(uint8_t state);
 static bool readTopLevelJsonString(const String &json, const char *key,
                                    char *out, size_t outSize);
 static bool readTopLevelJsonBool(const String &json, const char *key, bool &outVal);
 static bool readTopLevelJsonInt(const String &json, const char *key, int &outVal);
 static bool readTopLevelJsonDouble(const String &json, const char *key, double &outVal);
+static bool refreshAuthoritativeDeliveryFieldsFromFirebase(bool includeCoords = true);
 static bool verifyPersonalPinLocal(const char *pin);
 static void probeCameraIfDue(unsigned long now);
 void writeLockEventToFirebase(bool otpValid, bool faceDetected, bool unlocked,
@@ -634,9 +637,15 @@ public:
   ModemLockGuard(const char *owner, uint32_t timeoutMs)
       : _owner(owner), _locked(takeModem(timeoutMs, owner)) {}
   ~ModemLockGuard() {
-    if (_locked) giveModem(_owner);
+    release();
   }
   bool ok() const { return _locked; }
+  void release() {
+    if (_locked) {
+      giveModem(_owner);
+      _locked = false;
+    }
+  }
 
 private:
   const char *_owner;
@@ -1480,20 +1489,32 @@ static String firebaseUrlForPath(const char *path) {
   return url;
 }
 
+static inline void feedCloudIoWatchdog() {
+  TaskHandle_t currentTask = xTaskGetCurrentTaskHandle();
+  if (smartBoxLoopTaskHandle == NULL || currentTask == smartBoxLoopTaskHandle) {
+    esp_task_wdt_reset();
+  }
+  yield();
+}
+
 static bool wifiFirebaseRequest(const char *method, const char *path,
                                 const String *payload, String *bodyOut,
                                 int *statusOut = NULL) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
+  feedCloudIoWatchdog();
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   String url = firebaseUrlForPath(path);
+  feedCloudIoWatchdog();
   if (!http.begin(client, url)) return false;
+  feedCloudIoWatchdog();
   http.setTimeout(8000);
   http.addHeader("Content-Type", "application/json");
 
   int code = -1;
+  feedCloudIoWatchdog();
   if (strcmp(method, "GET") == 0) {
     code = http.GET();
   } else if (strcmp(method, "PUT") == 0) {
@@ -1501,10 +1522,16 @@ static bool wifiFirebaseRequest(const char *method, const char *path,
   } else if (strcmp(method, "PATCH") == 0) {
     code = http.sendRequest("PATCH", *payload);
   }
+  feedCloudIoWatchdog();
 
   if (statusOut) *statusOut = code;
-  if (code > 0 && bodyOut) *bodyOut = http.getString();
+  if (code > 0 && bodyOut) {
+    feedCloudIoWatchdog();
+    *bodyOut = http.getString();
+    feedCloudIoWatchdog();
+  }
   http.end();
+  feedCloudIoWatchdog();
 
   bool ok = (code >= 200 && code < 300);
   if (ok) {
@@ -2107,6 +2134,7 @@ static bool isControllerUp(unsigned long now) {
 
 void maybePublishDurabilityMetrics(unsigned long now) {
   if (!lteConnected) return;
+  if (modemHttpBusy) return;
   if ((now - lastDurabilityMetricFlushAt) < DURABILITY_METRICS_INTERVAL_MS) {
     return;
   }
@@ -2166,7 +2194,8 @@ bool httpPatchWithRetry(const char *path, const char *jsonData) {
 
 void publishPhotoUploadState(const char *status, int progress,
                              const char *deliveryId, size_t originalSize,
-                             const char *errorMessage = "") {
+                             const char *errorMessage = "",
+                             const char *uploadRole = "full") {
   const char *safeStatus = status && status[0] ? status : "PENDING";
   const char *safeDelivery =
       (deliveryId && deliveryId[0]) ? deliveryId : "UNKNOWN_DELIVERY";
@@ -2196,10 +2225,12 @@ void publishPhotoUploadState(const char *status, int progress,
            "\"progress_percent\":%d,\"original_size_bytes\":%lu,"
            "\"compressed_size_bytes\":%lu,\"compression_ratio\":1,"
            "\"retry_count\":0,\"error_message\":\"%s\","
+           "\"last_upload_role\":\"%s\","
            "\"upload_updated_at\":{\".sv\":\"timestamp\"}}",
            safeDelivery, safeStatus, clampedProgress,
            (unsigned long)originalSize, (unsigned long)originalSize,
-           errorMessage ? errorMessage : "");
+           errorMessage ? errorMessage : "",
+           (uploadRole && uploadRole[0]) ? uploadRole : "full");
 
   char path[80];
   snprintf(path, sizeof(path), "/hardware/%s/photo_upload.json", HARDWARE_ID);
@@ -2356,7 +2387,9 @@ void sendToFirebase() {
 
 static int selectBestHotspot(char *ssidOut, size_t ssidLen,
                              char *passOut, size_t passLen) {
+  feedCloudIoWatchdog();
   int n = WiFi.scanNetworks();
+  feedCloudIoWatchdog();
   int bestIdx = -1;
   int bestCredential = -1;
   int bestRssi = -999;
@@ -2378,7 +2411,8 @@ static int selectBestHotspot(char *ssidOut, size_t ssidLen,
   }
   if (bestIdx < 0 || bestCredential < 0) {
     WiFi.scanDelete();
-    return -1;
+    selectedHotspotCredential = -1;
+    return -1000;
   }
   strncpy(ssidOut, HOTSPOTS[bestCredential].ssid, ssidLen - 1);
   ssidOut[ssidLen - 1] = '\0';
@@ -2401,7 +2435,7 @@ static void startHotspotStation() {
   char ssid[33] = "";
   char pass[65] = "";
   int rssi = selectBestHotspot(ssid, sizeof(ssid), pass, sizeof(pass));
-  if (rssi < -998) {
+  if (rssi < -998 || ssid[0] == '\0') {
     Serial.println("[WIFI] No configured hotspot found; LTE fallback remains available");
     wifiUplinkConnected = false;
     return;
@@ -2412,14 +2446,18 @@ static void startHotspotStation() {
   WiFi.setSleep(false);
   esp_wifi_set_ps(WIFI_PS_NONE);
   esp_wifi_set_max_tx_power(78);
+  WiFi.disconnect(false);
+  feedCloudIoWatchdog();
   WiFi.begin(ssid, pass);
   Serial.printf("[WIFI] Connecting to hotspot '%s' (%d dBm)\n", ssid, rssi);
 
   unsigned long deadline = millis() + 15000;
   while (WiFi.status() != WL_CONNECTED && millis() < deadline) {
+    esp_task_wdt_reset();
     delay(250);
     yield();
   }
+  esp_task_wdt_reset();
 
   wifiUplinkConnected = (WiFi.status() == WL_CONNECTED);
   if (wifiUplinkConnected) {
@@ -4120,7 +4158,7 @@ static void retryPendingCommandAck(unsigned long now) {
   }
 }
 
-static bool refreshAuthoritativeDeliveryFieldsFromFirebase() {
+static bool refreshAuthoritativeDeliveryFieldsFromFirebase(bool includeCoords) {
   bool anyOk = false;
 
   char path[96];
@@ -4212,8 +4250,14 @@ static bool refreshAuthoritativeDeliveryFieldsFromFirebase() {
     }
   }
 
-  if (refreshHardwareCoordsExact()) {
-    anyOk = true;
+  if (includeCoords) {
+    if ((!destCoordsValid || !pickupCoordsValid) && refreshHardwareCoordsExact()) {
+      anyOk = true;
+    } else if (destCoordsValid && pickupCoordsValid) {
+      Serial.println("[CONTEXT] Exact coords refresh skipped - cached coords still valid");
+    }
+  } else {
+    Serial.println("[CONTEXT] Exact coords refresh deferred - parsing truncated body first");
   }
 
   if (anyOk) {
@@ -4423,6 +4467,7 @@ void refreshDeliveryContextFromFirebase() {
 
     sendATAndWait("+HTTPTERM", 1000);
     modemHttpBusy = false;
+    modemLock.release();
 
     Serial.printf("[CONTEXT] totalBytes=%d body(120): %.120s\n", (int)body.length(),
                   body.c_str());
@@ -4439,9 +4484,6 @@ void refreshDeliveryContextFromFirebase() {
       }
     }
     bool responseTruncated = (totalResponseLen > 0 && totalResponseLen > (int)body.length());
-    if (responseTruncated) {
-      refreshAuthoritativeDeliveryFieldsFromFirebase();
-    }
 
     // Manual refresh: if mobile app bumped refresh_context_at, speed up polls.
     {
@@ -4458,43 +4500,46 @@ void refreshDeliveryContextFromFirebase() {
     }
 
     // EC-32: Parse top-level return_active (ignore nested historical fields).
-    if (!responseTruncated) {
-      bool parsedReturnActive = false;
+    {
       bool returnActiveValue = false;
-      parsedReturnActive = readTopLevelJsonBool(body, "return_active", returnActiveValue);
-      returnActive = parsedReturnActive ? returnActiveValue : false;
+      bool parsedReturnActive = readTopLevelJsonBool(body, "return_active", returnActiveValue);
+      if (parsedReturnActive) {
+        returnActive = returnActiveValue;
+      } else if (!responseTruncated) {
+        returnActive = false;
+      }
     }
 
     // Parse top-level return_otp.
-    if (!responseTruncated) {
+    {
       char parsedReturnOtp[8] = "";
       if (readTopLevelJsonString(body, "return_otp", parsedReturnOtp, sizeof(parsedReturnOtp)) &&
           strlen(parsedReturnOtp) > 0 && strlen(parsedReturnOtp) <= 6) {
         strncpy(cachedReturnOtp, parsedReturnOtp, sizeof(cachedReturnOtp) - 1);
         cachedReturnOtp[sizeof(cachedReturnOtp) - 1] = '\0';
         returnOtpCacheValid = true;
-      } else {
+      } else if (!responseTruncated) {
         cachedReturnOtp[0] = '\0';
         returnOtpCacheValid = false;
       }
     }
 
     // Parse top-level otp_code only.
-    if (!responseTruncated) {
+    {
       char parsedOtp[8] = "";
       if (readTopLevelJsonString(body, "otp_code", parsedOtp, sizeof(parsedOtp)) &&
           strlen(parsedOtp) > 0 && strlen(parsedOtp) <= 6) {
         strncpy(cachedOtp, parsedOtp, sizeof(cachedOtp) - 1);
         cachedOtp[sizeof(cachedOtp) - 1] = '\0';
         otpCacheValid = true;
-      } else {
+      } else if (!responseTruncated) {
         cachedOtp[0] = '\0';
         otpCacheValid = false;
       }
     }
 
     // Parse top-level delivery_id only.
-    if (!responseTruncated) {
+    {
       char parsedDeliveryId[64] = "";
       if (readTopLevelJsonString(body, "delivery_id", parsedDeliveryId,
                                  sizeof(parsedDeliveryId)) &&
@@ -4502,18 +4547,22 @@ void refreshDeliveryContextFromFirebase() {
         strncpy(cachedDeliveryId, parsedDeliveryId, sizeof(cachedDeliveryId) - 1);
         cachedDeliveryId[sizeof(cachedDeliveryId) - 1] = '\0';
         deliveryIdCacheValid = true;
-      } else {
+      } else if (!responseTruncated) {
         cachedDeliveryId[0] = '\0';
         deliveryIdCacheValid = false;
       }
     }
 
-    // The hardware node has grown large enough that whole-node reads can be
-    // truncated by the modem. These exact tiny reads make cancellation/order
-    // clearing authoritative even when the diagnostic payload is oversized.
-    if (!responseTruncated) {
-      refreshAuthoritativeDeliveryFieldsFromFirebase();
+    if (responseTruncated &&
+        (!deliveryIdCacheValid || !otpCacheValid ||
+         (returnActive && !returnOtpCacheValid))) {
+      refreshAuthoritativeDeliveryFieldsFromFirebase(false);
     }
+
+    // Exact field reads are only needed when the modem truncated the hardware
+    // node. A complete response already carries these top-level fields, and
+    // repeating several LTE GETs here can monopolize the modem long enough to
+    // starve GPS and watchdog-sensitive loop work.
 
     // Same-site demo bookings use one physical location for pickup and dropoff.
     // Keep this top-level flag close to the delivery context so /otp can expose
@@ -4585,9 +4634,11 @@ void refreshDeliveryContextFromFirebase() {
                                !hashValid || !saltValid);
       bool pinRuntimeDisabled = (parsedEnabled && !enabledVal);
       bool pinRuntimeRefreshed = false;
-      if (pinRuntimeMissing && !pinRuntimeDisabled) {
+      if (pinRuntimeMissing && !pinRuntimeDisabled && !responseTruncated) {
         pinRuntimeRefreshed =
             refreshPersonalPinRuntimeFromFirebase(responseTruncated, false);
+      } else if (pinRuntimeMissing && !pinRuntimeDisabled && responseTruncated) {
+        Serial.println("[PIN] Runtime refresh deferred - truncated context response");
       }
 
       if (pinRuntimeRefreshed) {
@@ -5436,6 +5487,63 @@ void triggerRebootAllIfScheduled(unsigned long now) {
 }
 
 // ==================== HOTSPOT HTTP ROUTER ====================
+static bool readHttpBodyBounded(WiFiClient &client, char *buf, size_t bufSize,
+                                size_t contentLength,
+                                unsigned long timeoutMs) {
+  if (!buf || bufSize == 0) return false;
+  buf[0] = '\0';
+  if (contentLength == 0) return true;
+  if (contentLength >= bufSize) return false;
+
+  size_t rd = 0;
+  unsigned long lastByteAt = millis();
+  unsigned long deadline = lastByteAt + timeoutMs;
+  while (rd < contentLength && millis() < deadline) {
+    feedCloudIoWatchdog();
+    int available = client.available();
+    if (available > 0) {
+      int c = client.read();
+      if (c < 0) {
+        delay(1);
+        continue;
+      }
+      buf[rd++] = (char)c;
+      lastByteAt = millis();
+      deadline = lastByteAt + timeoutMs;
+      continue;
+    }
+
+    if (!client.connected() && millis() - lastByteAt > 100) {
+      break;
+    }
+    delay(2);
+    yield();
+  }
+
+  buf[rd] = '\0';
+  return rd == contentLength;
+}
+
+static void sendPlainHttpResponse(WiFiClient &client, int statusCode,
+                                  const char *body,
+                                  bool keepAlive = false) {
+  const char *statusText = statusCode == 200 ? "OK" :
+                           statusCode == 400 ? "Bad Request" :
+                           statusCode == 404 ? "Not Found" : "OK";
+  const char *payload = body ? body : "";
+  client.setTimeout(1000);
+  client.printf("HTTP/1.1 %d %s\r\n", statusCode, statusText);
+  client.print("Content-Type: text/plain\r\n");
+  client.print(keepAlive ? "Connection: keep-alive\r\n" : "Connection: close\r\n");
+  client.printf("Content-Length: %u\r\n\r\n", (unsigned int)strlen(payload));
+  client.print(payload);
+  feedCloudIoWatchdog();
+  if (!keepAlive) {
+    delay(5);
+    client.stop();
+  }
+}
+
 void handleCameraClient() {
   if (inApRequestHandler) {
     return;
@@ -5479,7 +5587,7 @@ void handleCameraClient() {
   Serial.println("[AP] REQ: " + requestLine);
 
   char method[8] = "";
-  char reqPath[32] = "";
+  char reqPath[160] = "";
   {
     int sp1 = requestLine.indexOf(' ');
     int sp2 = requestLine.indexOf(' ', sp1 + 1);
@@ -5495,9 +5603,12 @@ void handleCameraClient() {
   String objectPath =
       "esp32cam/" + String(CAM_PREFIX) + "/relay_" + String(millis()) + ".jpg";
   String proofRole = "full";
+  char uploadDeliveryId[64] = "";
 
   while (true) {
+    feedCloudIoWatchdog();
     String line = client.readStringUntil('\n');
+    feedCloudIoWatchdog();
     line.trim();
     if (line.length() == 0)
       break;
@@ -5514,6 +5625,16 @@ void handleCameraClient() {
       proofRole = line.substring(13);
       proofRole.trim();
       proofRole.toLowerCase();
+    } else if (lower.startsWith("x-delivery-id:")) {
+      String headerDeliveryId = line.substring(14);
+      headerDeliveryId.trim();
+      if (headerDeliveryId.length() > 0 &&
+          headerDeliveryId != "UNKNOWN_DELIVERY" &&
+          headerDeliveryId.length() < sizeof(uploadDeliveryId)) {
+        strncpy(uploadDeliveryId, headerDeliveryId.c_str(),
+                sizeof(uploadDeliveryId) - 1);
+        uploadDeliveryId[sizeof(uploadDeliveryId) - 1] = '\0';
+      }
     }
   }
 
@@ -5911,10 +6032,10 @@ void handleCameraClient() {
     controllerLastSeenAt = millis();
     Serial.println("[AP] -> POST /command-ack");
     char jsonBuf[320] = "";
-    if (contentLength > 0 && contentLength < sizeof(jsonBuf)) {
-      client.setTimeout(5000);
-      size_t rd = client.readBytes(jsonBuf, contentLength);
-      jsonBuf[rd] = '\0';
+    if (!readHttpBodyBounded(client, jsonBuf, sizeof(jsonBuf), contentLength, 3000)) {
+      Serial.printf("[AP] Bad command-ack body cl=%u\n", (unsigned int)contentLength);
+      sendPlainHttpResponse(client, 400, "BAD_BODY");
+      return;
     }
 
     char cmd[24] = "";
@@ -6052,11 +6173,12 @@ void handleCameraClient() {
   if (strcmp(method, "POST") == 0 && strcmp(reqPath, "/personal-pin-verify") == 0) {
     Serial.println("[AP] -> POST /personal-pin-verify");
     char jsonBuf[320] = "";
-    if (contentLength > 0 && contentLength < sizeof(jsonBuf)) {
-      client.setTimeout(5000);
-      size_t rd = client.readBytes(jsonBuf, contentLength);
-      jsonBuf[rd] = '\0';
+    if (!readHttpBodyBounded(client, jsonBuf, sizeof(jsonBuf), contentLength, 3000)) {
+      Serial.printf("[AP] Bad personal-pin body cl=%u\n", (unsigned int)contentLength);
+      sendPlainHttpResponse(client, 400, "BAD_BODY");
+      return;
     }
+    feedCloudIoWatchdog();
 
     char pin[12] = "";
     extractJsonStringValue(jsonBuf, "pin", pin, sizeof(pin));
@@ -6098,13 +6220,7 @@ void handleCameraClient() {
     Serial.printf("[PIN] Verify result: %s (enabled=%d)\n",
                   resultBody, personalPinEnabled ? 1 : 0);
 
-    String resp =
-        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
-        String(strlen(resultBody)) + "\r\n\r\n" + resultBody;
-    client.print(resp);
-    client.flush();
-    delay(10);
-    client.stop();
+    sendPlainHttpResponse(client, 200, resultBody);
 
     writePersonalPinAudit("RIDER_MANUAL_PIN_ATTEMPT",
                           verified ? "success" : "denied", currentlyLocked,
@@ -6122,10 +6238,10 @@ void handleCameraClient() {
     controllerLastSeenAt = millis();
     Serial.println("[AP] -> POST /event");
     char jsonBuf[384] = "";
-    if (contentLength > 0 && contentLength < sizeof(jsonBuf)) {
-      client.setTimeout(5000);
-      size_t rd = client.readBytes(jsonBuf, contentLength);
-      jsonBuf[rd] = '\0';
+    if (!readHttpBodyBounded(client, jsonBuf, sizeof(jsonBuf), contentLength, 3000)) {
+      Serial.printf("[AP] Bad event body cl=%u\n", (unsigned int)contentLength);
+      sendPlainHttpResponse(client, 400, "BAD_BODY");
+      return;
     }
     Serial.printf("[AP] Event: %s\n", jsonBuf);
 
@@ -6261,27 +6377,37 @@ void handleCameraClient() {
   bool uploadOK = false;
   String failReason = "";
   bool isPreviewProof = proofRole == "preview";
+  const char *writebackDeliveryId =
+      uploadDeliveryId[0] ? uploadDeliveryId :
+      ((deliveryIdCacheValid && cachedDeliveryId[0] != '\0')
+           ? cachedDeliveryId
+           : "UNKNOWN_DELIVERY");
+  bool hasWritebackDelivery =
+      strcmp(writebackDeliveryId, "UNKNOWN_DELIVERY") != 0;
+  bool finalProofWritebackOK = isPreviewProof;
+
   if (contentLength == 0) {
     failReason = "FAIL:bad_cl:" + String(contentLength);
   } else {
     publishPhotoUploadState(isPreviewProof ? "COMPRESSING" : "UPLOADING",
                             isPreviewProof ? 15 : 45,
-                            deliveryIdCacheValid ? cachedDeliveryId
-                                                 : "UNKNOWN_DELIVERY",
-                            contentLength);
+                            writebackDeliveryId,
+                            contentLength,
+                            "",
+                            isPreviewProof ? "preview" : "full");
     uploadOK = uploadClientToSupabaseViaLTE(client, contentLength, objectPath);
     if (!uploadOK)
       failReason = relayDiag;
   }
 
   // Write the public URL back to Firebase so web/mobile apps can find the image
-  if (uploadOK && lteConnected) {
+  if (uploadOK && (wifiCloudHealthy || lteConnected)) {
     char publicUrl[256];
     snprintf(publicUrl, sizeof(publicUrl),
              "%s/storage/v1/object/public/%s/%s",
              SUPABASE_URL, SUPABASE_BUCKET, objectPath.c_str());
 
-    if (deliveryIdCacheValid && cachedDeliveryId[0] != '\0') {
+    if (hasWritebackDelivery) {
       // Preview photos unlock the app UI quickly; full photos preserve the
       // existing archival proof fields.
       char deliveryJson[768];
@@ -6299,7 +6425,7 @@ void handleCameraClient() {
       }
       char deliveryPath[96];
       snprintf(deliveryPath, sizeof(deliveryPath),
-               "/deliveries/%s.json", cachedDeliveryId);
+               "/deliveries/%s.json", writebackDeliveryId);
       bool deliveryFbOK = httpPatchWithRetry(deliveryPath, deliveryJson);
       if (!deliveryFbOK) {
         delay(250);
@@ -6307,6 +6433,9 @@ void handleCameraClient() {
       }
       Serial.printf("[RELAY] Delivery proof writeback: %s\n",
                     deliveryFbOK ? "OK" : "FAIL");
+      if (!isPreviewProof && deliveryFbOK) {
+        finalProofWritebackOK = true;
+      }
 
       char auditJson[768];
       if (isPreviewProof) {
@@ -6315,17 +6444,17 @@ void handleCameraClient() {
                  "\"latest_photo_preview_url\":\"%s\","
                  "\"latest_photo_preview_object_path\":\"%s\","
                  "\"latest_photo_preview_uploaded_at\":{\".sv\":\"timestamp\"}}",
-                 cachedDeliveryId, HARDWARE_ID, publicUrl, objectPath.c_str());
+                 writebackDeliveryId, HARDWARE_ID, publicUrl, objectPath.c_str());
       } else {
         snprintf(auditJson, sizeof(auditJson),
                  "{\"delivery_id\":\"%s\",\"box_id\":\"%s\","
                  "\"latest_photo_url\":\"%s\",\"latest_photo_object_path\":\"%s\","
                  "\"latest_photo_uploaded_at\":{\".sv\":\"timestamp\"}}",
-                 cachedDeliveryId, HARDWARE_ID, publicUrl, objectPath.c_str());
+                 writebackDeliveryId, HARDWARE_ID, publicUrl, objectPath.c_str());
       }
       char auditPath[96];
       snprintf(auditPath, sizeof(auditPath),
-               "/audit_logs/%s.json", cachedDeliveryId);
+               "/audit_logs/%s.json", writebackDeliveryId);
       bool auditFbOK = httpPatchWithRetry(auditPath, auditJson);
       if (!auditFbOK) {
         delay(250);
@@ -6341,21 +6470,28 @@ void handleCameraClient() {
         snprintf(supabaseDeliveryJson, sizeof(supabaseDeliveryJson),
                  "{\"proof_photo_url\":\"%s\"}", publicUrl);
         bool supabaseWritebackOK =
-            httpPatchSupabase("deliveries", cachedDeliveryId, supabaseDeliveryJson);
+            httpPatchSupabase("deliveries", writebackDeliveryId, supabaseDeliveryJson);
         if (!supabaseWritebackOK) {
           delay(250);
           supabaseWritebackOK =
-              httpPatchSupabase("deliveries", cachedDeliveryId, supabaseDeliveryJson);
+              httpPatchSupabase("deliveries", writebackDeliveryId, supabaseDeliveryJson);
+        }
+        if (!supabaseWritebackOK) {
+          Serial.println("[RELAY] Supabase delivery proof writeback: FAIL");
         }
       }
+    } else if (!isPreviewProof) {
+      finalProofWritebackOK = false;
+      Serial.println("[RELAY] Full proof has no delivery id; keeping upload pending");
     }
 
-    char urlJson[384];
+    char urlJson[448];
     snprintf(urlJson, sizeof(urlJson),
              "{\"last_upload_public_url\":\"%s\",\"last_upload_object_path\":\"%s\","
-             "\"last_upload_role\":\"%s\","
+             "\"last_upload_role\":\"%s\",\"last_upload_delivery_id\":\"%s\","
              "\"last_upload_uploaded_at\":{\".sv\":\"timestamp\"}}",
-             publicUrl, objectPath.c_str(), isPreviewProof ? "preview" : "full");
+             publicUrl, objectPath.c_str(), isPreviewProof ? "preview" : "full",
+             writebackDeliveryId);
 
     char camPath[64];
     snprintf(camPath, sizeof(camPath), "/hardware/%s/camera.json", HARDWARE_ID);
@@ -6382,17 +6518,24 @@ void handleCameraClient() {
     }
   }
 
+  if (uploadOK && !isPreviewProof && !finalProofWritebackOK) {
+    uploadOK = false;
+    failReason = "FAIL:full_writeback_failed";
+  }
+
   if (uploadOK) {
-    publishPhotoUploadState("COMPLETED", 100,
-                            deliveryIdCacheValid ? cachedDeliveryId
-                                                 : "UNKNOWN_DELIVERY",
-                            contentLength);
+    publishPhotoUploadState(isPreviewProof ? "UPLOADING" : "COMPLETED",
+                            isPreviewProof ? 60 : 100,
+                            writebackDeliveryId,
+                            contentLength,
+                            "",
+                            isPreviewProof ? "preview" : "full");
   } else {
     publishPhotoUploadState("FAILED", 0,
-                            deliveryIdCacheValid ? cachedDeliveryId
-                                                 : "UNKNOWN_DELIVERY",
+                            writebackDeliveryId,
                             contentLength,
-                            failReason.c_str());
+                            failReason.c_str(),
+                            isPreviewProof ? "preview" : "full");
   }
 
   String body = uploadOK ? ("OK:" + relayDiag) : failReason;
@@ -6560,12 +6703,15 @@ static bool parseFirebaseBoolValue(const String &body, bool &out, bool &hasValue
 
 static bool fetchFirebaseDouble(const char *path, double &outVal) {
   if (!path || path[0] == '\0') return false;
+  feedCloudIoWatchdog();
   String body = httpGetFromFirebase(path);
+  feedCloudIoWatchdog();
   body.trim();
   if (body.length() == 0 || body == "null") {
     return false;
   }
   outVal = body.toDouble();
+  feedCloudIoWatchdog();
   return true;
 }
 
@@ -6597,9 +6743,11 @@ static void applyPickupCoords(double lat, double lon, const char *source) {
 static bool fetchFirebaseDoubleAny(const char *const *paths, uint8_t pathCount,
                                    double &outVal) {
   for (uint8_t i = 0; i < pathCount; i++) {
+    feedCloudIoWatchdog();
     if (paths[i] && fetchFirebaseDouble(paths[i], outVal)) {
       return true;
     }
+    feedCloudIoWatchdog();
   }
   return false;
 }
@@ -6616,12 +6764,14 @@ static bool refreshHardwareCoordsExact() {
   snprintf(pathC, sizeof(pathC), "/hardware/%s/dropoff_lat.json", HARDWARE_ID);
   const char *latPaths[] = {pathA, pathB, pathC};
   bool gotLat = fetchFirebaseDoubleAny(latPaths, 3, dLat);
+  feedCloudIoWatchdog();
 
   snprintf(pathA, sizeof(pathA), "/hardware/%s/target_lng.json", HARDWARE_ID);
   snprintf(pathB, sizeof(pathB), "/hardware/%s/dest_lon.json", HARDWARE_ID);
   snprintf(pathC, sizeof(pathC), "/hardware/%s/dropoff_lng.json", HARDWARE_ID);
   const char *lonPaths[] = {pathA, pathB, pathC};
   bool gotLon = fetchFirebaseDoubleAny(lonPaths, 3, dLon);
+  feedCloudIoWatchdog();
 
   if (gotLat && gotLon && (dLat != 0.0 || dLon != 0.0)) {
     applyTargetCoords(dLat, dLon, "hardware");
@@ -6633,8 +6783,10 @@ static bool refreshHardwareCoordsExact() {
   double pLat = 0.0, pLon = 0.0;
   snprintf(pathA, sizeof(pathA), "/hardware/%s/pickup_lat.json", HARDWARE_ID);
   bool gotPLat = fetchFirebaseDouble(pathA, pLat);
+  feedCloudIoWatchdog();
   snprintf(pathA, sizeof(pathA), "/hardware/%s/pickup_lng.json", HARDWARE_ID);
   bool gotPLon = fetchFirebaseDouble(pathA, pLon);
+  feedCloudIoWatchdog();
 
   if (gotPLat && gotPLon && (pLat != 0.0 || pLon != 0.0)) {
     applyPickupCoords(pLat, pLon, "hardware");
@@ -6644,7 +6796,9 @@ static bool refreshHardwareCoordsExact() {
   bool sameSiteValue = false;
   bool hasSameSite = false;
   snprintf(pathA, sizeof(pathA), "/hardware/%s/same_pickup_dropoff.json", HARDWARE_ID);
+  feedCloudIoWatchdog();
   String sameSiteBody = httpGetFromFirebase(pathA);
+  feedCloudIoWatchdog();
   sameSiteBody.trim();
   if (parseFirebaseBoolValue(sameSiteBody, sameSiteValue, hasSameSite) && hasSameSite) {
     cachedSamePickupDropoff = deliveryIdCacheValid && sameSiteValue;
@@ -6682,12 +6836,14 @@ static bool refreshTargetCoordsFromDelivery(const char *deliveryId, bool force) 
   snprintf(path3, sizeof(path3), "/deliveries/%s/dropoff_lat.json", deliveryId);
   const char *delLatPaths[] = {path, path2, path3};
   gotLat = fetchFirebaseDoubleAny(delLatPaths, 3, dLat);
+  feedCloudIoWatchdog();
 
   snprintf(path, sizeof(path), "/deliveries/%s/target_lng.json", deliveryId);
   snprintf(path2, sizeof(path2), "/deliveries/%s/dest_lon.json", deliveryId);
   snprintf(path3, sizeof(path3), "/deliveries/%s/dropoff_lng.json", deliveryId);
   const char *delLonPaths[] = {path, path2, path3};
   gotLon = fetchFirebaseDoubleAny(delLonPaths, 3, dLon);
+  feedCloudIoWatchdog();
 
   if (gotLat && gotLon && (dLat != 0.0 || dLon != 0.0)) {
     applyTargetCoords(dLat, dLon, "delivery");
@@ -6703,8 +6859,10 @@ static bool refreshTargetCoordsFromDelivery(const char *deliveryId, bool force) 
 
   snprintf(path, sizeof(path), "/deliveries/%s/pickup_lat.json", deliveryId);
   gotPLat = fetchFirebaseDouble(path, pLat);
+  feedCloudIoWatchdog();
   snprintf(path, sizeof(path), "/deliveries/%s/pickup_lng.json", deliveryId);
   gotPLon = fetchFirebaseDouble(path, pLon);
+  feedCloudIoWatchdog();
 
   if (gotPLat && gotPLon && (pLat != 0.0 || pLon != 0.0)) {
     applyPickupCoords(pLat, pLon, "delivery");
@@ -7411,8 +7569,11 @@ void setup() {
   // â”€â”€ Initialize Watchdog Timer FIRST (before any modem ops) â”€â”€
   // Core 2.x API: esp_task_wdt_init(timeout_seconds, panic_on_timeout)
   esp_task_wdt_init(WDT_TIMEOUT_S, true); // true = reboot on timeout
+  smartBoxLoopTaskHandle = xTaskGetCurrentTaskHandle();
   esp_task_wdt_add(NULL);                 // Watch the main loop task
   Serial.printf("[WDT] Watchdog armed (%ds timeout)\n", WDT_TIMEOUT_S);
+  Serial.printf("[BUILD] Proxy12 WDT90 loop-guard build %s %s\n", __DATE__,
+                __TIME__);
 
   // Initialize modem with proper power sequence
   modemSerial.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
@@ -7584,9 +7745,9 @@ void setup() {
 
 // ==================== FIREBASE SYNC TASK (CORE 0) ====================
 void firebaseSyncTask(void *pvParameters) {
-  esp_task_wdt_add(NULL);
+  Serial.println("[WDT] FirebaseSync not enrolled; network waits must not reboot proxy");
   for (;;) {
-    esp_task_wdt_reset();
+    feedCloudIoWatchdog();
     unsigned long now = millis();
 
     bool hasActiveDelivery = deliveryIdCacheValid && cachedDeliveryId[0] != '\0';
@@ -7620,6 +7781,7 @@ void firebaseSyncTask(void *pvParameters) {
       bool tracked = queuedCommandAckTracked;
       commandAckFirebaseWriteQueued = false;
       bool ackWritten = writeCommandAckToFirebase(cmd, status, details);
+      feedCloudIoWatchdog();
       if (tracked) {
         if (ackWritten) markCommandDone();
         else { commandAckFirebaseWriteQueued = true; lastCommandAckRetryAt = now + COMMAND_ACK_RETRY_INTERVAL_MS; }
@@ -7634,11 +7796,13 @@ void firebaseSyncTask(void *pvParameters) {
       if (!httpPatchWithRetry(patchPath, patchBody)) {
         returnCompletionFirebaseWriteQueued = true;
       }
+      feedCloudIoWatchdog();
     }
 
     if ((wifiCloudHealthy || lteConnected) && tamperFirebaseWriteQueued && !modemHttpBusy) {
       tamperFirebaseWriteQueued = false;
       writeTamperToFirebase();
+      feedCloudIoWatchdog();
     }
 
     if ((wifiCloudHealthy || lteConnected) && lockEventFirebaseWriteQueued && !modemHttpBusy) {
@@ -7654,10 +7818,12 @@ void firebaseSyncTask(void *pvParameters) {
       unsigned long latencyMs = queuedLockUnlockLatencyMs;
       lockEventFirebaseWriteQueued = false;
       writeLockEventToFirebase(ov, fd, ul, attempts, retryExhausted, fallbackRequired, reason, latencyMs);
+      feedCloudIoWatchdog();
     }
 
     if ((wifiCloudHealthy || lteConnected) && now - lastDeliveryContextRead >= deliveryReadInterval) {
       refreshDeliveryContextFromFirebase();
+      feedCloudIoWatchdog();
       lastDeliveryContextRead = now;
     }
 
@@ -7676,23 +7842,28 @@ void firebaseSyncTask(void *pvParameters) {
         personalPinRuntimeRefreshForce = force;
         Serial.println("[PIN] Queued runtime refresh failed; will retry");
       }
+      feedCloudIoWatchdog();
     }
 
     if ((wifiCloudHealthy || lteConnected) && now - lastFB >= firebaseInterval) {
       sendToFirebase();
+      feedCloudIoWatchdog();
       lastFB = now;
     }
 
     if ((wifiCloudHealthy || lteConnected) && now - lastTamperCheckAt >= TAMPER_CHECK_INTERVAL) {
       checkAndClearTamperFromFirebase();
+      feedCloudIoWatchdog();
       lastTamperCheckAt = now;
     }
 
     if ((wifiCloudHealthy || lteConnected) && now - lastPhotoBurstCheckAt >= PHOTO_BURST_CHECK_INTERVAL) {
       checkAndRunPhotoBurstFromFirebase(now);
+      feedCloudIoWatchdog();
       lastPhotoBurstCheckAt = now;
     }
 
+    feedCloudIoWatchdog();
     vTaskDelay(pdMS_TO_TICKS(100)); // Yield to other Core 0 tasks
   }
 }
@@ -7702,14 +7873,20 @@ void loop() {
   esp_task_wdt_reset(); // Feed watchdog every loop iteration
   unsigned long now = millis();
   maintainHotspotStation(now);
+  feedCloudIoWatchdog();
   pollWifiCloudHealth(now);
+  feedCloudIoWatchdog();
   pollDiscoveryServer();
+  feedCloudIoWatchdog();
   probeCameraIfDue(now);
+  feedCloudIoWatchdog();
 #if !DISABLE_PROXY_UART
   pollProxyUart();
+  feedCloudIoWatchdog();
 #endif
   enforceTamperSuppressionTimeout(now);
   maybeEvaluateConnectivityMatrix(now);
+  feedCloudIoWatchdog();
 
   // ── Modem/LTE retry with exponential backoff (keeps HTTP server alive) ──
   if ((!modemOK || !lteConnected) && now >= modemRetryAt) {
@@ -7774,10 +7951,11 @@ void loop() {
   }
 
   // Modem health check (lightweight AT heartbeat)
-  if (modemOK && now - lastModemHealth >= MODEM_HEALTH_INTERVAL) {
+  if (modemOK && !modemHttpBusy && now - lastModemHealth >= MODEM_HEALTH_INTERVAL) {
     checkModemHealth();
     lastModemHealth = now;
   }
+  feedCloudIoWatchdog();
 
   // Periodic memory report
   if (now - lastMemReport >= MEM_REPORT_INTERVAL) {
@@ -7790,7 +7968,7 @@ void loop() {
   if (idlePowerMode) {
     gpsInterval *= IDLE_GPS_POLL_MULTIPLIER;
   }
-  if (modemOK && gpsEnabled && now - lastGps >= gpsInterval) {
+  if (modemOK && gpsEnabled && !modemHttpBusy && now - lastGps >= gpsInterval) {
     readGPS();
     lastGps = now;
 
@@ -7804,7 +7982,10 @@ void loop() {
       }
       lastGpsStatus = now;
     }
+  } else if (modemOK && gpsEnabled && modemHttpBusy && now - lastGps >= gpsInterval) {
+    lastGps = now;
   }
+  feedCloudIoWatchdog();
 
   // ── Battery monitor (10 s interval) — dual channel ──
   if (now - lastBatteryRead >= BATTERY_READ_INTERVAL) {
@@ -7848,9 +8029,10 @@ void loop() {
     }
   }
 
-  if ((wifiCloudHealthy || lteConnected) && deliveryIdCacheValid) {
+  if ((wifiCloudHealthy || lteConnected) && deliveryIdCacheValid && !modemHttpBusy) {
     refreshPhoneLocationIfNeeded();
   }
+  feedCloudIoWatchdog();
 
   // ── EC-78: Reassignment auto-ack ──
   if (reassign.processAutoAck(now)) {
@@ -7865,24 +8047,32 @@ void loop() {
   }
 
   // Re-sync network time periodically to prevent clock drift
-  if ((wifiCloudHealthy || lteConnected) && now - lastTimeSync >= TIME_SYNC_INTERVAL) {
+  if ((wifiCloudHealthy || lteConnected) && !modemHttpBusy &&
+      now - lastTimeSync >= TIME_SYNC_INTERVAL) {
     Serial.println("Periodic time re-sync...");
     syncNetworkTime();
     lastTimeSync = now;
   }
+  feedCloudIoWatchdog();
 
 
 
-  if (wifiCloudHealthy || lteConnected) {
+  if ((wifiCloudHealthy || lteConnected) && !modemHttpBusy) {
     retryPendingCommandAck(now);
   }
+  feedCloudIoWatchdog();
 
-  if ((wifiCloudHealthy || lteConnected) && now - lastPersonalPinFlushAt >= PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS) {
+  if ((wifiCloudHealthy || lteConnected) && !modemHttpBusy &&
+      now - lastPersonalPinFlushAt >= PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS) {
     flushQueuedPersonalPinAudits();
     lastPersonalPinFlushAt = now;
   }
+  feedCloudIoWatchdog();
 
-  maybePublishDurabilityMetrics(now);
+  if (!modemHttpBusy) {
+    maybePublishDurabilityMetrics(now);
+  }
+  feedCloudIoWatchdog();
 
   delay(10);
 }

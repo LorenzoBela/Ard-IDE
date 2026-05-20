@@ -26,6 +26,7 @@
 #include <esp_arduino_version.h>
 #include <esp_camera.h>
 #include <esp_log.h>
+#include "img_converters.h"
 #include <time.h>
 
 #if !defined(ESP_ARDUINO_VERSION_MAJOR) || ESP_ARDUINO_VERSION_MAJOR != 2
@@ -78,18 +79,20 @@ char PROXY_HOST[16] = "";
 
 char DEVICE_ID[24] = "OV3660_CAM_001";
 #define FILE_PREFIX "capture"
-#define MAX_UPLOAD_RETRIES 6
+#define MAX_UPLOAD_RETRIES 12
 #define MAX_PREVIEW_UPLOAD_RETRIES 10
-#define MAX_FULL_UPLOAD_RETRIES 6
+#define MAX_FULL_UPLOAD_RETRIES 12
 #define UPLOAD_RETRY_BASE_MS 2000
 #define UPLOAD_RETRY_MAX_MS 60000
+#define UPLOAD_PHASE_GRACE_MS 5000
 
 // ===================== DETECTION CONFIG =====================
 #define DETECTION_COOLDOWN_MS 2000 // Min time between uploads
 #define PREVIEW_FRAME_SIZE FRAMESIZE_QVGA
 #define PREVIEW_JPEG_QUALITY 18
-#define UPLOAD_FRAME_SIZE FRAMESIZE_SVGA
-#define UPLOAD_JPEG_QUALITY 10
+#define DERIVED_PREVIEW_JPEG_QUALITY 70
+#define UPLOAD_FRAME_SIZE FRAMESIZE_VGA
+#define UPLOAD_JPEG_QUALITY 12
 #define LOW_LIGHT_LUMA_THRESHOLD 38
 #define LOW_LIGHT_REPORT_LUMA_THRESHOLD 28
 #define LOW_LIGHT_REPORT_HIT_PERCENT 75
@@ -111,7 +114,9 @@ char DEVICE_ID[24] = "OV3660_CAM_001";
 #define WIFI_RETRY_JITTER_MS 400
 #define PROXY_DISCOVERY_RETRY_MS 1500
 #define PROXY_SUBNET_PROBE_RETRY_MS 3000
-#define PROXY_MISSING_RECONNECT_MS 45000
+#define PROXY_MISSING_RECONNECT_MS 180000
+#define WIFI_PROOF_WORK_GRACE_MS 90000
+#define WIFI_STATUS_LOG_INTERVAL_MS 15000
 #define PROXY_DIAG_INTERVAL_MS 30000
 #define PROXY_DIAG_FAIL_LIMIT 3
 
@@ -145,14 +150,16 @@ static uint8_t lastDetectLuma = 255;
 static bool lastFaceWindowLowLight = false;
 static bool lastFaceWindowBright = false;
 
-// Deferred upload flag. Face-check handlers capture the evidence JPEG first,
-// then loop() only uploads/retries that frozen frame.
+// Deferred upload flag. Face-check handlers freeze one proof frame first.
+// The same JPEG is uploaded as preview and full proof so both show the same moment.
 static bool pendingUpload = false;
 static bool uploadInProgress = false;
 static unsigned long uploadRetryAtMs = 0;
 static uint8_t pendingUploadRetryCount = 0;
 static uint8_t pendingPreviewRetryCount = 0;
 static uint8_t pendingFullRetryCount = 0;
+static bool pendingFullCapture = false;
+static bool uploadPhaseDeferred = false;
 static bool payloadStoreReady = false;
 static char pendingObjectPath[128] = "";
 static char pendingPreviewObjectPath[128] = "";
@@ -172,6 +179,7 @@ static const char *CAM_KEY_OBJECT = "obj";
 static const char *CAM_KEY_PREVIEW_OBJECT = "previewObj";
 static const char *CAM_KEY_PREVIEW_RETRY = "previewRetry";
 static const char *CAM_KEY_FULL_RETRY = "fullRetry";
+static const char *CAM_KEY_FULL_CAPTURE = "fullCapture";
 
 // WiFi reconnect scheduler (non-blocking)
 static bool wifiConnectInProgress = false;
@@ -184,6 +192,11 @@ static unsigned long lastCamAnnounceAt = 0;
 static unsigned long nextProxyDiscoveryAt = 0;
 static unsigned long nextProxySubnetProbeAt = 0;
 static unsigned long proxyMissingSince = 0;
+static unsigned long lastProofNetworkWorkAt = 0;
+static unsigned long lastWifiStatusLogAt = 0;
+static uint16_t wifiSoftReconnectCount = 0;
+static uint8_t proxyUploadFailCount = 0;
+static char lastKnownProxyHost[16] = "";
 static unsigned long lastProxyDiagAt = 0;
 static uint8_t proxyDiscoveryMisses = 0;
 static uint8_t proxyDiagFailCount = 0;
@@ -257,6 +270,8 @@ String makeObjectPath(const char *proofRole = "full");
 bool switchToUploadMode(framesize_t frameSize, int jpegQuality,
                         bool lowLightMode, bool brightLightMode = false);
 bool switchToDetectMode();
+static void markProofNetworkWork();
+static bool proofNetworkWorkActive(unsigned long now);
 
 static uint32_t fnv1a32(const char *text) {
   const char *src = text ? text : "";
@@ -312,7 +327,8 @@ static void persistUploadIntent(bool pending) {
     camPrefs.putString(CAM_KEY_PREVIEW_OBJECT, pendingPreviewObjectPath);
     camPrefs.putUChar(CAM_KEY_PREVIEW_RETRY, pendingPreviewRetryCount);
     camPrefs.putUChar(CAM_KEY_FULL_RETRY, pendingFullRetryCount);
-    bumpNvsWrites(7);
+    camPrefs.putBool(CAM_KEY_FULL_CAPTURE, pendingFullCapture);
+    bumpNvsWrites(8);
   } else {
     camPrefs.remove(CAM_KEY_DELIVERY);
     camPrefs.remove(CAM_KEY_QUEUED_AT);
@@ -321,10 +337,13 @@ static void persistUploadIntent(bool pending) {
     camPrefs.remove(CAM_KEY_PREVIEW_OBJECT);
     camPrefs.remove(CAM_KEY_PREVIEW_RETRY);
     camPrefs.remove(CAM_KEY_FULL_RETRY);
-    bumpNvsWrites(7);
+    camPrefs.remove(CAM_KEY_FULL_CAPTURE);
+    bumpNvsWrites(8);
     pendingUploadRetryCount = 0;
     pendingPreviewRetryCount = 0;
     pendingFullRetryCount = 0;
+    pendingFullCapture = false;
+    uploadPhaseDeferred = false;
     pendingObjectPath[0] = '\0';
     pendingPreviewObjectPath[0] = '\0';
   }
@@ -333,6 +352,8 @@ static void persistUploadIntent(bool pending) {
 static void clearPendingPayloadStorage() {
   pendingPreviewRetryCount = 0;
   pendingFullRetryCount = 0;
+  pendingFullCapture = false;
+  uploadPhaseDeferred = false;
   if (!payloadStoreReady) {
     pendingObjectPath[0] = '\0';
     pendingPreviewObjectPath[0] = '\0';
@@ -396,8 +417,84 @@ static bool savePendingPreviewPayload(const uint8_t *data, size_t len,
                                   objectPath);
 }
 
+static bool saveDerivedPreviewFromFullJpeg(const camera_fb_t *proof,
+                                           const String &previewObjectPath) {
+  if (!proof || proof->format != PIXFORMAT_JPEG || !proof->buf ||
+      proof->len == 0 || proof->width < 2 || proof->height < 2) {
+    return false;
+  }
+
+  uint16_t previewWidth = proof->width / 2;
+  uint16_t previewHeight = proof->height / 2;
+  size_t fullRgbLen = (size_t)proof->width * (size_t)proof->height * 3;
+  size_t previewRgbLen = (size_t)previewWidth * (size_t)previewHeight * 3;
+
+  uint8_t *fullRgb = (uint8_t *)ps_malloc(fullRgbLen);
+  if (!fullRgb) {
+    fullRgb = (uint8_t *)malloc(fullRgbLen);
+  }
+  if (!fullRgb) {
+    netLog("[UPLOAD] Derived preview full RGB buffer OOM (%u bytes)\n",
+           (unsigned int)fullRgbLen);
+    return false;
+  }
+
+  bool decoded = fmt2rgb888(proof->buf, proof->len, PIXFORMAT_JPEG, fullRgb);
+  if (!decoded) {
+    free(fullRgb);
+    netLog("[UPLOAD] Derived preview decode failed\n");
+    return false;
+  }
+
+  uint8_t *previewRgb = (uint8_t *)ps_malloc(previewRgbLen);
+  if (!previewRgb) {
+    previewRgb = (uint8_t *)malloc(previewRgbLen);
+  }
+  if (!previewRgb) {
+    free(fullRgb);
+    netLog("[UPLOAD] Derived preview small RGB buffer OOM (%u bytes)\n",
+           (unsigned int)previewRgbLen);
+    return false;
+  }
+
+  for (uint16_t y = 0; y < previewHeight; y++) {
+    uint16_t srcY = y * 2;
+    for (uint16_t x = 0; x < previewWidth; x++) {
+      uint16_t srcX = x * 2;
+      size_t src = ((size_t)srcY * proof->width + srcX) * 3;
+      size_t dst = ((size_t)y * previewWidth + x) * 3;
+      previewRgb[dst] = fullRgb[src];
+      previewRgb[dst + 1] = fullRgb[src + 1];
+      previewRgb[dst + 2] = fullRgb[src + 2];
+    }
+  }
+  free(fullRgb);
+
+  uint8_t *previewJpg = NULL;
+  size_t previewLen = 0;
+  bool encoded = fmt2jpg(previewRgb, previewRgbLen, previewWidth, previewHeight,
+                         PIXFORMAT_RGB888, DERIVED_PREVIEW_JPEG_QUALITY,
+                         &previewJpg, &previewLen);
+  free(previewRgb);
+
+  if (!encoded || !previewJpg || previewLen == 0) {
+    if (previewJpg) free(previewJpg);
+    netLog("[UPLOAD] Derived preview encode failed\n");
+    return false;
+  }
+
+  bool saved = savePendingPreviewPayload(previewJpg, previewLen,
+                                         previewObjectPath);
+  netLog("[UPLOAD] Derived same-frame preview: %ux%u %u bytes\n",
+         (unsigned int)previewWidth, (unsigned int)previewHeight,
+         (unsigned int)previewLen);
+  free(previewJpg);
+  return saved;
+}
+
 static bool uploadStoredPayload(const char *filePath, char *objectPathBuf,
                                 const char *proofRole) {
+  markProofNetworkWork();
   if (!payloadStoreReady || !SPIFFS.exists(filePath) ||
       objectPathBuf[0] == '\0') {
     return false;
@@ -454,11 +551,69 @@ static unsigned long computeUploadBackoff(uint8_t retryCount) {
   return backoff > UPLOAD_RETRY_MAX_MS ? UPLOAD_RETRY_MAX_MS : backoff;
 }
 
+static bool capturePendingFullPayload(const char *source) {
+  markProofNetworkWork();
+  if (!payloadStoreReady || pendingObjectPath[0] == '\0') {
+    return false;
+  }
+
+  bool lowLightMode =
+      lastFaceWindowLowLight || lastDetectLuma <= LOW_LIGHT_LUMA_THRESHOLD;
+  bool brightLightMode = !lowLightMode &&
+      (lastFaceWindowBright || lastDetectLuma >= BRIGHT_LIGHT_LUMA_THRESHOLD);
+
+  unsigned long t0 = millis();
+  if (!switchToUploadMode(UPLOAD_FRAME_SIZE, UPLOAD_JPEG_QUALITY, lowLightMode,
+                          brightLightMode)) {
+    switchToDetectMode();
+    netLog("[UPLOAD] Deferred full mode switch from %s failed\n", source);
+    return false;
+  }
+
+  delay(lowLightMode ? LOW_LIGHT_EXPOSURE_SETTLE_MS
+                     : UPLOAD_EXPOSURE_SETTLE_MS);
+
+  for (uint8_t i = 0; i < UPLOAD_STALE_FLUSH_FRAMES; i++) {
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (stale) {
+      esp_camera_fb_return(stale);
+    }
+    delay(70);
+  }
+
+  camera_fb_t *photo = esp_camera_fb_get();
+  if (photo && photo->len < 5000) {
+    esp_camera_fb_return(photo);
+    delay(50);
+    photo = esp_camera_fb_get();
+  }
+
+  bool fullSaved = false;
+  if (photo) {
+    fullSaved = savePendingPayload(photo->buf, photo->len,
+                                   String(pendingObjectPath));
+    netLog("[UPLOAD] Frozen deferred full proof from %s: %u bytes in %lums\n",
+           source, (unsigned int)photo->len, millis() - t0);
+    esp_camera_fb_return(photo);
+  } else {
+    netLog("[UPLOAD] Deferred full proof capture from %s failed\n", source);
+  }
+
+  switchToDetectMode();
+
+  if (fullSaved) {
+    pendingFullCapture = false;
+    persistUploadIntent(true);
+  }
+  return fullSaved;
+}
+
 static bool uploadPendingPayloadFromStorage() {
   if (!payloadStoreReady) {
     return false;
   }
 
+  bool previewJustUploaded = false;
   if (pendingPreviewObjectPath[0] != '\0' &&
       SPIFFS.exists(CAM_PENDING_PREVIEW_FILE)) {
     if (!uploadStoredPayload(CAM_PENDING_PREVIEW_FILE, pendingPreviewObjectPath,
@@ -467,6 +622,40 @@ static bool uploadPendingPayloadFromStorage() {
       return false;
     }
     pendingPreviewRetryCount = 0;
+    previewJustUploaded = true;
+    if (pendingFullCapture && pendingObjectPath[0] != '\0' &&
+        !SPIFFS.exists(CAM_PENDING_FILE)) {
+      uploadPhaseDeferred = true;
+      uploadRetryAtMs = millis() + UPLOAD_PHASE_GRACE_MS;
+      persistUploadIntent(true);
+      netLog("[UPLOAD] Preview uploaded; deferring full capture %lums\n",
+             (unsigned long)UPLOAD_PHASE_GRACE_MS);
+      return false;
+    }
+  }
+
+  if (previewJustUploaded && pendingObjectPath[0] != '\0' &&
+      SPIFFS.exists(CAM_PENDING_FILE)) {
+    uploadPhaseDeferred = true;
+    uploadRetryAtMs = millis() + UPLOAD_PHASE_GRACE_MS;
+    persistUploadIntent(true);
+    netLog("[UPLOAD] Preview uploaded; deferring same-frame full upload %lums\n",
+           (unsigned long)UPLOAD_PHASE_GRACE_MS);
+    return false;
+  }
+
+  if (pendingFullCapture && pendingObjectPath[0] != '\0' &&
+      !SPIFFS.exists(CAM_PENDING_FILE)) {
+    if (!capturePendingFullPayload("deferred")) {
+      if (pendingFullRetryCount < 255) pendingFullRetryCount++;
+      return false;
+    }
+    uploadPhaseDeferred = true;
+    uploadRetryAtMs = millis() + UPLOAD_PHASE_GRACE_MS;
+    persistUploadIntent(true);
+    netLog("[UPLOAD] Full captured; deferring full upload %lums\n",
+           (unsigned long)UPLOAD_PHASE_GRACE_MS);
+    return false;
   }
 
   if (pendingObjectPath[0] != '\0' && SPIFFS.exists(CAM_PENDING_FILE)) {
@@ -504,6 +693,8 @@ static void initUploadIntentStore() {
       (uint8_t)camPrefs.getUChar(CAM_KEY_PREVIEW_RETRY, 0);
   pendingFullRetryCount =
       (uint8_t)camPrefs.getUChar(CAM_KEY_FULL_RETRY, 0);
+  pendingFullCapture =
+      camPrefs.getBool(CAM_KEY_FULL_CAPTURE, false);
 
   String obj = camPrefs.getString(CAM_KEY_OBJECT, "");
   if (obj.length() > 0 && obj.length() < sizeof(pendingObjectPath)) {
@@ -541,6 +732,7 @@ static void initUploadIntentStore() {
 
 bool queueSingleUpload(const char *source) {
   unsigned long now = millis();
+  markProofNetworkWork();
 
   if (uploadInProgress || pendingUpload) {
     netLog("[UPLOAD] Skip queue from %s (busy)\n", source);
@@ -557,6 +749,8 @@ bool queueSingleUpload(const char *source) {
   pendingUploadRetryCount = 0;
   pendingPreviewRetryCount = 0;
   pendingFullRetryCount = 0;
+  pendingFullCapture = false;
+  uploadPhaseDeferred = false;
   pendingObjectPath[0] = '\0';
   pendingPreviewObjectPath[0] = '\0';
   persistUploadIntent(true);
@@ -566,9 +760,16 @@ bool queueSingleUpload(const char *source) {
 
 bool queueCapturedUpload(const char *source) {
   unsigned long now = millis();
+  markProofNetworkWork();
 
-  if (uploadInProgress || pendingUpload) {
-    netLog("[UPLOAD] Skip capture from %s (busy)\n", source);
+  if (pendingUpload) {
+    netLog("[UPLOAD] Existing proof upload pending for %s; accepting face check from %s\n",
+           currentDeliveryId, source);
+    return true;
+  }
+
+  if (uploadInProgress) {
+    netLog("[UPLOAD] Skip capture from %s (upload active)\n", source);
     return false;
   }
 
@@ -591,7 +792,7 @@ bool queueCapturedUpload(const char *source) {
   String fullObjectPath = makeObjectPath("full");
   unsigned long t0 = millis();
 
-  if (!switchToUploadMode(PREVIEW_FRAME_SIZE, PREVIEW_JPEG_QUALITY, lowLightMode,
+  if (!switchToUploadMode(UPLOAD_FRAME_SIZE, UPLOAD_JPEG_QUALITY, lowLightMode,
                           brightLightMode)) {
     switchToDetectMode();
     return false;
@@ -608,74 +809,42 @@ bool queueCapturedUpload(const char *source) {
     delay(70);
   }
 
-  camera_fb_t *preview = esp_camera_fb_get();
-  if (preview && preview->len < 4000) {
-    esp_camera_fb_return(preview);
+  camera_fb_t *proof = esp_camera_fb_get();
+  if (proof && proof->len < 5000) {
+    esp_camera_fb_return(proof);
     delay(50);
-    preview = esp_camera_fb_get();
+    proof = esp_camera_fb_get();
   }
 
   bool previewSaved = false;
-  if (preview) {
-    previewSaved = savePendingPreviewPayload(preview->buf, preview->len,
-                                             previewObjectPath);
-    netLog("[UPLOAD] Frozen preview from %s: %u bytes\n", source,
-           (unsigned int)preview->len);
-    esp_camera_fb_return(preview);
-  } else {
-    netLog("[UPLOAD] Preview capture from %s failed\n", source);
-  }
-
   bool fullSaved = false;
-  if (switchToUploadMode(UPLOAD_FRAME_SIZE, UPLOAD_JPEG_QUALITY, lowLightMode,
-                         brightLightMode)) {
-    delay(lowLightMode ? LOW_LIGHT_EXPOSURE_SETTLE_MS
-                       : UPLOAD_EXPOSURE_SETTLE_MS);
-
-    for (uint8_t i = 0; i < UPLOAD_STALE_FLUSH_FRAMES; i++) {
-      camera_fb_t *stale = esp_camera_fb_get();
-      if (stale) {
-        esp_camera_fb_return(stale);
-      }
-      delay(70);
-    }
-
-    camera_fb_t *photo = esp_camera_fb_get();
-    if (photo && photo->len < 5000) {
-      esp_camera_fb_return(photo);
-      delay(50);
-      photo = esp_camera_fb_get();
-    }
-
-    if (photo) {
-      fullSaved = savePendingPayload(photo->buf, photo->len, fullObjectPath);
-      netLog("[UPLOAD] Frozen full proof from %s: %u bytes\n", source,
-             (unsigned int)photo->len);
-      esp_camera_fb_return(photo);
-    } else {
-      netLog("[UPLOAD] Full proof capture from %s failed\n", source);
-    }
+  if (proof) {
+    previewSaved = saveDerivedPreviewFromFullJpeg(proof, previewObjectPath);
+    fullSaved = savePendingPayload(proof->buf, proof->len, fullObjectPath);
+    netLog("[UPLOAD] Frozen same-frame full proof from %s: %ux%u %u bytes in %lums\n",
+           source, (unsigned int)proof->width, (unsigned int)proof->height,
+           (unsigned int)proof->len, millis() - t0);
+    esp_camera_fb_return(proof);
   } else {
-    netLog("[UPLOAD] Full proof mode switch from %s failed\n", source);
+    netLog("[UPLOAD] Proof capture from %s failed\n", source);
   }
 
   switchToDetectMode();
 
-  if (!previewSaved && !fullSaved) {
+  if (!previewSaved || !fullSaved) {
     netLog("[UPLOAD] No proof payload saved from %s\n", source);
     clearPendingPayloadStorage();
     return false;
   }
 
+  pendingFullCapture = false;
   pendingUpload = true;
   uploadRetryAtMs = millis();
   pendingUploadRetryCount = 0;
   pendingPreviewRetryCount = 0;
   pendingFullRetryCount = 0;
   persistUploadIntent(true);
-  netLog("[UPLOAD] Frozen proof set from %s: preview=%d full=%d in %lums\n",
-         source, previewSaved ? 1 : 0, fullSaved ? 1 : 0,
-         millis() - t0);
+  netLog("[UPLOAD] Same-frame preview/full queued from %s\n", source);
   return true;
 }
 
@@ -694,6 +863,17 @@ const char *getSupabaseBearerToken() {
     return SUPABASE_SERVICE_ROLE_KEY;
   }
   return SUPABASE_API_KEY;
+}
+
+static void markProofNetworkWork() {
+  lastProofNetworkWorkAt = millis();
+}
+
+static bool proofNetworkWorkActive(unsigned long now) {
+  return pendingUpload || uploadInProgress || pendingFullCapture ||
+         uploadPhaseDeferred ||
+         (lastProofNetworkWorkAt != 0 &&
+          (now - lastProofNetworkWorkAt) < WIFI_PROOF_WORK_GRACE_MS);
 }
 
 // ===================== WIFI =====================
@@ -835,7 +1015,10 @@ bool discoverProxyUdp(unsigned long timeoutMs = 1500) {
 
         strncpy(PROXY_HOST, replyIp.c_str(), sizeof(PROXY_HOST) - 1);
         PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
+        strncpy(lastKnownProxyHost, PROXY_HOST, sizeof(lastKnownProxyHost) - 1);
+        lastKnownProxyHost[sizeof(lastKnownProxyHost) - 1] = '\0';
         proxyDiscoveryMisses = 0;
+        proxyUploadFailCount = 0;
         proxyMissingSince = 0;
         nextProxyDiscoveryAt = millis() + 5000UL;
         nextProxySubnetProbeAt = millis() + 15000UL;
@@ -862,7 +1045,10 @@ static void rememberProxyHost(const IPAddress &ip, const char *source) {
   String ipStr = ip.toString();
   strncpy(PROXY_HOST, ipStr.c_str(), sizeof(PROXY_HOST) - 1);
   PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
+  strncpy(lastKnownProxyHost, PROXY_HOST, sizeof(lastKnownProxyHost) - 1);
+  lastKnownProxyHost[sizeof(lastKnownProxyHost) - 1] = '\0';
   proxyDiscoveryMisses = 0;
+  proxyUploadFailCount = 0;
   proxyDiagFailCount = 0;
   proxyMissingSince = 0;
   nextProxyDiscoveryAt = millis() + 5000UL;
@@ -910,6 +1096,14 @@ static bool pingProxyAt(const IPAddress &ip, unsigned long timeoutMs = 200) {
 
 static bool probeLikelyProxyHosts(uint8_t maxHosts = 8) {
   if (WiFi.status() != WL_CONNECTED) return false;
+
+  if (lastKnownProxyHost[0] != '\0') {
+    IPAddress lastKnown;
+    if (lastKnown.fromString(lastKnownProxyHost) && pingProxyAt(lastKnown, 350)) {
+      rememberProxyHost(lastKnown, "last-known");
+      return true;
+    }
+  }
 
   IPAddress gateway = WiFi.gatewayIP();
   if (pingProxyAt(gateway)) {
@@ -1106,6 +1300,13 @@ void maintainWiFiConnection() {
   unsigned long now = millis();
 
   if (WiFi.status() == WL_CONNECTED) {
+    if (now - lastWifiStatusLogAt >= WIFI_STATUS_LOG_INTERVAL_MS) {
+      lastWifiStatusLogAt = now;
+      Serial.printf("[WIFI] OK ip=%s rssi=%d proxy=%s pending=%d upload=%d\n",
+                    WiFi.localIP().toString().c_str(), WiFi.RSSI(),
+                    PROXY_HOST[0] ? PROXY_HOST : "missing",
+                    pendingUpload ? 1 : 0, uploadInProgress ? 1 : 0);
+    }
     if (PROXY_HOST[0] == '\0' && now >= nextProxyDiscoveryAt) {
       nextProxyDiscoveryAt = now + PROXY_DISCOVERY_RETRY_MS;
       if (!discoverProxyUdp(350) && proxyDiscoveryMisses >= 3 &&
@@ -1119,6 +1320,11 @@ void maintainWiFiConnection() {
     if (PROXY_HOST[0] == '\0') {
       if (proxyMissingSince == 0) proxyMissingSince = now;
       if ((now - proxyMissingSince) >= PROXY_MISSING_RECONNECT_MS) {
+        if (proofNetworkWorkActive(now)) {
+          Serial.println(F("[DISCOVERY] Proxy missing during proof work; keeping WiFi associated"));
+          proxyMissingSince = now;
+          return;
+        }
         Serial.println(F("[DISCOVERY] Proxy still missing; rotating/reconnecting WiFi"));
         rotateHotspotCandidate("proxy_missing");
         WiFi.disconnect(false, false);
@@ -1180,10 +1386,12 @@ void maintainWiFiConnection() {
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
   WiFi.disconnect(false, false);
+  wifiSoftReconnectCount++;
 
   WiFi.config(INADDR_NONE, INADDR_NONE, INADDR_NONE);
 
-  netLog("[WIFI] Non-blocking reconnect attempt to '%s'\n", WIFI_SSID);
+  netLog("[WIFI] Non-blocking reconnect attempt #%u to '%s'\n",
+         (unsigned int)wifiSoftReconnectCount, WIFI_SSID);
   WiFi.begin((const char *)WIFI_SSID, WIFI_PASSWORD);
   wifiConnectInProgress = true;
   wifiConnectStartedAt = now;
@@ -1590,6 +1798,7 @@ String makeObjectPath(const char *proofRole) {
 bool uploadToSupabase(const uint8_t *data, size_t len,
                       const String &objectPath,
                       const char *proofRole) {
+  markProofNetworkWork();
   if (WiFi.status() != WL_CONNECTED) {
     maintainWiFiConnection();
     if (WiFi.status() != WL_CONNECTED) {
@@ -1597,10 +1806,16 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
       return false;
     }
   }
-  if (PROXY_HOST[0] == '\0' && !discoverProxyUdp(700) &&
-      !probeLikelyProxyHosts(10)) {
-    Serial.println(F("Upload skipped: proxy discovery failed."));
-    return false;
+  if (PROXY_HOST[0] == '\0') {
+    if (lastKnownProxyHost[0] != '\0') {
+      strncpy(PROXY_HOST, lastKnownProxyHost, sizeof(PROXY_HOST) - 1);
+      PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
+      Serial.printf("[PROXY] Retrying last known proxy %s before rediscovery\n",
+                    PROXY_HOST);
+    } else if (!discoverProxyUdp(700) && !probeLikelyProxyHosts(10)) {
+      Serial.println(F("Upload skipped: proxy discovery failed."));
+      return false;
+    }
   }
 
   // POST image data to the LilyGO proxy which relays it to Supabase.
@@ -1615,6 +1830,7 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
   http.addHeader("X-Object-Path", objectPath);
   http.addHeader("X-Proof-Role",
                  (proofRole && proofRole[0] != '\0') ? proofRole : "full");
+  http.addHeader("X-Delivery-Id", currentDeliveryId);
   char idempotencyKey[48];
   snprintf(idempotencyKey, sizeof(idempotencyKey), "%08lx-%u",
            (unsigned long)fnv1a32(objectPath.c_str()), (unsigned int)len);
@@ -1631,9 +1847,26 @@ bool uploadToSupabase(const uint8_t *data, size_t len,
                 response.length() > 0 ? response.c_str() : "(no body)");
 
   if (code == 200 || code == 201) {
+    proxyUploadFailCount = 0;
+    strncpy(lastKnownProxyHost, PROXY_HOST, sizeof(lastKnownProxyHost) - 1);
+    lastKnownProxyHost[sizeof(lastKnownProxyHost) - 1] = '\0';
     Serial.print(F("Proxy upload success -> "));
     Serial.println(objectPath);
     return true;
+  }
+
+  if (code <= 0) {
+    if (proxyUploadFailCount < 255) proxyUploadFailCount++;
+    if (proxyUploadFailCount >= 3) {
+      PROXY_HOST[0] = '\0';
+      Serial.println(F("[PROXY] Repeated upload failures; clearing active proxy."));
+    } else {
+      Serial.printf("[PROXY] Keeping active proxy after transient upload failure #%u.\n",
+                    (unsigned int)proxyUploadFailCount);
+    }
+    nextProxyDiscoveryAt = 0;
+    nextProxySubnetProbeAt = 0;
+    Serial.println(F("[PROXY] Will retry known proxy and rediscover in background."));
   }
 
   Serial.println(F("Proxy upload failed."));
@@ -1861,8 +2094,8 @@ bool setCameraSleepMode(bool sleepMode) {
 
 // ===================== FACE-STATUS HTTP HANDLER =====================
 // Responds to GET /face-status from the GPS/LTE proxy board.
-// Runs face detection on demand. Responds IMMEDIATELY, then defers upload
-// to loop() to avoid deadlock (CAM uploads back to the same proxy).
+// Runs face detection on demand. Freezes one proof frame, responds immediately,
+// then defers upload to loop() to avoid deadlock.
 void sendBrowserLivePage(WiFiClient &client) {
   client.print(F(
       "HTTP/1.1 200 OK\r\n"
@@ -1913,10 +2146,16 @@ void sendBrowserStatus(WiFiClient &client) {
   body += "  \"wifi_ssid\": \"" + String(WIFI_SSID) + "\",\n";
   body += "  \"ip\": \"" + WiFi.localIP().toString() + "\",\n";
   body += "  \"rssi_dbm\": " + String(WiFi.RSSI()) + ",\n";
+  body += "  \"wifi_status\": \"" + String(wifiStatusText(WiFi.status())) + "\",\n";
+  body += "  \"wifi_reconnect_count\": " + String(wifiSoftReconnectCount) + ",\n";
+  body += "  \"last_wifi_reconnect_ms\": " + String(lastWifiReconnectLatencyMs) + ",\n";
   body += "  \"camera_sleep\": " + String(cameraSleepMode ? "true" : "false") + ",\n";
   body += "  \"camera_mode\": \"" + String(cameraInDetectMode ? "detect_rgb565" : "jpeg") + "\",\n";
   body += "  \"proxy_host\": \"" + String(PROXY_HOST) + "\",\n";
-  body += "  \"pending_upload\": " + String(pendingUpload ? "true" : "false") + "\n";
+  body += "  \"pending_upload\": " + String(pendingUpload ? "true" : "false") + ",\n";
+  body += "  \"pending_full_capture\": " + String(pendingFullCapture ? "true" : "false") + ",\n";
+  body += "  \"upload_phase_deferred\": " + String(uploadPhaseDeferred ? "true" : "false") + ",\n";
+  body += "  \"upload_in_progress\": " + String(uploadInProgress ? "true" : "false") + "\n";
   body += "}\n";
 
   client.print(F("HTTP/1.1 200 OK\r\n"));
@@ -2319,17 +2558,48 @@ void handleFaceStatusClient() {
   }
 
   // Parse deliveryId from query string if present
+  bool deliveryConflictWithPendingUpload = false;
   int qIdx = requestLine.indexOf("?delivery_id=");
   if (qIdx >= 0) {
     int spIdx = requestLine.indexOf(' ', qIdx);
     if (spIdx > qIdx) {
       String delId = requestLine.substring(qIdx + 13, spIdx);
       if (delId.length() > 0 && delId.length() < sizeof(currentDeliveryId)) {
-        strncpy(currentDeliveryId, delId.c_str(),
-                sizeof(currentDeliveryId) - 1);
-        currentDeliveryId[sizeof(currentDeliveryId) - 1] = '\0';
-        if (pendingUpload) {
-          persistUploadIntent(true);
+        if (pendingUpload &&
+            strcmp(currentDeliveryId, "UNKNOWN_DELIVERY") != 0 &&
+            delId != String(currentDeliveryId)) {
+          String existingDeliveryId = String(currentDeliveryId);
+          if (delId.startsWith(existingDeliveryId)) {
+            netLog("[UPLOAD] Repairing truncated pending delivery id %s -> %s\n",
+                   currentDeliveryId, delId.c_str());
+            strncpy(currentDeliveryId, delId.c_str(),
+                    sizeof(currentDeliveryId) - 1);
+            currentDeliveryId[sizeof(currentDeliveryId) - 1] = '\0';
+            if (pendingPreviewObjectPath[0] != '\0') {
+              String repairedPreviewPath = makeObjectPath("preview");
+              strncpy(pendingPreviewObjectPath, repairedPreviewPath.c_str(),
+                      sizeof(pendingPreviewObjectPath) - 1);
+              pendingPreviewObjectPath[sizeof(pendingPreviewObjectPath) - 1] = '\0';
+            }
+            if (pendingObjectPath[0] != '\0') {
+              String repairedFullPath = makeObjectPath("full");
+              strncpy(pendingObjectPath, repairedFullPath.c_str(),
+                      sizeof(pendingObjectPath) - 1);
+              pendingObjectPath[sizeof(pendingObjectPath) - 1] = '\0';
+            }
+            persistUploadIntent(true);
+          } else {
+            deliveryConflictWithPendingUpload = true;
+            netLog("[UPLOAD] Face request for %s while proof for %s is pending\n",
+                   delId.c_str(), currentDeliveryId);
+          }
+        } else {
+          strncpy(currentDeliveryId, delId.c_str(),
+                  sizeof(currentDeliveryId) - 1);
+          currentDeliveryId[sizeof(currentDeliveryId) - 1] = '\0';
+          if (pendingUpload) {
+            persistUploadIntent(true);
+          }
         }
       }
     }
@@ -2346,7 +2616,9 @@ void handleFaceStatusClient() {
   // Run repeated face detection in a window (old working logic style)
   bool faceFound = false;
   bool lowLight = false;
-  if (!cameraSleepMode) {
+  if (deliveryConflictWithPendingUpload) {
+    netLog("[HTTP] Face check held: different delivery upload pending\n");
+  } else if (!cameraSleepMode) {
     bool detectReady = cameraInDetectMode || switchToDetectMode();
     if (!detectReady) {
       netLog("[HTTP] Face check failed: camera detect mode unavailable\n");
@@ -2374,13 +2646,16 @@ void handleFaceStatusClient() {
     personCount++;
     netLog("[HTTP] Face detected!\n");
     result = queueCapturedUpload("HTTP") ? "FACE_OK" : "FACE_BUSY";
+  } else if (deliveryConflictWithPendingUpload) {
+    result = "FACE_BUSY";
   } else {
     netLog(lowLight ? "[HTTP] No face detected (low light)\n"
                     : "[HTTP] No face detected\n");
     result = lowLight ? "NO_FACE_LOW_LIGHT" : "NO_FACE";
   }
 
-  // Send FACE_OK only after the proof JPEG is already frozen locally.
+  // Send FACE_OK after the proof frame is frozen locally. Preview and full proof
+  // both upload from that same frame so the final image cannot be a later retake.
   String fullResult = String(result) + "\r\n";
   char resp[128];
   snprintf(resp, sizeof(resp),
@@ -2407,7 +2682,7 @@ void loop() {
   handleUartFaceCommand();  // On-demand face-check via UART (from Tester)
 
   // Deferred upload — runs AFTER face-check response was sent. Face-triggered
-  // uploads replay the already-frozen SPIFFS JPEG instead of recapturing later.
+  // uploads replay the already-frozen SPIFFS JPEGs instead of recapturing later.
   if (pendingUpload && !uploadInProgress && millis() >= uploadRetryAtMs) {
     uploadInProgress = true;
     netLog("[UPLOAD] Deferred upload starting...\n");
@@ -2431,8 +2706,12 @@ void loop() {
       pendingUploadRetryCount = 0;
       pendingPreviewRetryCount = 0;
       pendingFullRetryCount = 0;
+      uploadPhaseDeferred = false;
       persistUploadIntent(false);
       netLog("[UPLOAD] Done. One photo captured.\n");
+    } else if (uploadPhaseDeferred) {
+      uploadPhaseDeferred = false;
+      netLog("[UPLOAD] Phase break; next upload step after grace window.\n");
     } else {
       if (pendingUploadRetryCount < 255) {
         pendingUploadRetryCount++;
@@ -2527,7 +2806,7 @@ void handleUartFaceCommand() {
   bool lowLight = false;
   bool detected = runFaceDetectionWindow(FACE_DETECT_WINDOW_MS, &lowLight);
 
-  // Respond FACE_OK only after the proof JPEG is already frozen locally.
+  // Respond FACE_OK after the quick preview is frozen or already pending.
   if (detected) {
     netLog("[UART] Face DETECTED\n");
     Serial2.println(queueCapturedUpload("UART") ? "FACE_OK" : "FACE_BUSY");
@@ -2536,3 +2815,4 @@ void handleUartFaceCommand() {
     Serial2.println(lowLight ? "NO_FACE_LOW_LIGHT" : "NO_FACE");
   }
 }
+
