@@ -55,9 +55,8 @@ static const int  PROXY_PORT   = 8080;
 
 // Physical pairing for this controller sketch. Controller 001 must only bind
 // to BOX_001, controller 002 to BOX_002, etc.
-#ifndef CONTROLLER_BOX_NUM
-#define CONTROLLER_BOX_NUM 2
-#endif
+// Final BOX_001 build: hard-pin this controller as CONTROLLER_001.
+#define CONTROLLER_BOX_NUM 1
 
 // Hardware ID (derived from proxy's AP SSID at runtime)
 extern char HARDWARE_ID[12];

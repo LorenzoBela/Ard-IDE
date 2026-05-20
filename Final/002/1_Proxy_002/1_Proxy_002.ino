@@ -56,9 +56,8 @@ char AP_SSID[24]     = "SmartTopBox_AP"; // e.g. "SmartTopBox_AP_002"
 char CAM_PREFIX[24]  = "OV3660_CAM_001"; // e.g. "OV3660_CAM_002"
 uint8_t boxNum       = 0;
 
-// Optional fixed physical pairing. Leave undefined to keep MAC/Firebase
-// auto-provisioning; define PROXY_BOX_NUM as 1, 2, ... to pin this proxy.
-// #define PROXY_BOX_NUM 1
+// Final BOX_002 build: hard-pin this LilyGO proxy as BOX_002.
+#define PROXY_BOX_NUM 2
 
 // ==================== HOTSPOT (WiFi AP for ESP32-CAM) ====================
 // Production hotspot-first variant: LilyGO joins one of these hotspots as a

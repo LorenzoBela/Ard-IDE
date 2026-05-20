@@ -53,6 +53,12 @@ static const int  PROXY_PORT   = 8080;
 #define PROXY_DISCOVERY_QUERY "SMART_TOP_BOX_PROXY?"
 #define PROXY_DISCOVERY_REPLY "SMART_TOP_BOX_PROXY:"
 
+// Physical pairing for this controller sketch. Controller 001 must only bind
+// to BOX_001, controller 002 to BOX_002, etc.
+#ifndef CONTROLLER_BOX_NUM
+#define CONTROLLER_BOX_NUM 1
+#endif
+
 // Hardware ID (derived from proxy's AP SSID at runtime)
 extern char HARDWARE_ID[12];
 

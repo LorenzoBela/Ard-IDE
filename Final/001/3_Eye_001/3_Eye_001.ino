@@ -69,9 +69,8 @@ char PROXY_HOST[16] = "";
 // Pair each ESP32-CAM with exactly one LilyGO proxy/box. When multiple boxes
 // share the same phone/router hotspot, discovery replies from the other box are
 // visible too; accepting the first reply can swap proof-photo routing.
-#ifndef CAMERA_BOX_NUM
+// Final BOX_001 build: hard-pin this ESP32-CAM as OV3660_CAM_001.
 #define CAMERA_BOX_NUM 1
-#endif
 
 // Supabase credentials kept here for reference (used by GPS/LTE board for
 // relay)

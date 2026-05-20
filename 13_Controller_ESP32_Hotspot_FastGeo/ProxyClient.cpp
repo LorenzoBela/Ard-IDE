@@ -29,6 +29,8 @@
 char WIFI_SSID[33]     = "";
 char WIFI_PASSWORD[65] = "";
 char HARDWARE_ID[12]   = "";
+char EXPECTED_HARDWARE_ID[12] = "";
+char EXPECTED_CONTROLLER_ID[20] = "";
 char PROXY_HOST[16]    = "";
 
 // ── UDP logger ──
@@ -141,6 +143,27 @@ static const uint8_t PROXY_NEARBY_RADIUS = 8;
 static const uint8_t PROXY_SUBNET_PROBE_HOSTS = 18;
 static const uint8_t PROXY_RECONNECT_MISS_LIMIT = 8;
 
+static void ensureControllerIdentity() {
+  if (EXPECTED_HARDWARE_ID[0] == '\0') {
+    snprintf(EXPECTED_HARDWARE_ID, sizeof(EXPECTED_HARDWARE_ID), "BOX_%03u",
+             (unsigned int)CONTROLLER_BOX_NUM);
+  }
+  if (EXPECTED_CONTROLLER_ID[0] == '\0') {
+    snprintf(EXPECTED_CONTROLLER_ID, sizeof(EXPECTED_CONTROLLER_ID),
+             "CONTROLLER_%03u", (unsigned int)CONTROLLER_BOX_NUM);
+  }
+  if (HARDWARE_ID[0] == '\0') {
+    strncpy(HARDWARE_ID, EXPECTED_HARDWARE_ID, sizeof(HARDWARE_ID) - 1);
+    HARDWARE_ID[sizeof(HARDWARE_ID) - 1] = '\0';
+  }
+}
+
+static bool proxyHardwareMatchesExpected(const char *hardwareId) {
+  ensureControllerIdentity();
+  return hardwareId && hardwareId[0] != '\0' &&
+         strcmp(hardwareId, EXPECTED_HARDWARE_ID) == 0;
+}
+
 static void clearDiscoveredProxy(const char *reason) {
   if (PROXY_HOST[0] != '\0') {
     Serial.printf("[DISCOVERY] Clearing proxy %s (%s)\n",
@@ -152,15 +175,17 @@ static void clearDiscoveredProxy(const char *reason) {
 
 static void rememberDiscoveredProxy(const IPAddress &ip, const char *hardwareId,
                                     const char *source) {
+  if (!proxyHardwareMatchesExpected(hardwareId)) {
+    Serial.printf("[DISCOVERY] Ignoring proxy %s for %s; expected %s\n",
+                  hardwareId && hardwareId[0] ? hardwareId : "UNKNOWN",
+                  source ? source : "probe", EXPECTED_HARDWARE_ID);
+    return;
+  }
   String ipStr = ip.toString();
   strncpy(PROXY_HOST, ipStr.c_str(), sizeof(PROXY_HOST) - 1);
   PROXY_HOST[sizeof(PROXY_HOST) - 1] = '\0';
-  if (hardwareId && hardwareId[0] != '\0') {
-    strncpy(HARDWARE_ID, hardwareId, sizeof(HARDWARE_ID) - 1);
-    HARDWARE_ID[sizeof(HARDWARE_ID) - 1] = '\0';
-  } else if (HARDWARE_ID[0] == '\0') {
-    snprintf(HARDWARE_ID, sizeof(HARDWARE_ID), "BOX_001");
-  }
+  strncpy(HARDWARE_ID, EXPECTED_HARDWARE_ID, sizeof(HARDWARE_ID) - 1);
+  HARDWARE_ID[sizeof(HARDWARE_ID) - 1] = '\0';
   proxyDiscoveryMisses = 0;
   nextProxyDiscoveryAt = millis() + 5000UL;
   nextProxySubnetProbeAt = millis() + 15000UL;
@@ -184,7 +209,7 @@ static bool pingProxyAt(const IPAddress &ip, unsigned long timeoutMs) {
   }
 
   client.printf(
-      "GET /ping HTTP/1.1\r\n"
+      "GET /identity HTTP/1.1\r\n"
       "Host: %s:%d\r\n"
       "Connection: close\r\n"
       "\r\n",
@@ -192,7 +217,8 @@ static bool pingProxyAt(const IPAddress &ip, unsigned long timeoutMs) {
 
   unsigned long deadline = millis() + timeoutMs;
   bool sawHttpOk = false;
-  bool sawBodyOk = false;
+  bool headersDone = false;
+  String body = "";
   while (millis() < deadline && (client.connected() || client.available())) {
     if (!client.available()) {
       yield();
@@ -203,20 +229,24 @@ static bool pingProxyAt(const IPAddress &ip, unsigned long timeoutMs) {
     if (line.startsWith("HTTP/1.1 200") || line.startsWith("HTTP/1.0 200")) {
       sawHttpOk = true;
     }
-    if (line == "OK") {
-      sawBodyOk = true;
-      break;
+    if (line.length() == 0) {
+      headersDone = true;
+      continue;
+    }
+    if (headersDone) {
+      body += line;
     }
   }
   client.stop();
-  return sawHttpOk || sawBodyOk;
+  body.trim();
+  return sawHttpOk && proxyHardwareMatchesExpected(body.c_str());
 }
 
 static bool tryProxyCandidate(const IPAddress &ip, const char *source,
                               unsigned long timeoutMs = PROXY_PROBE_TIMEOUT_MS) {
   if (ip == IPAddress(0, 0, 0, 0) || ip == WiFi.localIP()) return false;
   if (pingProxyAt(ip, timeoutMs)) {
-    rememberDiscoveredProxy(ip, NULL, source);
+    rememberDiscoveredProxy(ip, EXPECTED_HARDWARE_ID, source);
     return true;
   }
   return false;
@@ -525,6 +555,12 @@ static bool discoverProxyUdp(unsigned long timeoutMs = 1200) {
 
         int parsed = sscanf(payload, "%15[^:]:%d:%11s",
                             replyIp, &replyPort, replyHardware);
+        if (!proxyHardwareMatchesExpected(parsed >= 3 ? replyHardware : NULL)) {
+          Serial.printf("[DISCOVERY] Ignoring proxy reply %s; expected %s\n",
+                        parsed >= 3 ? replyHardware : "UNKNOWN",
+                        EXPECTED_HARDWARE_ID);
+          continue;
+        }
         IPAddress ip;
         if (parsed >= 1 && ip.fromString(replyIp)) {
           rememberDiscoveredProxy(ip, parsed >= 3 ? replyHardware : NULL, "udp");
@@ -737,7 +773,7 @@ bool scanForProxy() {
       proxyBssidKnown = false;
     }
 
-    snprintf(HARDWARE_ID, sizeof(HARDWARE_ID), "BOX_001");
+    ensureControllerIdentity();
     selectedHotspotCredential = bestCredential;
 
 #if CONTROLLER_VERBOSE_LOGS
@@ -955,9 +991,10 @@ static int httpGetOnce(const char *path, String &bodyOut,
   client.printf(
       "GET %s HTTP/1.1\r\n"
       "Host: %s:%d\r\n"
+      "X-Controller-Id: %s\r\n"
       "Connection: close\r\n"
       "\r\n",
-      path, PROXY_HOST, PROXY_PORT);
+      path, PROXY_HOST, PROXY_PORT, EXPECTED_CONTROLLER_ID);
 
   unsigned long deadline = millis() + timeoutMs;
   int statusCode = -1;
@@ -1313,9 +1350,10 @@ static bool fetchDeliveryContextInternal(bool updateStatusCommand) {
   persistentClient.printf(
       "GET /otp HTTP/1.1\r\n"
       "Host: %s:%d\r\n"
+      "X-Controller-Id: %s\r\n"
       "Connection: keep-alive\r\n"
       "\r\n",
-      PROXY_HOST, PROXY_PORT);
+      PROXY_HOST, PROXY_PORT, EXPECTED_CONTROLLER_ID);
 
   String body = "";
   int code = readHttpResponse(body, REFRESH_HTTP_TIMEOUT_MS);
@@ -1331,9 +1369,10 @@ static bool fetchDeliveryContextInternal(bool updateStatusCommand) {
     persistentClient.printf(
         "GET /otp HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
+        "X-Controller-Id: %s\r\n"
         "Connection: keep-alive\r\n"
         "\r\n",
-        PROXY_HOST, PROXY_PORT);
+        PROXY_HOST, PROXY_PORT, EXPECTED_CONTROLLER_ID);
     body = "";
     code = readHttpResponse(body, REFRESH_HTTP_TIMEOUT_MS);
     if (code < 0) {
@@ -1402,9 +1441,10 @@ bool requestContextRefresh() {
   persistentClient.printf(
       "GET /refresh-context?geo=1 HTTP/1.1\r\n"
       "Host: %s:%d\r\n"
+      "X-Controller-Id: %s\r\n"
       "Connection: keep-alive\r\n"
       "\r\n",
-      PROXY_HOST, PROXY_PORT);
+      PROXY_HOST, PROXY_PORT, EXPECTED_CONTROLLER_ID);
 
   String body = "";
   int code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
@@ -1418,9 +1458,10 @@ bool requestContextRefresh() {
     persistentClient.printf(
         "GET /refresh-context?geo=1 HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
+        "X-Controller-Id: %s\r\n"
         "Connection: keep-alive\r\n"
         "\r\n",
-        PROXY_HOST, PROXY_PORT);
+        PROXY_HOST, PROXY_PORT, EXPECTED_CONTROLLER_ID);
     body = "";
     code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
     if (code < 0) {
@@ -1474,9 +1515,10 @@ bool requestProxyPing() {
   persistentClient.printf(
       "GET /ping HTTP/1.1\r\n"
       "Host: %s:%d\r\n"
+      "X-Controller-Id: %s\r\n"
       "Connection: keep-alive\r\n"
       "\r\n",
-      PROXY_HOST, PROXY_PORT);
+      PROXY_HOST, PROXY_PORT, EXPECTED_CONTROLLER_ID);
 
   String body = "";
   int code = readHttpResponse(body, 1000);
@@ -1543,6 +1585,7 @@ bool fetchDiagnostics(ControllerDiagData &out) {
   http.setTimeout(CONTROLLER_DIAG_HTTP_TIMEOUT_MS);
   http.setReuse(false);
   http.begin(client, url);
+  http.addHeader("X-Controller-Id", EXPECTED_CONTROLLER_ID);
 
   int code = http.GET();
   if (code != 200) {
@@ -1690,6 +1733,7 @@ static int sendRawPost(const char *path, const char *json) {
   http.setTimeout(FETCH_HTTP_TIMEOUT_MS);
   http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Controller-Id", EXPECTED_CONTROLLER_ID);
   int code = http.POST((uint8_t *)json, strlen(json));
   http.end();
   return code;
@@ -1702,12 +1746,13 @@ static int sendRawPost(const char *path, const char *json) {
   persistentClient.printf(
       "POST %s HTTP/1.1\r\n"
       "Host: %s:%d\r\n"
+      "X-Controller-Id: %s\r\n"
       "Connection: keep-alive\r\n"
       "Content-Type: application/json\r\n"
       "Content-Length: %d\r\n"
       "\r\n"
       "%s",
-      path, PROXY_HOST, PROXY_PORT, jsonLen, json);
+      path, PROXY_HOST, PROXY_PORT, EXPECTED_CONTROLLER_ID, jsonLen, json);
 
   String body;
   int code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
@@ -1721,12 +1766,13 @@ static int sendRawPost(const char *path, const char *json) {
     persistentClient.printf(
         "POST %s HTTP/1.1\r\n"
         "Host: %s:%d\r\n"
+        "X-Controller-Id: %s\r\n"
         "Connection: keep-alive\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %d\r\n"
         "\r\n"
         "%s",
-        path, PROXY_HOST, PROXY_PORT, jsonLen, json);
+        path, PROXY_HOST, PROXY_PORT, EXPECTED_CONTROLLER_ID, jsonLen, json);
     code = readHttpResponse(body, FETCH_HTTP_TIMEOUT_MS);
     if (code < 0) {
       closePersistentConnection();
@@ -1896,6 +1942,7 @@ bool requestCameraPowerMode(bool wakeMode) {
 
   http.setTimeout(2500);
   http.begin(url);
+  http.addHeader("X-Controller-Id", EXPECTED_CONTROLLER_ID);
   int code = http.GET();
 
   bool ok = false;
@@ -1963,6 +2010,7 @@ int requestPersonalPinToggle(const char *pin, bool currentlyLocked) {
   http.setTimeout(5000);
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Controller-Id", EXPECTED_CONTROLLER_ID);
   int code = http.POST((uint8_t *)json, strlen(json));
   if (code != 200) {
 #if CONTROLLER_VERBOSE_LOGS
@@ -2020,6 +2068,7 @@ int requestFaceCheck() {
 
     http.setTimeout(FACE_CHECK_WIFI_TIMEOUT_MS);
     http.begin(url);
+    http.addHeader("X-Controller-Id", EXPECTED_CONTROLLER_ID);
     int code = http.GET();
 
     if (code == 200) {
