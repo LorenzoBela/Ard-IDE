@@ -1907,6 +1907,17 @@ bool reportCommandAckToProxy(const char *command, const char *status, const char
            command ? command : "", status ? status : "", details ? details : "",
            HARDWARE_ID, activeDeliveryId);
 
+  if (command && strcmp(command, "REBOOT_ALL") == 0) {
+    int code = sendRawPost("/command-ack", json);
+    if (code == 200 || code == 201) {
+#if CONTROLLER_VERBOSE_LOGS
+      Serial.printf("[CMD_ACK] %s/%s sent sync HTTP %d\n",
+                    command, status ? status : "", code);
+#endif
+      return true;
+    }
+  }
+
   bool queued = enqueueProxyPost("/command-ack", json);
 #if CONTROLLER_VERBOSE_LOGS
   Serial.printf("[CMD_ACK] %s/%s queued=%d\n", command ? command : "", status ? status : "", queued ? 1 : 0);

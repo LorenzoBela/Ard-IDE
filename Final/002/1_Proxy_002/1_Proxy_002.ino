@@ -179,6 +179,7 @@ WiFiServer camServer(CAM_SERVER_PORT);
 static WiFiClient keepAliveController;
 static bool inApRequestHandler = false;
 static volatile bool modemHttpBusy = false;
+static uint8_t modemHttpBusyDepth = 0;
 SemaphoreHandle_t stateMutex = NULL;
 SemaphoreHandle_t modemMutex = NULL;
 TaskHandle_t smartBoxLoopTaskHandle = NULL;
@@ -483,6 +484,7 @@ static void clearDeliveryContextCaches(const char *reason, bool patchHardware) {
 
 unsigned long lastPersonalPinFlushAt = 0;
 #define PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS 5000
+#define PERSONAL_PIN_AUDIT_FLUSH_MAX_PER_PASS 1
 static unsigned long lastPinRuntimeRefreshAt = 0;
 #define PIN_RUNTIME_REFRESH_MIN_MS 15000
 static bool personalPinRuntimeRefreshQueued = false;
@@ -653,6 +655,26 @@ public:
 private:
   const char *_owner;
   bool _locked;
+};
+
+class ModemHttpBusyGuard {
+public:
+  ModemHttpBusyGuard() : _active(true) {
+    modemHttpBusyDepth++;
+    modemHttpBusy = true;
+  }
+  ~ModemHttpBusyGuard() {
+    release();
+  }
+  void release() {
+    if (!_active) return;
+    if (modemHttpBusyDepth > 0) modemHttpBusyDepth--;
+    if (modemHttpBusyDepth == 0) modemHttpBusy = false;
+    _active = false;
+  }
+
+private:
+  bool _active;
 };
 
 static bool takeState(uint32_t timeoutMs) {
@@ -1353,6 +1375,7 @@ bool parseCCLK(const String &resp, unsigned long &outEpoch) {
 bool syncNetworkTime() {
   ModemLockGuard modemLock("syncNetworkTime", 1000);
   if (!modemLock.ok()) return false;
+  ModemHttpBusyGuard httpBusy;
   Serial.println("Syncing network time (PHT, UTC+8)...");
   String resp;
 
@@ -1590,6 +1613,7 @@ bool httpPutToFirebase(const char *path, const String &jsonData) {
   }
   ModemLockGuard modemLock("httpPutToFirebase", 250);
   if (!modemLock.ok()) return false;
+  ModemHttpBusyGuard httpBusy;
 
   String resp;
 
@@ -1789,6 +1813,7 @@ bool httpPatchToFirebase(const char *path, const String &jsonData) {
   }
   ModemLockGuard modemLock("httpPatchToFirebase", 250);
   if (!modemLock.ok()) return false;
+  ModemHttpBusyGuard httpBusy;
 
   String resp;
 
@@ -2249,6 +2274,7 @@ void sendToFirebase() {
   }
   ModemLockGuard modemLock("sendToFirebase", 250);
   if (!modemLock.ok()) return;
+  ModemHttpBusyGuard httpBusy;
 
   Serial.print("Firebase... ");
 
@@ -2800,6 +2826,7 @@ bool uploadToSupabaseViaLTE(const uint8_t *data, size_t len,
     relayDiag = "BUSY";
     return false;
   }
+  ModemHttpBusyGuard httpBusy;
 
   String resp;
   sendATAndWait("+HTTPTERM", 1000);
@@ -3020,6 +3047,7 @@ bool uploadClientToSupabaseViaLTE(WiFiClient &source, size_t len,
     relayDiag = "BUSY";
     return false;
   }
+  ModemHttpBusyGuard httpBusy;
   Serial.printf("[RELAY] Streaming %u bytes -> Supabase path: %s\n", len,
                 objectPath.c_str());
 
@@ -3180,6 +3208,7 @@ bool httpPatchSupabase(const char *tableName, const char *recordId, const char *
   if (!lteConnected) return false;
   ModemLockGuard modemLock("httpPatchSupabase", 250);
   if (!modemLock.ok()) return false;
+  ModemHttpBusyGuard httpBusy;
 
   Serial.printf("[SBASE] PATCH table %s id %s\n", tableName, recordId);
 
@@ -3849,18 +3878,23 @@ static void queuePersonalPinAudit(const char *eventJson) {
   }
 }
 
-static void flushQueuedPersonalPinAudits() {
+static void flushQueuedPersonalPinAudits(uint8_t maxEvents = PERSONAL_PIN_AUDIT_FLUSH_MAX_PER_PASS) {
   if (!lteConnected) return;
 
   char queued[384];
-  while (dpAuditQueueCount() > 0) {
+  uint8_t flushed = 0;
+  while (dpAuditQueueCount() > 0 && flushed < maxEvents) {
+    feedCloudIoWatchdog();
     if (!dpDequeueAuditEvent(queued, sizeof(queued))) {
       return;
     }
+    feedCloudIoWatchdog();
     if (!writePersonalPinAuditNow(queued)) {
       dpEnqueueAuditEvent(queued);
       return;
     }
+    flushed++;
+    feedCloudIoWatchdog();
   }
 }
 
@@ -4311,6 +4345,7 @@ void refreshDeliveryContextFromFirebase() {
   }
   ModemLockGuard modemLock("refreshDeliveryContextFromFirebase", 250);
   if (!modemLock.ok()) return;
+  ModemHttpBusyGuard httpBusy;
 
   bool contextCleared = false;
   bool prevDeliveryValid = deliveryIdCacheValid;
@@ -4327,14 +4362,12 @@ void refreshDeliveryContextFromFirebase() {
   snprintf(path, sizeof(path), "/hardware/%s.json", HARDWARE_ID);
 
   String resp;
-  modemHttpBusy = true;
   sendATAndWait("+HTTPTERM", 1000);
   delay(100);
 
   modem.sendAT("+HTTPINIT");
   if (modem.waitResponse(5000L, resp) != 1) {
     sendATAndWait("+HTTPTERM", 1000);
-    modemHttpBusy = false;
     return;
   }
 
@@ -4384,7 +4417,6 @@ void refreshDeliveryContextFromFirebase() {
 
   if (!actionOK || httpStatus != 200) {
     sendATAndWait("+HTTPTERM", 1000);
-    modemHttpBusy = false;
     contextFetchFailCount++;
     if (deliveryIdCacheValid && cachedDeliveryId[0] != '\0') {
       deliveryContextStale = true;
@@ -4475,7 +4507,7 @@ void refreshDeliveryContextFromFirebase() {
     }
 
     sendATAndWait("+HTTPTERM", 1000);
-    modemHttpBusy = false;
+    httpBusy.release();
     modemLock.release();
 
     Serial.printf("[CONTEXT] totalBytes=%d body(120): %.120s\n", (int)body.length(),
@@ -4968,11 +5000,6 @@ void refreshDeliveryContextFromFirebase() {
                     returnOtpCacheValid ? cachedReturnOtp : "NONE",
                     (int)returnOtpCacheValid);
     }
-  }
-
-  if (modemHttpBusy) {
-    sendATAndWait("+HTTPTERM", 1000);
-    modemHttpBusy = false;
   }
 }
 
@@ -5489,6 +5516,7 @@ void triggerRebootAllIfScheduled(unsigned long now) {
   httpPatchWithRetry(
       rebootPath,
       "{\"rebooted\":true,\"source\":\"reboot_all\",\"scope\":\"proxy_controller_cam\",\"timestamp\":{\".sv\":\"timestamp\"}}");
+  markCommandDone();
 
   Serial.println("[REBOOT_ALL] Proxy restarting now");
   delay(150);
@@ -6642,8 +6670,8 @@ String httpGetFromFirebase(const char *path) {
   }
   ModemLockGuard modemLock("httpGetFromFirebase", 250);
   if (!modemLock.ok()) return "";
+  ModemHttpBusyGuard httpBusy;
 
-  modemHttpBusy = true;
   String resp;
   sendATAndWait("+HTTPTERM", 1000);
   delay(100);
@@ -6651,7 +6679,6 @@ String httpGetFromFirebase(const char *path) {
   modem.sendAT("+HTTPINIT");
   if (modem.waitResponse(5000L, resp) != 1) {
     sendATAndWait("+HTTPTERM", 1000);
-    modemHttpBusy = false;
     return "";
   }
 
@@ -6730,7 +6757,6 @@ String httpGetFromFirebase(const char *path) {
   }
 
   sendATAndWait("+HTTPTERM", 1000);
-  modemHttpBusy = false;
   return body;
 }
 
@@ -7061,6 +7087,7 @@ static bool httpGetSupabaseRest(const String &pathAndQuery, String &bodyOut,
   if (!lteConnected) return false;
   ModemLockGuard modemLock("httpGetSupabaseRest", 250);
   if (!modemLock.ok()) return false;
+  ModemHttpBusyGuard httpBusy;
 
   String resp;
   sendATAndWait("+HTTPTERM", 1000);
@@ -7927,6 +7954,13 @@ void firebaseSyncTask(void *pvParameters) {
       feedCloudIoWatchdog();
     }
 
+    if ((wifiCloudHealthy || lteConnected) && !modemHttpBusy &&
+        now - lastPersonalPinFlushAt >= PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS) {
+      flushQueuedPersonalPinAudits();
+      lastPersonalPinFlushAt = now;
+      feedCloudIoWatchdog();
+    }
+
     if ((wifiCloudHealthy || lteConnected) && now - lastFB >= firebaseInterval) {
       sendToFirebase();
       feedCloudIoWatchdog();
@@ -8141,13 +8175,6 @@ void loop() {
 
   if ((wifiCloudHealthy || lteConnected) && !modemHttpBusy) {
     retryPendingCommandAck(now);
-  }
-  feedCloudIoWatchdog();
-
-  if ((wifiCloudHealthy || lteConnected) && !modemHttpBusy &&
-      now - lastPersonalPinFlushAt >= PERSONAL_PIN_AUDIT_FLUSH_INTERVAL_MS) {
-    flushQueuedPersonalPinAudits();
-    lastPersonalPinFlushAt = now;
   }
   feedCloudIoWatchdog();
 
